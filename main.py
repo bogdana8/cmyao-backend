@@ -2,9 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import json
-import os
 import uuid
+from sqlalchemy import create_engine, Column, String, Integer, JSON
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = FastAPI()
 
@@ -15,10 +15,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FILE_PATH = "templates_db.json"
-RESPONSES_FILE = "responses_db.json"
+# ТВОЄ ПІДКЛЮЧЕННЯ ДО БАЗИ ДАНИХ NEON:
+# (я прибрав &channel_binding=require з кінця, щоб уникнути конфліктів у деяких версіях Python)
+DATABASE_URL = "postgresql://neondb_owner:npg_AlvcYP6VQsZ4@ep-morning-credit-a41lvtxp-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 
+# --- МОДЕЛІ БАЗИ ДАНИХ ---
+class DBTemplate(Base):
+    __tablename__ = "templates"
+    id = Column(String, primary_key=True, index=True)
+    title = Column(String, index=True)
+    questions = Column(JSON)
+
+class DBResponse(Base):
+    __tablename__ = "responses"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    survey_id = Column(String, index=True)
+    answers = Column(JSON)
+
+
+# Створюємо таблиці в базі автоматично!
+Base.metadata.create_all(bind=engine)
+
+
+# --- СХЕМИ ДЛЯ ФРОНТЕНДУ ---
 class QuestionSchema(BaseModel):
     id: str
     text: str
@@ -39,82 +63,80 @@ class StudentResponseSchema(BaseModel):
     answers: list
 
 
-def read_db():
-    if not os.path.exists(FILE_PATH): return []
-    with open(FILE_PATH, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except:
-            return []
-
+# --- МАРШРУТИ ---
 
 @app.get("/api/templates")
 async def get_templates():
-    return read_db()
+    db = SessionLocal()
+    templates = db.query(DBTemplate).all()
+    db.close()
+    return [{"id": t.id, "title": t.title, "questions": t.questions} for t in templates]
 
 
 @app.post("/api/templates")
 async def save_template(survey: SurveyTemplateSchema):
-    db = read_db()
+    db = SessionLocal()
     if not survey.id:
         survey.id = str(uuid.uuid4())[:8]
-        db.append(survey.model_dump())
+        new_template = DBTemplate(id=survey.id, title=survey.title,
+                                  questions=[q.model_dump() for q in survey.questions])
+        db.add(new_template)
     else:
-        for idx, item in enumerate(db):
-            if item['id'] == survey.id:
-                db[idx] = survey.model_dump()
-    with open(FILE_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=4)
-    return {"message": "Шаблон збережено", "id": survey.id}
+        db_template = db.query(DBTemplate).filter(DBTemplate.id == survey.id).first()
+        if db_template:
+            db_template.title = survey.title
+            db_template.questions = [q.model_dump() for q in survey.questions]
+        else:
+            new_template = DBTemplate(id=survey.id, title=survey.title,
+                                      questions=[q.model_dump() for q in survey.questions])
+            db.add(new_template)
+    db.commit()
+    db.close()
+    return {"message": "Шаблон надійно збережено в БД!", "id": survey.id}
 
 
 @app.post("/api/templates/clone/{template_id}")
 async def clone_template(template_id: str):
-    db = read_db()
-    template = next((item for item in db if item["id"] == template_id), None)
-    if not template: raise HTTPException(status_code=404, detail="Не знайдено")
+    db = SessionLocal()
+    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
+    if not template:
+        db.close()
+        raise HTTPException(status_code=404, detail="Не знайдено")
 
-    new_copy = template.copy()
-    new_copy["id"] = str(uuid.uuid4())[:8]
-    new_copy["title"] = f"{template['title']} (Копія)"
-    db.append(new_copy)
-    with open(FILE_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=4)
-    return {"message": "Дубльовано успішно", "new_id": new_copy["id"]}
+    new_id = str(uuid.uuid4())[:8]
+    new_copy = DBTemplate(id=new_id, title=f"{template.title} (Копія)", questions=template.questions)
+    db.add(new_copy)
+    db.commit()
+    db.close()
+    return {"message": "Дубльовано успішно", "new_id": new_id}
 
 
 @app.delete("/api/templates/{template_id}")
 async def delete_template(template_id: str):
-    db = read_db()
-    db = [item for item in db if item["id"] != template_id]
-    with open(FILE_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=4)
+    db = SessionLocal()
+    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
+    if template:
+        db.delete(template)
+        db.commit()
+    db.close()
     return {"message": "Видалено"}
 
 
-# --- МАРШРУТИ ДЛЯ СТУДЕНТІВ ---
-
 @app.get("/api/templates/{template_id}")
 async def get_single_template(template_id: str):
-    db = read_db()
-    for item in db:
-        if item["id"] == template_id:
-            return item
+    db = SessionLocal()
+    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
+    db.close()
+    if template:
+        return {"id": template.id, "title": template.title, "questions": template.questions}
     raise HTTPException(status_code=404, detail="Опитування не знайдено")
 
 
 @app.post("/api/responses")
 async def save_student_response(response: StudentResponseSchema):
-    if not os.path.exists(RESPONSES_FILE):
-        db = []
-    else:
-        with open(RESPONSES_FILE, "r", encoding="utf-8") as f:
-            try:
-                db = json.load(f)
-            except:
-                db = []
-
-    db.append(response.model_dump())
-    with open(RESPONSES_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=4)
-    return {"message": "Дякуємо! Ваші відповіді збережено."}
+    db = SessionLocal()
+    new_response = DBResponse(survey_id=response.survey_id, answers=response.answers)
+    db.add(new_response)
+    db.commit()
+    db.close()
+    return {"message": "Дякуємо! Ваші відповіді збережено в надійній базі даних."}
