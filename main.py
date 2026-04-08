@@ -6,6 +6,8 @@ import uuid
 from sqlalchemy import create_engine, Column, String, Integer, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from jose import jwt
 
 app = FastAPI()
 
@@ -22,8 +24,10 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- КРИПТОГРАФІЯ (для паролів) ---
+# --- КРИПТОГРАФІЯ ТА ТОКЕНИ ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+SECRET_KEY = "cmyo-super-secret-key-change-later"  # Секретний ключ для підпису токенів
+ALGORITHM = "HS256"
 
 
 # --- МОДЕЛІ БАЗИ ДАНИХ ---
@@ -41,16 +45,14 @@ class DBResponse(Base):
     answers = Column(JSON)
 
 
-# НОВЕ: Таблиця користувачів
 class DBUser(Base):
     __tablename__ = "users"
     id = Column(String, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
-    role = Column(String)  # 'superadmin', 'admin', 'student'
+    role = Column(String)
 
 
-# НОВЕ: Таблиця пройдених опитувань (щоб не проходили двічі)
 class DBCompletedSurvey(Base):
     __tablename__ = "completed_surveys"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -88,9 +90,21 @@ class UserCreateSchema(BaseModel):
     role: str
 
 
+class UserLoginSchema(BaseModel):
+    email: str
+    password: str
+
+
+# --- ДОПОМІЖНІ ФУНКЦІЇ ---
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=1)  # Токен діє 1 день
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
 # --- МАРШРУТИ ---
 
-# НОВЕ: Секретна реєстрація
 @app.post("/api/secret-register")
 async def secret_register(user: UserCreateSchema):
     db = SessionLocal()
@@ -100,16 +114,27 @@ async def secret_register(user: UserCreateSchema):
         raise HTTPException(status_code=400, detail="Така пошта вже зареєстрована")
 
     hashed_pwd = pwd_context.hash(user.password)
-    new_user = DBUser(
-        id=str(uuid.uuid4())[:8],
-        email=user.email,
-        hashed_password=hashed_pwd,
-        role=user.role
-    )
+    new_user = DBUser(id=str(uuid.uuid4())[:8], email=user.email, hashed_password=hashed_pwd, role=user.role)
     db.add(new_user)
     db.commit()
     db.close()
     return {"message": f"Акаунт {user.email} (роль: {user.role}) успішно створено!"}
+
+
+# НОВЕ: Маршрут для входу
+@app.post("/api/login")
+async def login(user: UserLoginSchema):
+    db = SessionLocal()
+    db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
+    db.close()
+
+    # Перевіряємо чи є такий юзер і чи співпадає пароль
+    if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Неправильна пошта або пароль")
+
+    # Якщо все ок - видаємо VIP-перепустку (токен)
+    access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id})
+    return {"access_token": access_token, "role": db_user.role}
 
 
 @app.get("/api/templates")
