@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
 from sqlalchemy import create_engine, Column, String, Integer, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
+from passlib.context import CryptContext
 
 app = FastAPI()
 
@@ -15,13 +16,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ТВОЄ ПІДКЛЮЧЕННЯ ДО БАЗИ ДАНИХ NEON:
-# (я прибрав &channel_binding=require з кінця, щоб уникнути конфліктів у деяких версіях Python)
 DATABASE_URL = "postgresql://neondb_owner:npg_AlvcYP6VQsZ4@ep-morning-credit-a41lvtxp-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# --- КРИПТОГРАФІЯ (для паролів) ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 # --- МОДЕЛІ БАЗИ ДАНИХ ---
@@ -31,6 +33,7 @@ class DBTemplate(Base):
     title = Column(String, index=True)
     questions = Column(JSON)
 
+
 class DBResponse(Base):
     __tablename__ = "responses"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -38,7 +41,23 @@ class DBResponse(Base):
     answers = Column(JSON)
 
 
-# Створюємо таблиці в базі автоматично!
+# НОВЕ: Таблиця користувачів
+class DBUser(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    role = Column(String)  # 'superadmin', 'admin', 'student'
+
+
+# НОВЕ: Таблиця пройдених опитувань (щоб не проходили двічі)
+class DBCompletedSurvey(Base):
+    __tablename__ = "completed_surveys"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(String, index=True)
+    survey_id = Column(String, index=True)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -63,7 +82,35 @@ class StudentResponseSchema(BaseModel):
     answers: list
 
 
+class UserCreateSchema(BaseModel):
+    email: str
+    password: str
+    role: str
+
+
 # --- МАРШРУТИ ---
+
+# НОВЕ: Секретна реєстрація
+@app.post("/api/secret-register")
+async def secret_register(user: UserCreateSchema):
+    db = SessionLocal()
+    db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
+    if db_user:
+        db.close()
+        raise HTTPException(status_code=400, detail="Така пошта вже зареєстрована")
+
+    hashed_pwd = pwd_context.hash(user.password)
+    new_user = DBUser(
+        id=str(uuid.uuid4())[:8],
+        email=user.email,
+        hashed_password=hashed_pwd,
+        role=user.role
+    )
+    db.add(new_user)
+    db.commit()
+    db.close()
+    return {"message": f"Акаунт {user.email} (роль: {user.role}) успішно створено!"}
+
 
 @app.get("/api/templates")
 async def get_templates():
@@ -139,4 +186,4 @@ async def save_student_response(response: StudentResponseSchema):
     db.add(new_response)
     db.commit()
     db.close()
-    return {"message": "Дякуємо! Ваші відповіді збережено в надійній базі даних."}
+    return {"message": "Дякуємо! Ваші відповіді збережено."}
