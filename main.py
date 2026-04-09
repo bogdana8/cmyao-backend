@@ -21,7 +21,7 @@ app.add_middleware(
 
 DATABASE_URL = "postgresql://neondb_owner:npg_AlvcYP6VQsZ4@ep-morning-credit-a41lvtxp-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
 
-engine = create_engine(DATABASE_URL)engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -220,3 +220,8 @@ async def delete_template(template_id: str, user: dict = Depends(get_current_use
         db.commit()
     db.close()
     return {"message": "Видалено"}
+
+# Відкритий маршрут спеціально для бота-будильника
+@app.get("/api/ping")
+async def ping():
+    return {"status": "ok", "message": "Я не сплю!"}
