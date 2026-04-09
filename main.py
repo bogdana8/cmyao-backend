@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
@@ -7,7 +8,7 @@ from sqlalchemy import create_engine, Column, String, Integer, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
-from jose import jwt
+from jose import jwt, JWTError
 
 app = FastAPI()
 
@@ -26,9 +27,11 @@ Base = declarative_base()
 
 # --- КРИПТОГРАФІЯ ТА ТОКЕНИ ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "cmyo-super-secret-key-change-later"  # Секретний ключ для підпису токенів
+SECRET_KEY = "cmyo-super-secret-key-change-later" 
 ALGORITHM = "HS256"
 
+# Ініціалізуємо "охоронця" для перевірки токенів
+security = HTTPBearer()
 
 # --- МОДЕЛІ БАЗИ ДАНИХ ---
 class DBTemplate(Base):
@@ -37,13 +40,11 @@ class DBTemplate(Base):
     title = Column(String, index=True)
     questions = Column(JSON)
 
-
 class DBResponse(Base):
     __tablename__ = "responses"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     survey_id = Column(String, index=True)
     answers = Column(JSON)
-
 
 class DBUser(Base):
     __tablename__ = "users"
@@ -52,16 +53,13 @@ class DBUser(Base):
     hashed_password = Column(String)
     role = Column(String)
 
-
 class DBCompletedSurvey(Base):
     __tablename__ = "completed_surveys"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_id = Column(String, index=True)
     survey_id = Column(String, index=True)
 
-
 Base.metadata.create_all(bind=engine)
-
 
 # --- СХЕМИ ДЛЯ ФРОНТЕНДУ ---
 class QuestionSchema(BaseModel):
@@ -72,38 +70,44 @@ class QuestionSchema(BaseModel):
     logic_parent: Optional[str] = None
     logic_value: Optional[str] = None
 
-
 class SurveyTemplateSchema(BaseModel):
     id: Optional[str] = None
     title: str
     questions: List[QuestionSchema]
 
-
 class StudentResponseSchema(BaseModel):
     survey_id: str
     answers: list
-
 
 class UserCreateSchema(BaseModel):
     email: str
     password: str
     role: str
 
-
 class UserLoginSchema(BaseModel):
     email: str
     password: str
 
-
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=1)  # Токен діє 1 день
+    expire = datetime.utcnow() + timedelta(days=1)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+# НОВЕ: Функція, яка розшифровує токен і перевіряє, чи він дійсний
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Недійсний токен")
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Недійсний токен або термін його дії минув")
 
-# --- МАРШРУТИ ---
+# --- ВІДКРИТІ МАРШРУТИ (БЕЗ ПАРОЛІВ) ---
 
 @app.post("/api/secret-register")
 async def secret_register(user: UserCreateSchema):
@@ -112,7 +116,6 @@ async def secret_register(user: UserCreateSchema):
     if db_user:
         db.close()
         raise HTTPException(status_code=400, detail="Така пошта вже зареєстрована")
-
     hashed_pwd = pwd_context.hash(user.password)
     new_user = DBUser(id=str(uuid.uuid4())[:8], email=user.email, hashed_password=hashed_pwd, role=user.role)
     db.add(new_user)
@@ -120,80 +123,17 @@ async def secret_register(user: UserCreateSchema):
     db.close()
     return {"message": f"Акаунт {user.email} (роль: {user.role}) успішно створено!"}
 
-
-# НОВЕ: Маршрут для входу
 @app.post("/api/login")
 async def login(user: UserLoginSchema):
     db = SessionLocal()
     db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
     db.close()
-
-    # Перевіряємо чи є такий юзер і чи співпадає пароль
     if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
         raise HTTPException(status_code=401, detail="Неправильна пошта або пароль")
-
-    # Якщо все ок - видаємо VIP-перепустку (токен)
     access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id})
     return {"access_token": access_token, "role": db_user.role}
 
-
-@app.get("/api/templates")
-async def get_templates():
-    db = SessionLocal()
-    templates = db.query(DBTemplate).all()
-    db.close()
-    return [{"id": t.id, "title": t.title, "questions": t.questions} for t in templates]
-
-
-@app.post("/api/templates")
-async def save_template(survey: SurveyTemplateSchema):
-    db = SessionLocal()
-    if not survey.id:
-        survey.id = str(uuid.uuid4())[:8]
-        new_template = DBTemplate(id=survey.id, title=survey.title,
-                                  questions=[q.model_dump() for q in survey.questions])
-        db.add(new_template)
-    else:
-        db_template = db.query(DBTemplate).filter(DBTemplate.id == survey.id).first()
-        if db_template:
-            db_template.title = survey.title
-            db_template.questions = [q.model_dump() for q in survey.questions]
-        else:
-            new_template = DBTemplate(id=survey.id, title=survey.title,
-                                      questions=[q.model_dump() for q in survey.questions])
-            db.add(new_template)
-    db.commit()
-    db.close()
-    return {"message": "Шаблон надійно збережено в БД!", "id": survey.id}
-
-
-@app.post("/api/templates/clone/{template_id}")
-async def clone_template(template_id: str):
-    db = SessionLocal()
-    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
-    if not template:
-        db.close()
-        raise HTTPException(status_code=404, detail="Не знайдено")
-
-    new_id = str(uuid.uuid4())[:8]
-    new_copy = DBTemplate(id=new_id, title=f"{template.title} (Копія)", questions=template.questions)
-    db.add(new_copy)
-    db.commit()
-    db.close()
-    return {"message": "Дубльовано успішно", "new_id": new_id}
-
-
-@app.delete("/api/templates/{template_id}")
-async def delete_template(template_id: str):
-    db = SessionLocal()
-    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
-    if template:
-        db.delete(template)
-        db.commit()
-    db.close()
-    return {"message": "Видалено"}
-
-
+# Студентам треба бачити питання, щоб відповісти (Відкрито)
 @app.get("/api/templates/{template_id}")
 async def get_single_template(template_id: str):
     db = SessionLocal()
@@ -203,7 +143,7 @@ async def get_single_template(template_id: str):
         return {"id": template.id, "title": template.title, "questions": template.questions}
     raise HTTPException(status_code=404, detail="Опитування не знайдено")
 
-
+# Студентам треба зберігати відповіді (Відкрито)
 @app.post("/api/responses")
 async def save_student_response(response: StudentResponseSchema):
     db = SessionLocal()
@@ -212,3 +152,58 @@ async def save_student_response(response: StudentResponseSchema):
     db.commit()
     db.close()
     return {"message": "Дякуємо! Ваші відповіді збережено."}
+
+
+# --- ЗАКРИТІ МАРШРУТИ (ТІЛЬКИ З ТОКЕНОМ 🔐) ---
+# Зверни увагу на `user: dict = Depends(get_current_user)` - це і є замок!
+
+@app.get("/api/templates")
+async def get_templates(user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    templates = db.query(DBTemplate).all()
+    db.close()
+    return [{"id": t.id, "title": t.title, "questions": t.questions} for t in templates]
+
+@app.post("/api/templates")
+async def save_template(survey: SurveyTemplateSchema, user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    if not survey.id:
+        survey.id = str(uuid.uuid4())[:8]
+        new_template = DBTemplate(id=survey.id, title=survey.title, questions=[q.model_dump() for q in survey.questions])
+        db.add(new_template)
+    else:
+        db_template = db.query(DBTemplate).filter(DBTemplate.id == survey.id).first()
+        if db_template:
+            db_template.title = survey.title
+            db_template.questions = [q.model_dump() for q in survey.questions]
+        else:
+            new_template = DBTemplate(id=survey.id, title=survey.title, questions=[q.model_dump() for q in survey.questions])
+            db.add(new_template)
+    db.commit()
+    db.close()
+    return {"message": "Шаблон надійно збережено в БД!", "id": survey.id}
+
+@app.post("/api/templates/clone/{template_id}")
+async def clone_template(template_id: str, user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
+    if not template:
+        db.close()
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    
+    new_id = str(uuid.uuid4())[:8]
+    new_copy = DBTemplate(id=new_id, title=f"{template.title} (Копія)", questions=template.questions)
+    db.add(new_copy)
+    db.commit()
+    db.close()
+    return {"message": "Дубльовано успішно", "new_id": new_id}
+
+@app.delete("/api/templates/{template_id}")
+async def delete_template(template_id: str, user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
+    if template:
+        db.delete(template)
+        db.commit()
+    db.close()
+    return {"message": "Видалено"}
