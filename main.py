@@ -39,6 +39,7 @@ class DBTemplate(Base):
     id = Column(String, primary_key=True, index=True)
     title = Column(String, index=True)
     questions = Column(JSON)
+    target_audience = Column(JSON, nullable=True) # НОВЕ: Кому призначено
 
 class DBResponse(Base):
     __tablename__ = "responses"
@@ -52,6 +53,8 @@ class DBUser(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     role = Column(String)
+    full_name = Column(String, nullable=True) # НОВЕ: ПІБ
+    student_data = Column(JSON, nullable=True) # НОВЕ: Група, Курс і т.д.
 
 class DBCompletedSurvey(Base):
     __tablename__ = "completed_surveys"
@@ -83,6 +86,8 @@ class UserCreateSchema(BaseModel):
     email: str
     password: str
     role: str
+    full_name: Optional[str] = None      # НОВЕ
+    student_data: Optional[dict] = None  # НОВЕ
 
 class UserLoginSchema(BaseModel):
     email: str
@@ -116,12 +121,20 @@ async def secret_register(user: UserCreateSchema):
     if db_user:
         db.close()
         raise HTTPException(status_code=400, detail="Така пошта вже зареєстрована")
+    
     hashed_pwd = pwd_context.hash(user.password)
-    new_user = DBUser(id=str(uuid.uuid4())[:8], email=user.email, hashed_password=hashed_pwd, role=user.role)
+    new_user = DBUser(
+        id=str(uuid.uuid4())[:8], 
+        email=user.email, 
+        hashed_password=hashed_pwd, 
+        role=user.role,
+        full_name=user.full_name,          # Зберігаємо ПІБ
+        student_data=user.student_data     # Зберігаємо рюкзак
+    )
     db.add(new_user)
     db.commit()
     db.close()
-    return {"message": f"Акаунт {user.email} (роль: {user.role}) успішно створено!"}
+    return {"message": f"Акаунт {user.full_name or user.email} успішно створено!"}
 
 @app.post("/api/login")
 async def login(user: UserLoginSchema):
