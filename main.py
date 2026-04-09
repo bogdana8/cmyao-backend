@@ -156,17 +156,46 @@ async def get_single_template(template_id: str):
         return {"id": template.id, "title": template.title, "questions": template.questions}
     raise HTTPException(status_code=404, detail="Опитування не знайдено")
 
-# Студентам треба зберігати відповіді (Відкрито)
+# --- ОНОВЛЕНИЙ МАРШРУТ: Зберігаємо відповіді + фіксуємо, хто пройшов ---
 @app.post("/api/responses")
-async def save_student_response(response: StudentResponseSchema):
+async def save_student_response(response: StudentResponseSchema, user: dict = Depends(get_current_user)):
     db = SessionLocal()
+    
+    # 1. Зберігаємо самі відповіді
     new_response = DBResponse(survey_id=response.survey_id, answers=response.answers)
     db.add(new_response)
+    
+    # 2. Робимо відмітку в базі, що цей конкретний студент ПРОЙШОВ це опитування
+    completed_mark = DBCompletedSurvey(user_id=user["user_id"], survey_id=response.survey_id)
+    db.add(completed_mark)
+    
     db.commit()
     db.close()
     return {"message": "Дякуємо! Ваші відповіді збережено."}
 
-
+# --- НОВИЙ МАРШРУТ: Видаємо список опитувань для Кабінету Студента ---
+@app.get("/api/student/surveys")
+async def get_student_surveys(user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    
+    # Беремо всі опитування (пізніше ми додамо сюди фільтр по Спеціальності студента)
+    all_templates = db.query(DBTemplate).all()
+    
+    # Шукаємо в базі, які опитування цей студент ВЖЕ пройшов
+    completed_records = db.query(DBCompletedSurvey).filter(DBCompletedSurvey.user_id == user["user_id"]).all()
+    completed_ids = [record.survey_id for record in completed_records]
+    
+    # Формуємо список для фронтенду, додаючи мітку is_completed
+    result = []
+    for t in all_templates:
+        result.append({
+            "id": t.id,
+            "title": t.title,
+            "is_completed": t.id in completed_ids # True якщо пройшов, False якщо ні
+        })
+        
+    db.close()
+    return result
 # --- ЗАКРИТІ МАРШРУТИ (ТІЛЬКИ З ТОКЕНОМ 🔐) ---
 # Зверни увагу на `user: dict = Depends(get_current_user)` - це і є замок!
 
