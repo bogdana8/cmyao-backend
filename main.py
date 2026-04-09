@@ -198,7 +198,22 @@ async def get_student_surveys(user: dict = Depends(get_current_user)):
     return result
 # --- ЗАКРИТІ МАРШРУТИ (ТІЛЬКИ З ТОКЕНОМ 🔐) ---
 # Зверни увагу на `user: dict = Depends(get_current_user)` - це і є замок!
-
+# --- НОВИЙ МАРШРУТ: Віддаємо профіль студента ---
+@app.get("/api/student/me")
+async def get_student_profile(user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+    db.close()
+    
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        
+    return {
+        "full_name": db_user.full_name,
+        "email": db_user.email,
+        "student_data": db_user.student_data
+    }
+    
 @app.get("/api/templates")
 async def get_templates(user: dict = Depends(get_current_user)):
     db = SessionLocal()
