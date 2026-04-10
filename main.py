@@ -214,11 +214,10 @@ async def get_student_surveys(user: dict = Depends(get_current_user)):
             
     db.close()
     return result
-        
-    db.close()
-    return result
+
 # --- ЗАКРИТІ МАРШРУТИ (ТІЛЬКИ З ТОКЕНОМ 🔐) ---
 # Зверни увагу на `user: dict = Depends(get_current_user)` - це і є замок!
+
 # --- НОВИЙ МАРШРУТ: Віддаємо профіль студента ---
 @app.get("/api/student/me")
 async def get_student_profile(user: dict = Depends(get_current_user)):
@@ -240,7 +239,7 @@ async def get_templates(user: dict = Depends(get_current_user)):
     db = SessionLocal()
     templates = db.query(DBTemplate).all()
     db.close()
-    return [{"id": t.id, "title": t.title, "questions": t.questions} for t in templates]
+    return [{"id": t.id, "title": t.title, "questions": t.questions, "target_audience": t.target_audience} for t in templates]
 
 @app.post("/api/templates")
 async def save_template(survey: SurveyTemplateSchema, user: dict = Depends(get_current_user)):
