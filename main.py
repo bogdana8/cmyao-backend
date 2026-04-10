@@ -9,6 +9,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 app = FastAPI()
 
@@ -93,6 +95,9 @@ class UserCreateSchema(BaseModel):
 class UserLoginSchema(BaseModel):
     email: str
     password: str
+    
+class GoogleLoginSchema(BaseModel):
+    credential: str
 
 # --- ДОПОМІЖНІ ФУНКЦІЇ ---
 def create_access_token(data: dict):
@@ -136,6 +141,37 @@ async def secret_register(user: UserCreateSchema):
     db.commit()
     db.close()
     return {"message": f"Акаунт {user.full_name or user.email} успішно створено!"}
+
+GOOGLE_CLIENT_ID = "721585809833-756v703e49731ch3drcvn02c312m5fsn.apps.googleusercontent.com"
+
+@app.post("/api/google-login")
+async def google_login(auth_data: GoogleLoginSchema):
+    try:
+        # 1. Гугл перевіряє, чи токен справжній і не підроблений
+        idinfo = id_token.verify_oauth2_token(
+            auth_data.credential, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+
+        # 2. Дістаємо пошту, яку підтвердив Гугл
+        email = idinfo.get('email')
+
+        # 3. Шукаємо студента в нашій базі
+        db = SessionLocal()
+        db_user = db.query(DBUser).filter(DBUser.email == email).first()
+        db.close()
+
+        # Якщо Гугл сказав, що людина справжня, але її немає в нашій базі:
+        if not db_user:
+            raise HTTPException(status_code=403, detail="Вашої пошти немає в базі університету. Зверніться до деканату.")
+
+        # 4. Якщо все супер - видаємо наш ключ-перепустку (токен)
+        access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id})
+        return {"access_token": access_token, "role": db_user.role}
+
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Помилка перевірки Google")
 
 @app.post("/api/login")
 async def login(user: UserLoginSchema):
