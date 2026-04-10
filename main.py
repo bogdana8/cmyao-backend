@@ -77,6 +77,7 @@ class SurveyTemplateSchema(BaseModel):
     id: Optional[str] = None
     title: str
     questions: List[QuestionSchema]
+    target_audience: Optional[dict] = None  # НОВЕ: Правила, кому показувати
 
 class StudentResponseSchema(BaseModel):
     survey_id: str
@@ -178,21 +179,41 @@ async def save_student_response(response: StudentResponseSchema, user: dict = De
 async def get_student_surveys(user: dict = Depends(get_current_user)):
     db = SessionLocal()
     
-    # Беремо всі опитування (пізніше ми додамо сюди фільтр по Спеціальності студента)
-    all_templates = db.query(DBTemplate).all()
+    # 1. Дістаємо "рюкзак" студента
+    db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+    student_studies = db_user.student_data.get("навчання", []) if db_user and db_user.student_data else []
     
-    # Шукаємо в базі, які опитування цей студент ВЖЕ пройшов
+    all_templates = db.query(DBTemplate).all()
     completed_records = db.query(DBCompletedSurvey).filter(DBCompletedSurvey.user_id == user["user_id"]).all()
     completed_ids = [record.survey_id for record in completed_records]
     
-    # Формуємо список для фронтенду, додаючи мітку is_completed
     result = []
     for t in all_templates:
-        result.append({
-            "id": t.id,
-            "title": t.title,
-            "is_completed": t.id in completed_ids # True якщо пройшов, False якщо ні
-        })
+        is_allowed = True # За замовчуванням показуємо всім (глобальне опитування)
+        
+        # 2. Якщо в опитуванні є правила (наприклад {"Група": "ІПЗ-23-2"})
+        if t.target_audience:
+            is_allowed = False # Забороняємо, поки не знайдемо збіг
+            for study in student_studies:
+                match = True
+                for key, required_value in t.target_audience.items():
+                    # Перевіряємо, чи є в студента така група/спеціальність
+                    if study.get(key) != required_value:
+                        match = False
+                        break
+                if match:
+                    is_allowed = True # Знайшли збіг! Пускаємо!
+                    break
+                    
+        if is_allowed:
+            result.append({
+                "id": t.id,
+                "title": t.title,
+                "is_completed": t.id in completed_ids
+            })
+            
+    db.close()
+    return result
         
     db.close()
     return result
@@ -226,34 +247,30 @@ async def save_template(survey: SurveyTemplateSchema, user: dict = Depends(get_c
     db = SessionLocal()
     if not survey.id:
         survey.id = str(uuid.uuid4())[:8]
-        new_template = DBTemplate(id=survey.id, title=survey.title, questions=[q.model_dump() for q in survey.questions])
+        new_template = DBTemplate(
+            id=survey.id, 
+            title=survey.title, 
+            questions=[q.model_dump() for q in survey.questions],
+            target_audience=survey.target_audience # Зберігаємо цільову аудиторію
+        )
         db.add(new_template)
     else:
         db_template = db.query(DBTemplate).filter(DBTemplate.id == survey.id).first()
         if db_template:
             db_template.title = survey.title
             db_template.questions = [q.model_dump() for q in survey.questions]
+            db_template.target_audience = survey.target_audience # Оновлюємо
         else:
-            new_template = DBTemplate(id=survey.id, title=survey.title, questions=[q.model_dump() for q in survey.questions])
+            new_template = DBTemplate(
+                id=survey.id, 
+                title=survey.title, 
+                questions=[q.model_dump() for q in survey.questions],
+                target_audience=survey.target_audience
+            )
             db.add(new_template)
     db.commit()
     db.close()
     return {"message": "Шаблон надійно збережено в БД!", "id": survey.id}
-
-@app.post("/api/templates/clone/{template_id}")
-async def clone_template(template_id: str, user: dict = Depends(get_current_user)):
-    db = SessionLocal()
-    template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
-    if not template:
-        db.close()
-        raise HTTPException(status_code=404, detail="Не знайдено")
-    
-    new_id = str(uuid.uuid4())[:8]
-    new_copy = DBTemplate(id=new_id, title=f"{template.title} (Копія)", questions=template.questions)
-    db.add(new_copy)
-    db.commit()
-    db.close()
-    return {"message": "Дубльовано успішно", "new_id": new_id}
 
 @app.delete("/api/templates/{template_id}")
 async def delete_template(template_id: str, user: dict = Depends(get_current_user)):
