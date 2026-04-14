@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import json
 
 app = FastAPI()
 
@@ -210,14 +211,47 @@ async def save_student_response(response: StudentResponseSchema, user: dict = De
     db.close()
     return {"message": "Дякуємо! Ваші відповіді збережено."}
 
+# --- НОВИЙ МАРШРУТ: Віддаємо профіль студента ---
+@app.get("/api/student/me")
+async def get_student_profile(user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+    db.close()
+    
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Користувача не знайдено")
+        
+    # РОЗУМНЕ РОЗПАКУВАННЯ РЮКЗАКА: Якщо база віддала текст, перетворюємо на словник
+    s_data = db_user.student_data if db_user.student_data else {}
+    if isinstance(s_data, str):
+        try:
+            s_data = json.loads(s_data)
+        except:
+            s_data = {}
+            
+    return {
+        "full_name": db_user.full_name,
+        "email": db_user.email,
+        "student_data": s_data
+    }
+    
 # --- НОВИЙ МАРШРУТ: Видаємо список опитувань для Кабінету Студента ---
 @app.get("/api/student/surveys")
 async def get_student_surveys(user: dict = Depends(get_current_user)):
     db = SessionLocal()
     
-    # 1. Дістаємо "рюкзак" студента
+    # 1. Дістаємо студента
     db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
-    student_studies = db_user.student_data.get("навчання", []) if db_user and db_user.student_data else []
+    
+    # РОЗУМНЕ РОЗПАКУВАННЯ ДЛЯ СТУДЕНТА
+    s_data = db_user.student_data if db_user and db_user.student_data else {}
+    if isinstance(s_data, str):
+        try:
+            s_data = json.loads(s_data)
+        except:
+            s_data = {}
+            
+    student_studies = s_data.get("навчання", []) if isinstance(s_data, dict) else []
     
     all_templates = db.query(DBTemplate).all()
     completed_records = db.query(DBCompletedSurvey).filter(DBCompletedSurvey.user_id == user["user_id"]).all()
@@ -225,20 +259,26 @@ async def get_student_surveys(user: dict = Depends(get_current_user)):
     
     result = []
     for t in all_templates:
-        is_allowed = True # За замовчуванням показуємо всім (глобальне опитування)
+        is_allowed = True 
         
-        # 2. Якщо в опитуванні є правила (наприклад {"Група": "ІПЗ-23-2"})
-        if t.target_audience:
-            is_allowed = False # Забороняємо, поки не знайдемо збіг
+        # РОЗУМНЕ РОЗПАКУВАННЯ ПРАВИЛ АУДИТОРІЇ
+        t_audience = t.target_audience if t.target_audience else {}
+        if isinstance(t_audience, str):
+            try:
+                t_audience = json.loads(t_audience)
+            except:
+                t_audience = {}
+
+        if t_audience:
+            is_allowed = False 
             for study in student_studies:
                 match = True
-                for key, required_value in t.target_audience.items():
-                    # Перевіряємо, чи є в студента така група/спеціальність
+                for key, required_value in t_audience.items():
                     if study.get(key) != required_value:
                         match = False
                         break
                 if match:
-                    is_allowed = True # Знайшли збіг! Пускаємо!
+                    is_allowed = True 
                     break
                     
         if is_allowed:
@@ -250,25 +290,6 @@ async def get_student_surveys(user: dict = Depends(get_current_user)):
             
     db.close()
     return result
-
-# --- ЗАКРИТІ МАРШРУТИ (ТІЛЬКИ З ТОКЕНОМ 🔐) ---
-# Зверни увагу на `user: dict = Depends(get_current_user)` - це і є замок!
-
-# --- НОВИЙ МАРШРУТ: Віддаємо профіль студента ---
-@app.get("/api/student/me")
-async def get_student_profile(user: dict = Depends(get_current_user)):
-    db = SessionLocal()
-    db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
-    db.close()
-    
-    if not db_user:
-        raise HTTPException(status_code=404, detail="Користувача не знайдено")
-        
-    return {
-        "full_name": db_user.full_name,
-        "email": db_user.email,
-        "student_data": db_user.student_data
-    }
     
 @app.get("/api/templates")
 async def get_templates(user: dict = Depends(get_current_user)):
