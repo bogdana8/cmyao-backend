@@ -9,3 +9,5 @@ python-jose[cryptography]
 python-multipart
 google-auth
 requests
+pandas
+openpyxl
