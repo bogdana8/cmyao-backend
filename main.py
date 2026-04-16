@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from sqlalchemy import text
 import json
 import pandas as pd
 import io
@@ -408,4 +409,10 @@ async def save_student_response(response: StudentResponseSchema, user: dict = De
 
 @app.get("/api/ping")
 async def ping():
-    return {"status": "ok"}
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1")) # Легенький стук у базу даних
+        db.close()
+        return {"status": "ok", "db": "awake"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
