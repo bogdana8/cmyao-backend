@@ -298,7 +298,14 @@ async def get_student_profile(user: dict = Depends(get_current_user)):
     # Дістаємо оцінки з нової таблиці!
     grades = db.query(DBGrade).filter(DBGrade.student_id == db_user.id).all()
     grades_list = [
-        {"subject": g.subject, "score": g.score, "semester": g.semester, "teacher": g.teacher} 
+        {
+            "subject": g.subject, 
+            "score": g.score, 
+            "semester": g.semester, 
+            "teacher": g.teacher,
+            "group_name": g.group_name,     # Додаємо групу/спеціальність!
+            "control_form": g.control_form  # Додаємо форму контролю!
+        } 
         for g in grades
     ]
             
