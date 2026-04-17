@@ -113,6 +113,13 @@ class SurveyTemplateSchema(BaseModel):
 class StudentResponseSchema(BaseModel):
     survey_id: str
     answers: list
+    
+class GradeUpdateSchema(BaseModel):
+    score: str
+    subject: str
+    semester: int
+    control_form: str
+    teacher: str
 
 # --- ФУНКЦІЇ ДОСТУПУ (РОЛІ) ---
 def create_access_token(data: dict):
@@ -277,7 +284,53 @@ async def upload_grades(file: UploadFile = File(...), admin: dict = Depends(requ
     db.commit()
     db.close()
     return {"message": f"Успіх! Оброблено та додано/оновлено {added_count} оцінок."}
+@app.get("/api/csk/students")
+async def get_all_students_for_csk(admin: dict = Depends(require_csk_admin)):
+    """Отримати список всіх студентів з їхніми оцінками"""
+    db = SessionLocal()
+    students = db.query(DBUser).filter(DBUser.role == 'student').all()
+    result = []
+    for s in students:
+        grades = db.query(DBGrade).filter(DBGrade.student_id == s.id).all()
+        # Пробуємо витягти групу з student_data
+        group_name = "Невідомо"
+        if s.student_data and isinstance(s.student_data, dict):
+            studies = s.student_data.get("навчання", [])
+            if studies and len(studies) > 0:
+                group_name = studies[0].get("Група", "Невідомо")
+                
+        result.append({
+            "id": s.id,
+            "full_name": s.full_name or "Без імені",
+            "email": s.email,
+            "group": group_name,
+            "grades": [{
+                "id": g.id, "subject": g.subject, "score": g.score, 
+                "semester": g.semester, "control_form": g.control_form, 
+                "teacher": g.teacher, "group_name": g.group_name
+            } for g in grades]
+        })
+    db.close()
+    return result
 
+@app.put("/api/csk/grades/{grade_id}")
+async def update_single_grade(grade_id: int, grade_data: GradeUpdateSchema, admin: dict = Depends(require_csk_admin)):
+    """Оновити конкретну оцінку руками"""
+    db = SessionLocal()
+    grade = db.query(DBGrade).filter(DBGrade.id == grade_id).first()
+    if not grade:
+        db.close()
+        raise HTTPException(status_code=404, detail="Оцінку не знайдено")
+    
+    grade.score = grade_data.score
+    grade.subject = grade_data.subject
+    grade.semester = grade_data.semester
+    grade.control_form = grade_data.control_form
+    grade.teacher = grade_data.teacher
+    
+    db.commit()
+    db.close()
+    return {"message": "Оцінку успішно оновлено!"}
 # =========================================================
 # 🎓 ЗОНА СТУДЕНТА (ПРОФІЛЬ ТА ОЦІНКИ)
 # =========================================================
