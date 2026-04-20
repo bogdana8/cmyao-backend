@@ -475,8 +475,12 @@ async def save_student_response(response: StudentResponseSchema, user: dict = De
     db = SessionLocal()
     new_response = DBResponse(survey_id=response.survey_id, answers=response.answers)
     db.add(new_response)
-    completed_mark = DBCompletedSurvey(user_id=user["user_id"], survey_id=response.survey_id)
-    db.add(completed_mark)
+    
+    # Якщо це НЕ стейкхолдер, ставимо відмітку, що він пройшов опитування
+    if user.get("role") != "stakeholder":
+        completed_mark = DBCompletedSurvey(user_id=user["user_id"], survey_id=response.survey_id)
+        db.add(completed_mark)
+        
     db.commit()
     db.close()
     return {"message": "Збережено."}
