@@ -4,7 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
-from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -79,6 +79,15 @@ class DBGrade(Base):
     control_form = Column(String)
     teacher = Column(String)
 
+class DBAnnouncement(Base):
+    __tablename__ = "announcements"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    title = Column(String, nullable=False)
+    content = Column(String, nullable=True)
+    date = Column(String)
+    sender = Column(String) # Тут буде писати 'ЦСК' або 'ЦМЯО'
+    is_important = Column(Boolean, default=False)
+
 Base.metadata.create_all(bind=engine)
 
 # --- СХЕМИ ---
@@ -120,6 +129,11 @@ class GradeUpdateSchema(BaseModel):
     semester: int
     control_form: str
     teacher: str
+    
+class AnnouncementCreateSchema(BaseModel):
+    title: str
+    content: str = ""
+    is_important: bool = False
 
 # --- ФУНКЦІЇ ДОСТУПУ (РОЛІ) ---
 def create_access_token(data: dict):
@@ -466,6 +480,50 @@ async def save_student_response(response: StudentResponseSchema, user: dict = De
     db.commit()
     db.close()
     return {"message": "Збережено."}
+
+# =========================================================
+# 📢 ЗОНА ОГОЛОШЕНЬ
+# =========================================================
+@app.post("/api/announcements")
+async def create_announcement(ann: AnnouncementCreateSchema, user: dict = Depends(get_current_user)):
+    # Визначаємо, хто відправив новину
+    sender = "Деканат"
+    if user["role"] == "admin_csk": sender = "ЦСК"
+    elif user["role"] == "admin_cmyo": sender = "ЦМЯО"
+    elif user["role"] == "superadmin": sender = "Адміністрація"
+    
+    db = SessionLocal()
+    new_ann = DBAnnouncement(
+        title=ann.title,
+        content=ann.content,
+        date=datetime.now().strftime("%d.%m.%Y %H:%M"),
+        sender=sender,
+        is_important=ann.is_important
+    )
+    db.add(new_ann)
+    db.commit()
+    db.close()
+    return {"message": "Оголошення опубліковано!"}
+
+@app.get("/api/announcements")
+async def get_announcements(user: dict = Depends(get_current_user)):
+    db = SessionLocal()
+    # Сортуємо від найновіших до найстаріших
+    anns = db.query(DBAnnouncement).order_by(DBAnnouncement.id.desc()).all()
+    db.close()
+    return anns
+
+@app.delete("/api/announcements/{ann_id}")
+async def delete_announcement(ann_id: int, user: dict = Depends(get_current_user)):
+    # Забороняємо студентам видаляти новини
+    if user["role"] == "student": raise HTTPException(status_code=403)
+    db = SessionLocal()
+    ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
+    if ann:
+        db.delete(ann)
+        db.commit()
+    db.close()
+    return {"message": "Видалено"}
 
 @app.get("/api/ping")
 async def ping():
