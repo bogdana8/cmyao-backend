@@ -108,10 +108,10 @@ class GoogleLoginSchema(BaseModel):
 
 class UserCreateSchema(BaseModel):
     email: str
-    password: str
+    password: Optional[str] = None  # Зробили необов'язковим для оновлення
     role: str
     full_name: Optional[str] = None
-    student_data: Optional[dict] = None
+    student_data: Optional[dict] = None # Це буде наш контейнер для БУДЬ-ЯКИХ властивостей
 
 class QuestionSchema(BaseModel):
     id: str
@@ -209,23 +209,29 @@ async def get_all_users(admin: dict = Depends(require_superadmin)):
 
 @app.post("/api/superadmin/users")
 async def create_or_update_user(user: UserCreateSchema, admin: dict = Depends(require_superadmin)):
-    """Тут ти можеш створювати нових адмінів або міняти їм паролі"""
+    """Створення або оновлення користувача з будь-якими метаданими"""
     db = SessionLocal()
     db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
-    hashed_pwd = pwd_context.hash(user.password)
 
     if db_user:
-        db_user.hashed_password = hashed_pwd
+        # ОНОВЛЕННЯ ІСНУЮЧОГО
+        if user.password: # Якщо ввели новий пароль - оновлюємо
+            db_user.hashed_password = pwd_context.hash(user.password)
         db_user.role = user.role
         db_user.full_name = user.full_name
-        msg = f"Пароль та роль для {user.email} оновлено!"
+        db_user.student_data = user.student_data # Зберігаємо всі додаткові властивості
+        msg = f"Профіль {user.email} успішно оновлено!"
     else:
+        # СТВОРЕННЯ НОВОГО
+        if not user.password:
+            raise HTTPException(status_code=400, detail="Для нового користувача пароль обов'язковий!")
         new_user = DBUser(
-            id=str(uuid.uuid4())[:8], email=user.email, hashed_password=hashed_pwd, 
+            id=str(uuid.uuid4())[:8], email=user.email,
+            hashed_password=pwd_context.hash(user.password),
             role=user.role, full_name=user.full_name, student_data=user.student_data
         )
         db.add(new_user)
-        msg = f"Користувача {user.email} створено!"
+        msg = f"Нового користувача {user.email} створено!"
     
     db.commit()
     db.close()
