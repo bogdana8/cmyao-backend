@@ -531,6 +531,21 @@ async def get_announcements(user: dict = Depends(get_current_user)):
     db.close()
     return anns
 
+@app.put("/api/announcements/{ann_id}")
+async def update_announcement(ann_id: int, ann: AnnouncementCreateSchema, user: dict = Depends(get_current_user)):
+    # Дозволяємо редагувати адмінам
+    if user["role"] not in ["superadmin", "admin_csk", "admin_cmyo"]:
+        raise HTTPException(status_code=403, detail="Немає прав")
+    db = SessionLocal()
+    db_ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
+    if db_ann:
+        db_ann.title = ann.title
+        db_ann.content = ann.content
+        db_ann.is_important = ann.is_important
+        db.commit()
+    db.close()
+    return {"message": "Оголошення оновлено"}
+
 @app.delete("/api/announcements/{ann_id}")
 async def delete_announcement(ann_id: int, user: dict = Depends(get_current_user)):
     # Забороняємо студентам видаляти новини
