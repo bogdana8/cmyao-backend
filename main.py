@@ -16,8 +16,15 @@ import json
 import pandas as pd
 import io
 import re
+import os
+import shutil
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
+
+# Створюємо папку для збереження PDF і дозволяємо її читати
+os.makedirs("static/uploads", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -528,6 +535,29 @@ async def delete_announcement(ann_id: int, user: dict = Depends(get_current_user
         db.commit()
     db.close()
     return {"message": "Видалено"}
+
+# =========================================================
+# 📄 ЗОНА ФАЙЛІВ (ОПП ДЛЯ СТЕЙКХОЛДЕРІВ)
+# =========================================================
+@app.post("/api/upload-opp")
+async def upload_opp(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    # Тільки ЦМЯО та СуперАдмін можуть вантажити ОПП
+    if user.get("role") not in ["superadmin", "admin_cmyo"]:
+        raise HTTPException(status_code=403, detail="Доступ заборонено")
+    
+    file_location = "static/uploads/current_opp.pdf"
+    with open(file_location, "wb+") as file_object:
+        shutil.copyfileobj(file.file, file_object)
+    return {"message": "ОПП успішно завантажено!", "url": f"/{file_location}"}
+
+@app.get("/api/opp")
+async def get_opp():
+    if os.path.exists("static/uploads/current_opp.pdf"):
+        # Додаємо унікальний параметр, щоб браузер не кешував старий файл
+        import time
+        return {"url": f"/static/uploads/current_opp.pdf?t={int(time.time())}"}
+    return {"url": None}
+
 
 @app.get("/api/ping")
 async def ping():
