@@ -19,6 +19,7 @@ import re
 import os
 import shutil
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 app = FastAPI()
 
@@ -541,21 +542,27 @@ async def delete_announcement(ann_id: int, user: dict = Depends(get_current_user
 # =========================================================
 @app.post("/api/upload-opp")
 async def upload_opp(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    # Тільки ЦМЯО та СуперАдмін можуть вантажити ОПП
     if user.get("role") not in ["superadmin", "admin_cmyo"]:
         raise HTTPException(status_code=403, detail="Доступ заборонено")
     
+    os.makedirs("static/uploads", exist_ok=True)
     file_location = "static/uploads/current_opp.pdf"
     with open(file_location, "wb+") as file_object:
         shutil.copyfileobj(file.file, file_object)
-    return {"message": "ОПП успішно завантажено!", "url": f"/{file_location}"}
+    return {"message": "ОПП успішно завантажено!", "url": "/api/opp/download"}
+
+@app.get("/api/opp/download")
+async def download_opp():
+    file_path = "static/uploads/current_opp.pdf"
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="application/pdf", filename="OPP.pdf")
+    raise HTTPException(status_code=404, detail="Файл не знайдено")
 
 @app.get("/api/opp")
 async def get_opp():
     if os.path.exists("static/uploads/current_opp.pdf"):
-        # Додаємо унікальний параметр, щоб браузер не кешував старий файл
         import time
-        return {"url": f"/static/uploads/current_opp.pdf?t={int(time.time())}"}
+        return {"url": f"/api/opp/download?t={int(time.time())}"}
     return {"url": None}
 
 
