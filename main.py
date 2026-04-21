@@ -205,7 +205,14 @@ async def get_all_users(admin: dict = Depends(require_superadmin)):
     db = SessionLocal()
     users = db.query(DBUser).all()
     db.close()
-    return [{"id": u.id, "email": u.email, "full_name": u.full_name, "role": u.role} for u in users]
+    # ТЕПЕР МИ ВІДДАЄМО І STUDENT_DATA ТАКОЖ!
+    return [{
+        "id": u.id, 
+        "email": u.email, 
+        "full_name": u.full_name, 
+        "role": u.role,
+        "student_data": u.student_data
+    } for u in users]
 
 @app.post("/api/superadmin/users")
 async def create_or_update_user(user: UserCreateSchema, admin: dict = Depends(require_superadmin)):
