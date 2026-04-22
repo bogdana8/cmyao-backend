@@ -96,6 +96,11 @@ class DBAnnouncement(Base):
     sender = Column(String) # Тут буде писати 'ЦСК' або 'ЦМЯО'
     is_important = Column(Boolean, default=False)
 
+class DBDictionary(Base):
+    __tablename__ = "dictionaries"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    data = Column(JSON, nullable=False)
+
 Base.metadata.create_all(bind=engine)
 
 # --- СХЕМИ ---
@@ -591,6 +596,60 @@ async def get_opp():
         import time
         return {"url": f"/api/opp/download?t={int(time.time())}"}
     return {"url": None}
+
+# =========================================================
+# 📚 ЗОНА ДОВІДНИКІВ
+# =========================================================
+
+# Додаємо стартовий набір, щоб база Neon мала що завантажити при першому запуску!
+DEFAULT_DICTS = {
+    "groups": ["ІПЗ-23-1", "ІПЗ-23-2", "КН-20-1", "МКЖ-25"],
+    "specialties": ["F2 Інженерія програмного забеспечення", "F3 Комп'ютерні науки", "СЗ Міжнародні відносини/С7 Журналістика"],
+    "courses": ["1", "2", "3", "4", "1м", "2м"],
+    "semester": ["1", "2", "3", "4", "5", "6", "7","8","1м","2м","3м"],
+    "floor": ["Жіноча", "Чоловіча", "Середня"],#хе-хе, не смей трогать — прокляну
+    "finances": ["Бюджет", "Контракт"],
+    "study_forms": ["Денна", "Заочна", "Дуальна"],
+    "faculties": ["ФІТ", "ННІЕБО", "ННЮІ", "ННТІ"],
+    "curriculum": ["121-ІПЗ-23-Б-Д"],
+    "program": ["121-ІПЗ-23-Б"],
+    "departments": ["ІППЗ", "ЕЦБ", "МВ"],
+    "teacher_positions": ["Завідуючий кафедри", "Доцент", "Професор"],
+    "degrees": ["Кандидат наук", "Доктор наук", "Без ступеня"]
+}
+
+@app.get("/api/dictionaries")
+async def get_dictionaries():
+    """Отримати всі довідники. Якщо їх ще немає в базі - створює стандартні."""
+    db = SessionLocal()
+    dict_record = db.query(DBDictionary).first()
+    
+    if not dict_record:
+        # Якщо база пуста, записуємо стандартні значення
+        new_dict = DBDictionary(data=DEFAULT_DICTS)
+        db.add(new_dict)
+        db.commit()
+        db.refresh(new_dict)
+        dict_record = new_dict
+        
+    db.close()
+    return dict_record.data
+
+@app.put("/api/dictionaries")
+async def update_dictionaries(new_data: dict, admin: dict = Depends(require_superadmin)):
+    """Оновити довідники (доступно тільки суперадміну)"""
+    db = SessionLocal()
+    dict_record = db.query(DBDictionary).first()
+    
+    if dict_record:
+        dict_record.data = new_data
+    else:
+        dict_record = DBDictionary(data=new_data)
+        db.add(dict_record)
+        
+    db.commit()
+    db.close()
+    return {"message": "Довідники успішно оновлено!"}
 
 
 @app.get("/api/ping")
