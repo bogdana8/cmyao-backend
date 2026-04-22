@@ -17,6 +17,7 @@ import pandas as pd
 import io
 import re
 import os
+import time
 import shutil
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -593,7 +594,6 @@ async def download_opp():
 @app.get("/api/opp")
 async def get_opp():
     if os.path.exists("static/uploads/current_opp.pdf"):
-        import time
         return {"url": f"/api/opp/download?t={int(time.time())}"}
     return {"url": None}
 
@@ -603,19 +603,19 @@ async def get_opp():
 
 # Додаємо стартовий набір, щоб база Neon мала що завантажити при першому запуску!
 DEFAULT_DICTS = {
-    "groups": ["ІПЗ-23-1", "ІПЗ-23-2", "КН-20-1", "МКЖ-25"],
-    "specialties": ["F2 Інженерія програмного забеспечення", "F3 Комп'ютерні науки", "СЗ Міжнародні відносини/С7 Журналістика"],
-    "courses": ["1", "2", "3", "4", "1м", "2м"],
-    "semester": ["1", "2", "3", "4", "5", "6", "7","8","1м","2м","3м"],
-    "floor": ["Жіноча", "Чоловіча", "Середня"],#хе-хе, не смей трогать — прокляну
-    "finances": ["Бюджет", "Контракт"],
-    "study_forms": ["Денна", "Заочна", "Дуальна"],
-    "faculties": ["ФІТ", "ННІЕБО", "ННЮІ", "ННТІ"],
-    "curriculum": ["121-ІПЗ-23-Б-Д"],
-    "program": ["121-ІПЗ-23-Б"],
-    "departments": ["ІППЗ", "ЕЦБ", "МВ"],
-    "teacher_positions": ["Завідуючий кафедри", "Доцент", "Професор"],
-    "degrees": ["Кандидат наук", "Доктор наук", "Без ступеня"]
+    "groups": [],
+    "specialties": [],
+    "courses": [],
+    "semester": [],
+    "floor": [],#хе-хе, не смей трогать — прокляну
+    "finances": [],
+    "study_forms": [],
+    "faculties": [],
+    "curriculum": [],
+    "program": [],
+    "departments": [],
+    "teacher_positions": [],
+    "degrees": []
 }
 
 @app.get("/api/dictionaries")
