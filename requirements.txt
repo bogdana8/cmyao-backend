@@ -11,3 +11,4 @@ google-auth
 requests
 pandas
 openpyxl
+python-dotenv
