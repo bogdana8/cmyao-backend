@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -18,26 +18,26 @@ import re
 import os
 import time
 import shutil
+from collections import defaultdict
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 # =========================================================
-# ⚙️ КОНФІГУРАЦІЯ — читаємо з оточення, не хардкодимо!
+# ⚙️ КОНФІГУРАЦІЯ
 # =========================================================
 from dotenv import load_dotenv
-load_dotenv()  # Завантажує змінні з .env файлу (якщо є)
+load_dotenv()
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 
-# Перевіряємо, що всі критичні змінні задані
 if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY не задано! Додайте його в .env або змінні оточення.")
+    raise RuntimeError("SECRET_KEY не задано!")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задано! Додайте його в .env або змінні оточення.")
+    raise RuntimeError("DATABASE_URL не задано!")
 if not GOOGLE_CLIENT_ID:
-    raise RuntimeError("GOOGLE_CLIENT_ID не задано! Додайте його в .env або змінні оточення.")
+    raise RuntimeError("GOOGLE_CLIENT_ID не задано!")
 
 # =========================================================
 # 🚀 ІНІЦІАЛІЗАЦІЯ ДОДАТКУ
@@ -55,18 +55,43 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🗄️ БАЗА ДАНИХ — правильне управління сесіями
+# 🛡️ RATE LIMITER (захист від брутфорсу)
+# =========================================================
+# Зберігаємо: { ip: [timestamp1, timestamp2, ...] }
+_login_attempts: dict = defaultdict(list)
+LOGIN_RATE_LIMIT = 10        # максимум спроб
+LOGIN_RATE_WINDOW = 60 * 15  # за 15 хвилин (в секундах)
+
+def check_login_rate_limit(request: Request):
+    """
+    Перевіряє IP-адресу на перевищення ліміту спроб входу.
+    При перевищенні кидає 429 Too Many Requests.
+    """
+    ip = request.client.host
+    now = time.time()
+
+    # Залишаємо тільки спроби в межах вікна
+    _login_attempts[ip] = [
+        t for t in _login_attempts[ip]
+        if now - t < LOGIN_RATE_WINDOW
+    ]
+
+    if len(_login_attempts[ip]) >= LOGIN_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Забагато спроб входу. Спробуйте через 15 хвилин."
+        )
+
+    _login_attempts[ip].append(now)
+
+# =========================================================
+# 🗄️ БАЗА ДАНИХ
 # =========================================================
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 def get_db() -> Generator[Session, None, None]:
-    """
-    Dependency для FastAPI.
-    Гарантує закриття сесії навіть якщо виникла помилка.
-    Використовуйте як: db: Session = Depends(get_db)
-    """
     db = SessionLocal()
     try:
         yield db
@@ -223,26 +248,62 @@ def require_cmyo_admin(user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(status_code=403, detail="Тільки для ЦМЯО")
     return user
 
+# ✅ НОВА ФУНКЦІЯ: тільки адміністратори можуть керувати оголошеннями
+def require_announcement_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") not in ["superadmin", "admin_csk", "admin_cmyo"]:
+        raise HTTPException(status_code=403, detail="Тільки для адміністраторів")
+    return user
+
 # =========================================================
 # 🔐 АВТОРИЗАЦІЯ
 # =========================================================
+
+# ✅ ВИПРАВЛЕНО: додано rate limiting та захист від timing attack
 @app.post("/api/login")
-async def login(user: UserLoginSchema, db: Session = Depends(get_db)):
+async def login(
+    user: UserLoginSchema,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    # Перевіряємо ліміт спроб ДО будь-якої логіки
+    check_login_rate_limit(request)
+
     db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
-    if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
+
+    # Захист від timing attack: завжди виконуємо verify, навіть якщо юзера немає.
+    # Без цього зловмисник може визначити існуючі акаунти по часу відповіді.
+    dummy_hash = "$2b$12$KIX6s9S8sS8sS8sS8sS8sOKIX6s9S8sS8sS8sS8sS8sS8sS8sS8s"
+    hash_to_check = db_user.hashed_password if db_user else dummy_hash
+    password_valid = pwd_context.verify(user.password, hash_to_check)
+
+    if not db_user or not password_valid:
         raise HTTPException(status_code=401, detail="Неправильна пошта або пароль")
-    access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id})
+
+    access_token = create_access_token(
+        data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
+    )
     return {"access_token": access_token, "role": db_user.role}
 
+# ✅ ВИПРАВЛЕНО: додано rate limiting на Google login теж
 @app.post("/api/google-login")
-async def google_login(auth_data: GoogleLoginSchema, db: Session = Depends(get_db)):
+async def google_login(
+    auth_data: GoogleLoginSchema,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    check_login_rate_limit(request)
+
     try:
-        idinfo = id_token.verify_oauth2_token(auth_data.credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+        idinfo = id_token.verify_oauth2_token(
+            auth_data.credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
         email = idinfo.get("email")
         db_user = db.query(DBUser).filter(DBUser.email == email).first()
         if not db_user:
             raise HTTPException(status_code=403, detail="Вашої пошти немає в базі.")
-        access_token = create_access_token(data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id})
+        access_token = create_access_token(
+            data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
+        )
         return {"access_token": access_token, "role": db_user.role}
     except ValueError:
         raise HTTPException(status_code=401, detail="Помилка Google")
@@ -581,19 +642,45 @@ async def delete_template(
         db.commit()
     return {"message": "Видалено"}
 
+# ✅ ВИПРАВЛЕНО: додано авторизацію — тільки авторизовані користувачі
+# можуть отримувати питання опитування (до проходження)
 @app.get("/api/templates/{template_id}")
-async def get_single_template(template_id: str, db: Session = Depends(get_db)):
+async def get_single_template(
+    template_id: str,
+    user: dict = Depends(get_current_user),  # ← раніше не було!
+    db: Session = Depends(get_db)
+):
     template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
-    if template:
-        return {"id": template.id, "title": template.title, "questions": template.questions}
-    raise HTTPException(status_code=404)
+    if not template:
+        raise HTTPException(status_code=404, detail="Опитування не знайдено")
+    return {"id": template.id, "title": template.title, "questions": template.questions}
 
+# ✅ ВИПРАВЛЕНО: додано перевірку існування опитування та захист від повторного проходження
 @app.post("/api/responses")
 async def save_student_response(
     response: StudentResponseSchema,
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # 1. Перевіряємо, що опитування існує
+    template = db.query(DBTemplate).filter(DBTemplate.id == response.survey_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Опитування не знайдено")
+
+    # 2. Перевіряємо, що студент/викладач не проходив це опитування раніше.
+    #    Стейкхолдери можуть проходити необмежено (за бізнес-логікою).
+    if user.get("role") != "stakeholder":
+        already_completed = db.query(DBCompletedSurvey).filter(
+            DBCompletedSurvey.user_id == user["user_id"],
+            DBCompletedSurvey.survey_id == response.survey_id
+        ).first()
+        if already_completed:
+            raise HTTPException(
+                status_code=409,
+                detail="Ви вже проходили це опитування"
+            )
+
+    # 3. Зберігаємо відповіді
     db.add(DBResponse(survey_id=response.survey_id, answers=response.answers))
 
     if user.get("role") != "stakeholder":
@@ -605,10 +692,12 @@ async def save_student_response(
 # =========================================================
 # 📢 ОГОЛОШЕННЯ
 # =========================================================
+
+# ✅ ВИПРАВЛЕНО: тільки адміни можуть створювати оголошення
 @app.post("/api/announcements")
 async def create_announcement(
     ann: AnnouncementCreateSchema,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_announcement_admin),  # ← раніше був get_current_user
     db: Session = Depends(get_db)
 ):
     sender_map = {
@@ -635,37 +724,39 @@ async def get_announcements(
 ):
     return db.query(DBAnnouncement).order_by(DBAnnouncement.id.desc()).all()
 
+# ✅ ВИПРАВЛЕНО: використовуємо require_announcement_admin замість ручної перевірки
 @app.put("/api/announcements/{ann_id}")
 async def update_announcement(
     ann_id: int,
     ann: AnnouncementCreateSchema,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_announcement_admin),  # ← раніше була ручна перевірка ролі
     db: Session = Depends(get_db)
 ):
-    if user["role"] not in ["superadmin", "admin_csk", "admin_cmyo"]:
-        raise HTTPException(status_code=403, detail="Немає прав")
-
     db_ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
-    if db_ann:
-        db_ann.title = ann.title
-        db_ann.content = ann.content
-        db_ann.is_important = ann.is_important
-        db.commit()
+    if not db_ann:
+        raise HTTPException(status_code=404, detail="Оголошення не знайдено")
+
+    db_ann.title = ann.title
+    db_ann.content = ann.content
+    db_ann.is_important = ann.is_important
+    db.commit()
     return {"message": "Оголошення оновлено"}
 
+# ✅ ВИПРАВЛЕНО: використовуємо require_announcement_admin —
+# раніше викладачі (role="teacher") могли видаляти оголошення,
+# бо перевірка блокувала тільки role="student"
 @app.delete("/api/announcements/{ann_id}")
 async def delete_announcement(
     ann_id: int,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_announcement_admin),  # ← раніше: if role == "student": raise
     db: Session = Depends(get_db)
 ):
-    if user["role"] == "student":
-        raise HTTPException(status_code=403)
-
     ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
-    if ann:
-        db.delete(ann)
-        db.commit()
+    if not ann:
+        raise HTTPException(status_code=404, detail="Оголошення не знайдено")
+
+    db.delete(ann)
+    db.commit()
     return {"message": "Видалено"}
 
 # =========================================================
@@ -709,8 +800,13 @@ DEFAULT_DICTS = {
     "industries": [], "admin_departments": []
 }
 
+# ✅ ВИПРАВЛЕНО: довідники тепер вимагають авторизацію.
+# Публічний доступ розкривав структуру (групи, кафедри, спеціальності).
 @app.get("/api/dictionaries")
-async def get_dictionaries(db: Session = Depends(get_db)):
+async def get_dictionaries(
+    user: dict = Depends(get_current_user),  # ← раніше не було!
+    db: Session = Depends(get_db)
+):
     dict_record = db.query(DBDictionary).first()
     if not dict_record:
         dict_record = DBDictionary(data=DEFAULT_DICTS)
