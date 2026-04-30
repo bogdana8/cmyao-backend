@@ -136,6 +136,11 @@ class DBDictionary(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     data = Column(JSON, nullable=False)
 
+class DBBoardState(Base):
+    __tablename__ = "board_state"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    state = Column(JSON, nullable=False)
+
 Base.metadata.create_all(bind=engine)
 
 # =========================================================
@@ -727,6 +732,35 @@ async def update_dictionaries(
         db.add(DBDictionary(data=new_data))
     db.commit()
     return {"message": "Довідники успішно оновлено!"}
+
+# =========================================================
+# 🗂️ ДОШКА ЦМЯО — СТАН ПАПОК
+# =========================================================
+DEFAULT_BOARD_STATE = {"folders": [], "survey_folders": {}}
+
+@app.get("/api/cmyo/board")
+async def get_board_state(
+    user: dict = Depends(require_cmyo_admin),
+    db: Session = Depends(get_db)
+):
+    record = db.query(DBBoardState).first()
+    if not record:
+        return DEFAULT_BOARD_STATE
+    return record.state
+
+@app.put("/api/cmyo/board")
+async def save_board_state(
+    state: dict,
+    user: dict = Depends(require_cmyo_admin),
+    db: Session = Depends(get_db)
+):
+    record = db.query(DBBoardState).first()
+    if record:
+        record.state = state
+    else:
+        db.add(DBBoardState(state=state))
+    db.commit()
+    return {"message": "Збережено"}
 
 # =========================================================
 # 🏓 PING
