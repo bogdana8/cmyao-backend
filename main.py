@@ -25,7 +25,7 @@ from shevchenko import in_genitive, GrammaticalGender, DeclensionInput
 from docxtpl import DocxTemplate
 from num2words import num2words
 from fastapi.responses import StreamingResponse
-
+from urllib.parse import quote
 
 
 # =========================================================
@@ -996,11 +996,19 @@ async def generate_document(data: dict, user: dict = Depends(require_csk_admin))
         doc.save(output)
         output.seek(0)
         
+        # ОЦІ ТРИ РЯДКИ БУЛИ ВИПАДКОВО ВИДАЛЕНІ:
         safe_last = data.get('last_name', 'Student').replace(' ', '_').title()
         safe_group = data.get('group', 'Group').replace(' ', '_')
         filename = f"{doc_type.split('_')[-1]}_{safe_last}_{safe_group}_{datetime.now().strftime('%d.%m.%Y')}.docx"
-        
-        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
+
+        # А ось твоє правильне кодування:
+        encoded_filename = quote(filename)
+
+        return StreamingResponse(
+            output, 
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", 
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Генерація помилка: {str(e)}")
 
