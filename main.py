@@ -886,18 +886,30 @@ async def get_generator_config(user: dict = Depends(require_csk_admin)):
 @app.get("/api/csk/generator/students")
 async def search_gen_students(q: str = "", db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)):
     if not q: return []
-    # Шукаємо студентів за ПІБ (нечутливо до регістру)
+    # Шукаємо студентів за ПІБ
     students = db.query(DBUser).filter(DBUser.role == "student", DBUser.full_name.ilike(f"%{q}%")).limit(10).all()
     res = []
     for s in students:
-        group = "Невідомо"
-        if s.student_data and isinstance(s.student_data, dict):
-            group = s.student_data.get("навчання", [{}])[0].get("Група", "Невідомо")
-        res.append({"id": s.id, "text": f"{s.full_name}, {group}"})
+        s_data = s.student_data if isinstance(s.student_data, dict) else {}
+        studies = s_data.get("навчання", [])
+        
+        if not studies:
+            res.append({"id": f"{s.id}_0", "text": f"{s.full_name} (Немає даних про групу)"})
+        else:
+            # Виводимо окремий пункт для кожної спеціальності студента
+            for idx, study in enumerate(studies):
+                group = study.get("Група", "Невідомо")
+                spec = study.get("Спеціальність", "")
+                res.append({"id": f"{s.id}_{idx}", "text": f"{s.full_name} — {group} ({spec})"})
     return res
 
-@app.get("/api/csk/generator/student/{student_id}")
-async def get_gen_student_data(student_id: str, db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)):
+@app.get("/api/csk/generator/student/{composite_id}")
+async def get_gen_student_data(composite_id: str, db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)):
+    # Розпаковуємо наш хитрий ID (наприклад, "436aa621_1" -> id="436aa621", index=1)
+    parts = composite_id.split("_")
+    student_id = parts[0]
+    study_idx = int(parts[1]) if len(parts) > 1 else 0
+
     student = db.query(DBUser).filter(DBUser.id == student_id).first()
     if not student: raise HTTPException(status_code=404, detail="Студента не знайдено")
 
@@ -906,7 +918,6 @@ async def get_gen_student_data(student_id: str, db: Session = Depends(get_db), u
     first_name = name_parts[1] if len(name_parts) > 1 else "Ім'я"
     patronymic = name_parts[2] if len(name_parts) > 2 else "Побатькові"
 
-    # Визначаємо стать за по-батькові
     gender = GrammaticalGender.FEMININE if patronymic.lower().endswith('на') else GrammaticalGender.MASCULINE
     student_title = "Здобувачки вищої освіти" if gender == GrammaticalGender.FEMININE else "Здобувача вищої освіти"
 
@@ -925,21 +936,29 @@ async def get_gen_student_data(student_id: str, db: Session = Depends(get_db), u
         ln_gen_title = orig_last_name.title()
 
     s_data = student.student_data if isinstance(student.student_data, dict) else {}
-    navch = s_data.get("навчання", [{}])[0]
+    studies = s_data.get("навчання", [])
+    # Беремо саме ту спеціальність, яку обрали в випадаючому списку
+    navch = studies[study_idx] if study_idx < len(studies) else {}
     
     academic_unit_full = navch.get("Факультет", "")
     if academic_unit_full and not academic_unit_full.isupper():
         academic_unit_full = academic_unit_full[0].lower() + academic_unit_full[1:]
 
-    funding_source = " державним замовленням" if str(navch.get("Оплата", "")).lower() == "бюджет" else " кошти фізичних осіб"
+    # Розширена перевірка фінансування (шукає і "Оплата", і "Фінансування")
+    funding_raw = str(navch.get("Оплата", navch.get("Фінансування", ""))).lower()
+    funding_source = " державним замовленням" if "бюджет" in funding_raw else " кошти фізичних осіб"
+    
     course_val = str(navch.get("Курс", ""))
+    
+    # Витягуємо телефон з кореня JSON або повертаємо порожній рядок
+    phone = s_data.get("Телефон", s_data.get("phone", ""))
     
     return {
         "course": course_val, "group": navch.get("Група", ""), "spec": navch.get("Спеціальність", ""),
         "academic_unit": academic_unit_full, "edu_form": navch.get("Форма навчання", "денної").lower(),
         "name": f"{fn_gen} {ln_gen}", "first_name": fn_gen, "last_name": ln_gen,
         "last_name_title": ln_gen_title, "patronymic": pn_gen, "student_title": student_title,
-        "phone": "", "funding_source": funding_source
+        "phone": phone, "funding_source": funding_source
     }
 
 @app.post("/api/csk/generator/generate")
