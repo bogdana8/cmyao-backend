@@ -155,6 +155,7 @@ class DBAnnouncement(Base):
     date = Column(String)
     sender = Column(String)
     is_important = Column(Boolean, default=False)
+    is_edited = Column(Boolean, default=False)
 
 class DBDictionary(Base):
     __tablename__ = "dictionaries"
@@ -214,6 +215,7 @@ class AnnouncementCreateSchema(BaseModel):
     title: str
     content: str = ""
     is_important: bool = False
+    is_edited: bool = False
 
 # =========================================================
 # 🔑 ФУНКЦІЇ АВТОРИЗАЦІЇ
@@ -729,16 +731,21 @@ async def get_announcements(
 async def update_announcement(
     ann_id: int,
     ann: AnnouncementCreateSchema,
-    user: dict = Depends(require_announcement_admin),  # ← раніше була ручна перевірка ролі
+    user: dict = Depends(require_announcement_admin),
     db: Session = Depends(get_db)
 ):
     db_ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
     if not db_ann:
         raise HTTPException(status_code=404, detail="Оголошення не знайдено")
 
+    # Перевірка: ЦСК може змінювати тільки свої повідомлення
+    if user.get("role") == "admin_csk" and db_ann.sender != "ЦСК":
+        raise HTTPException(status_code=403, detail="Ви можете змінювати лише оголошення ЦСК")
+
     db_ann.title = ann.title
     db_ann.content = ann.content
     db_ann.is_important = ann.is_important
+    db_ann.is_edited = True  # Автоматично ставимо позначку "змінено"
     db.commit()
     return {"message": "Оголошення оновлено"}
 
