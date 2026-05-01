@@ -25,7 +25,8 @@ from shevchenko import in_genitive, GrammaticalGender, DeclensionInput
 from docxtpl import DocxTemplate
 from num2words import num2words
 from fastapi.responses import StreamingResponse
-import io
+
+
 
 # =========================================================
 # ⚙️ КОНФІГУРАЦІЯ
