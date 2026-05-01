@@ -21,6 +21,11 @@ import shutil
 from collections import defaultdict
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from shevchenko import in_genitive, GrammaticalGender, DeclensionInput
+from docxtpl import DocxTemplate
+from num2words import num2words
+from fastapi.responses import StreamingResponse
+import io
 
 # =========================================================
 # ⚙️ КОНФІГУРАЦІЯ
@@ -864,6 +869,140 @@ async def save_board_state(
         db.add(DBBoardState(state=state))
     db.commit()
     return {"message": "Збережено"}
+
+# =========================================================
+# 📝 ГЕНЕРАТОР ЗАЯВ ЦСК
+# =========================================================
+@app.get("/api/csk/generator/config")
+async def get_generator_config(user: dict = Depends(require_csk_admin)):
+    try:
+        with open('config/config.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Config error: {e}")
+        return {"application_reasons": {}}
+
+@app.get("/api/csk/generator/students")
+async def search_gen_students(q: str = "", db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)):
+    if not q: return []
+    # Шукаємо студентів за ПІБ (нечутливо до регістру)
+    students = db.query(DBUser).filter(DBUser.role == "student", DBUser.full_name.ilike(f"%{q}%")).limit(10).all()
+    res = []
+    for s in students:
+        group = "Невідомо"
+        if s.student_data and isinstance(s.student_data, dict):
+            group = s.student_data.get("навчання", [{}])[0].get("Група", "Невідомо")
+        res.append({"id": s.id, "text": f"{s.full_name}, {group}"})
+    return res
+
+@app.get("/api/csk/generator/student/{student_id}")
+async def get_gen_student_data(student_id: str, db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)):
+    student = db.query(DBUser).filter(DBUser.id == student_id).first()
+    if not student: raise HTTPException(status_code=404, detail="Студента не знайдено")
+
+    name_parts = student.full_name.split() if student.full_name else ["", "", ""]
+    orig_last_name = name_parts[0] if len(name_parts) > 0 else "Прізвище"
+    first_name = name_parts[1] if len(name_parts) > 1 else "Ім'я"
+    patronymic = name_parts[2] if len(name_parts) > 2 else "Побатькові"
+
+    # Визначаємо стать за по-батькові
+    gender = GrammaticalGender.FEMININE if patronymic.lower().endswith('на') else GrammaticalGender.MASCULINE
+    student_title = "Здобувачки вищої освіти" if gender == GrammaticalGender.FEMININE else "Здобувача вищої освіти"
+
+    try:
+        person = DeclensionInput(givenName=first_name, familyName=orig_last_name, patronymicName=patronymic, gender=gender)
+        declined = in_genitive(person)
+        fn_gen, pn_gen, ln_gen = declined['givenName'], declined['patronymicName'], declined['familyName']
+        
+        if gender == GrammaticalGender.MASCULINE and orig_last_name.lower().endswith('ий'):
+            ln_gen = orig_last_name[:-2] + "ого"
+            
+        ln_gen_title = ln_gen.title()
+        ln_gen = ln_gen.upper()
+    except Exception:
+        fn_gen, ln_gen, pn_gen = first_name, orig_last_name.upper(), patronymic
+        ln_gen_title = orig_last_name.title()
+
+    s_data = student.student_data if isinstance(student.student_data, dict) else {}
+    navch = s_data.get("навчання", [{}])[0]
+    
+    academic_unit_full = navch.get("Факультет", "")
+    if academic_unit_full and not academic_unit_full.isupper():
+        academic_unit_full = academic_unit_full[0].lower() + academic_unit_full[1:]
+
+    funding_source = " державним замовленням" if str(navch.get("Оплата", "")).lower() == "бюджет" else " кошти фізичних осіб"
+    course_val = str(navch.get("Курс", ""))
+    
+    return {
+        "course": course_val, "group": navch.get("Група", ""), "spec": navch.get("Спеціальність", ""),
+        "academic_unit": academic_unit_full, "edu_form": navch.get("Форма навчання", "денної").lower(),
+        "name": f"{fn_gen} {ln_gen}", "first_name": fn_gen, "last_name": ln_gen,
+        "last_name_title": ln_gen_title, "patronymic": pn_gen, "student_title": student_title,
+        "phone": "", "funding_source": funding_source
+    }
+
+@app.post("/api/csk/generator/generate")
+async def generate_document(data: dict, user: dict = Depends(require_csk_admin)):
+    doc_type = data.get('doc_type')
+    
+    if doc_type == 'template_application_lost_doc_graduate':
+        lost_doc = data.get('document', '')
+        if 'та' in lost_doc: data['pronoun'] = 'їх'
+        elif 'книжки' in lost_doc: data['pronoun'] = 'її'
+        else: data['pronoun'] = 'його'
+
+    for key in ['academic_unit', 'academic_unit_new', 'academic_unit_prev', 'uni_unit_prev']:
+        val = data.get(key, '').strip()
+        if val and not val.isupper(): data[key] = val[0].lower() + val[1:]
+
+    reason_doc = data.get('reason_document', '').strip()
+    if reason_doc:
+        data['reason_document'] = f"2. {reason_doc}." if doc_type == 'template_application_individual' else f"До заяви додаю:\n1. {reason_doc}."
+
+    if data.get('last_name_new'):
+        data['last_name_new_r'] = data['last_name_new'].upper()
+        data['last_name_new'] = data['last_name_new'].upper()
+
+    if doc_type == 'template_application_refund' and data.get('amount'):
+        try:
+            amount_float = float(data['amount'].replace(',', '.'))
+            hrn_int, kop_int = int(amount_float), int(round((amount_float - int(amount_float)) * 100))
+            hrn_text = num2words(hrn_int, lang='uk')
+            if hrn_text.endswith('один'): hrn_text = hrn_text[:-4] + 'одна'
+            if hrn_text.endswith('два'): hrn_text = hrn_text[:-3] + 'дві'
+            data['amount_text'] = f"{hrn_text} гривень {kop_int:02d} копійок"
+        except Exception: pass
+
+    data['war_doc'] = " військово-облікового документу," if "здобувача" in data.get('student_title', '').lower() else ""
+
+    name_parts = data.get('name', '').strip().split()
+    if len(name_parts) >= 2:
+        data['initials_signature'] = f"{name_parts[0].title()} {name_parts[1][0].upper()}." + (f"{name_parts[2][0].upper()}." if len(name_parts)>2 else "")
+    else: data['initials_signature'] = data.get('name', '')
+
+    for field in ['date_deduction', 'date_start', 'date_end', 'marriage_cert_date', 'date_renewal', 'order_date']:
+        if data.get(field):
+            try: data[field] = f"{datetime.strptime(data[field], '%Y-%m-%d').strftime('%d.%m.%Y')} р."
+            except Exception: pass
+
+    data['date_now'] = f"{datetime.now().strftime('%d.%m.%Y')} р."
+    
+    path = os.path.abspath(f"config/templates/{doc_type}.docx")
+    try:
+        doc = DocxTemplate(path)
+        doc.render(data)
+        output = io.BytesIO()
+        doc.save(output)
+        output.seek(0)
+        
+        safe_last = data.get('last_name', 'Student').replace(' ', '_').title()
+        safe_group = data.get('group', 'Group').replace(' ', '_')
+        filename = f"{doc_type.split('_')[-1]}_{safe_last}_{safe_group}_{datetime.now().strftime('%d.%m.%Y')}.docx"
+        
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Генерація помилка: {str(e)}")
+
 
 # =========================================================
 # 🏓 PING

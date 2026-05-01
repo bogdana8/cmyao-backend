@@ -12,3 +12,6 @@ requests
 pandas
 openpyxl
 python-dotenv
+shevchenko
+docxtpl
+num2words
