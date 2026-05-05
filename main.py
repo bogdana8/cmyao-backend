@@ -114,6 +114,16 @@ security = HTTPBearer()
 # =========================================================
 # 🏗️ МОДЕЛІ БАЗИ ДАНИХ
 # =========================================================
+class DBCertificateRequest(Base):
+    __tablename__ = "certificate_requests"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    student_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    doc_type = Column(String, nullable=False)
+    details = Column(JSON, nullable=True)
+    status = Column(String, default="pending") # pending, processing, ready, rejected
+    admin_comment = Column(String, nullable=True)
+    created_at = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
+    completed_at = Column(String, nullable=True)
 class DBUser(Base):
     __tablename__ = "users"
     id = Column(String, primary_key=True, index=True)
@@ -178,6 +188,13 @@ Base.metadata.create_all(bind=engine)
 # =========================================================
 # 📋 СХЕМИ (Pydantic)
 # =========================================================
+class CertRequestCreateSchema(BaseModel):
+    doc_type: str
+    details: dict = {}
+
+class CertStatusUpdateSchema(BaseModel):
+    status: str
+    admin_comment: Optional[str] = None
 class UserLoginSchema(BaseModel):
     email: str
     password: str
@@ -1037,6 +1054,92 @@ async def generate_document(data: dict, user: dict = Depends(require_csk_admin))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Генерація помилка: {str(e)}")
 
+# =========================================================
+# 📄 ЗАМОВЛЕННЯ ДОВІДОК
+# =========================================================
+
+# Для студента: Створити заявку
+@app.post("/api/student/certificates")
+async def create_certificate_request(
+    req: CertRequestCreateSchema,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    new_req = DBCertificateRequest(
+        student_id=user["user_id"],
+        doc_type=req.doc_type,
+        details=req.details
+    )
+    db.add(new_req)
+    db.commit()
+    return {"message": "Заявку успішно створено!"}
+
+# Для студента: Отримати свої заявки
+@app.get("/api/student/certificates")
+async def get_my_certificate_requests(
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return db.query(DBCertificateRequest).filter(DBCertificateRequest.student_id == user["user_id"]).order_by(DBCertificateRequest.id.desc()).all()
+
+# Для ЦСК/Адмінів: Отримати всі заявки разом з даними студента
+@app.get("/api/csk/certificates")
+async def get_all_certificate_requests(
+    admin: dict = Depends(require_announcement_admin), # Використовуємо існуючий дозвіл для адмінів
+    db: Session = Depends(get_db)
+):
+    requests = db.query(DBCertificateRequest).order_by(DBCertificateRequest.id.desc()).all()
+    result = []
+    for r in requests:
+        student = db.query(DBUser).filter(DBUser.id == r.student_id).first()
+        result.append({
+            "id": r.id,
+            "doc_type": r.doc_type,
+            "details": r.details,
+            "status": r.status,
+            "admin_comment": r.admin_comment,
+            "created_at": r.created_at,
+            "completed_at": r.completed_at,
+            "student_name": student.full_name if student else "Невідомий",
+            "student_email": student.email if student else "",
+            "student_data": student.student_data if student else {}
+        })
+    return result
+
+# Для ЦСК: Змінити статус заявки
+@app.put("/api/csk/certificates/{req_id}/status")
+async def update_certificate_status(
+    req_id: int,
+    status_data: CertStatusUpdateSchema,
+    admin: dict = Depends(require_announcement_admin),
+    db: Session = Depends(get_db)
+):
+    req = db.query(DBCertificateRequest).filter(DBCertificateRequest.id == req_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Заявку не знайдено")
+    
+    req.status = status_data.status
+    req.admin_comment = status_data.admin_comment
+    
+    if status_data.status in ["ready", "rejected"]:
+        req.completed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+        
+    db.commit()
+    return {"message": "Статус оновлено!"}
+
+# Для Суперадміна: Видалити заявку
+@app.delete("/api/superadmin/certificates/{req_id}")
+async def delete_certificate_request(
+    req_id: int,
+    admin: dict = Depends(require_superadmin),
+    db: Session = Depends(get_db)
+):
+    req = db.query(DBCertificateRequest).filter(DBCertificateRequest.id == req_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Заявку не знайдено")
+    db.delete(req)
+    db.commit()
+    return {"message": "Заявку видалено"}
 
 # =========================================================
 # 🏓 PING
