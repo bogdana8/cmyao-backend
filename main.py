@@ -1082,10 +1082,10 @@ async def get_my_certificate_requests(
 ):
     return db.query(DBCertificateRequest).filter(DBCertificateRequest.student_id == user["user_id"]).order_by(DBCertificateRequest.id.desc()).all()
 
-# Для ЦСК/Адмінів: Отримати всі заявки разом з даними студента
+# Для ЦСК/Адмінів: Отримати всі заявки
 @app.get("/api/csk/certificates")
 async def get_all_certificate_requests(
-    admin: dict = Depends(require_announcement_admin), # Використовуємо існуючий дозвіл для адмінів
+    admin: dict = Depends(require_csk_admin), # <--- ЗАМІНИТИ ТУТ
     db: Session = Depends(get_db)
 ):
     requests = db.query(DBCertificateRequest).order_by(DBCertificateRequest.id.desc()).all()
@@ -1111,7 +1111,7 @@ async def get_all_certificate_requests(
 async def update_certificate_status(
     req_id: int,
     status_data: CertStatusUpdateSchema,
-    admin: dict = Depends(require_announcement_admin),
+    admin: dict = Depends(require_csk_admin), # <--- І ЗАМІНИТИ ТУТ
     db: Session = Depends(get_db)
 ):
     req = db.query(DBCertificateRequest).filter(DBCertificateRequest.id == req_id).first()
