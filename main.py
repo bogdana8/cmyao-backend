@@ -139,12 +139,15 @@ class DBTemplate(Base):
     title = Column(String, index=True)
     questions = Column(JSON)
     target_audience = Column(JSON, nullable=True)
+    is_anonymous = Column(Boolean, default=True)  # ← за замовчуванням АНОНІМНЕ
 
 class DBResponse(Base):
     __tablename__ = "responses"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     survey_id = Column(String, index=True)
     answers = Column(JSON)
+    respondent_id = Column(String, nullable=True)   # NULL = анонімна відповідь
+    respondent_name = Column(String, nullable=True)  # Кеш ПІБ, щоб не робити JOIN
 
 class DBCompletedSurvey(Base):
     __tablename__ = "completed_surveys"
@@ -186,6 +189,26 @@ class DBBoardState(Base):
 Base.metadata.create_all(bind=engine)
 
 # =========================================================
+# 🔧 МІГРАЦІЇ (безпечне додавання нових колонок)
+# =========================================================
+def _run_migrations():
+    """Безпечно додає нові колонки до існуючих таблиць."""
+    migrations = [
+        "ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_id VARCHAR",
+        "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_name VARCHAR",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # Колонка вже існує або не підтримується
+
+_run_migrations()
+
+# =========================================================
 # 📋 СХЕМИ (Pydantic)
 # =========================================================
 class CertRequestCreateSchema(BaseModel):
@@ -222,6 +245,7 @@ class SurveyTemplateSchema(BaseModel):
     title: str
     questions: List[QuestionSchema]
     target_audience: Optional[dict] = None
+    is_anonymous: bool = True  # ← за замовчуванням АНОНІМНЕ
 
 class StudentResponseSchema(BaseModel):
     survey_id: str
@@ -626,7 +650,7 @@ async def get_templates(
     db: Session = Depends(get_db)
 ):
     templates = db.query(DBTemplate).all()
-    return [{"id": t.id, "title": t.title, "questions": t.questions, "target_audience": t.target_audience} for t in templates]
+    return [{"id": t.id, "title": t.title, "questions": t.questions, "target_audience": t.target_audience, "is_anonymous": t.is_anonymous if t.is_anonymous is not None else True} for t in templates]
 
 @app.post("/api/templates")
 async def save_template(
@@ -644,12 +668,14 @@ async def save_template(
         db_template.title = survey.title
         db_template.questions = questions_data
         db_template.target_audience = survey.target_audience
+        db_template.is_anonymous = survey.is_anonymous
     else:
         db.add(DBTemplate(
             id=survey.id,
             title=survey.title,
             questions=questions_data,
-            target_audience=survey.target_audience
+            target_audience=survey.target_audience,
+            is_anonymous=survey.is_anonymous
         ))
 
     db.commit()
@@ -678,7 +704,12 @@ async def get_single_template(
     template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="Опитування не знайдено")
-    return {"id": template.id, "title": template.title, "questions": template.questions}
+    return {
+        "id": template.id,
+        "title": template.title,
+        "questions": template.questions,
+        "is_anonymous": template.is_anonymous if template.is_anonymous is not None else True
+    }
 
 # =========================================================
 # 📊 АНАЛІТИКА ЦМЯО — отримання відповідей по опитуванню
@@ -691,16 +722,28 @@ async def get_survey_responses(
 ):
     """
     Повертає всі відповіді на конкретне опитування.
-    Доступно тільки для адміністраторів ЦМЯО та superadmin.
+    Для неанонімних — включає ПІБ та роль респондента.
     """
+    template = db.query(DBTemplate).filter(DBTemplate.id == survey_id).first()
+    is_anonymous = (template.is_anonymous if template and template.is_anonymous is not None else True)
+
     responses = db.query(DBResponse).filter(DBResponse.survey_id == survey_id).all()
-    return [
-        {
-            "id": r.id,
-            "answers": r.answers
-        }
-        for r in responses
-    ]
+    result = []
+    for r in responses:
+        entry = {"id": r.id, "answers": r.answers}
+        if not is_anonymous:
+            if r.respondent_id:
+                resp_user = db.query(DBUser).filter(DBUser.id == r.respondent_id).first()
+                entry["respondent"] = {
+                    "name": resp_user.full_name if resp_user else r.respondent_name,
+                    "email": resp_user.email if resp_user else "—",
+                    "role": resp_user.role if resp_user else "—"
+                }
+            else:
+                # Стара відповідь без прив'язки — позначаємо
+                entry["respondent"] = {"name": r.respondent_name or "Анонімно (стара відповідь)", "email": "—", "role": "—"}
+        result.append(entry)
+    return result
 
 # ✅ ВИПРАВЛЕНО: додано перевірку існування опитування та захист від повторного проходження
 @app.post("/api/responses")
@@ -727,8 +770,21 @@ async def save_student_response(
                 detail="Ви вже проходили це опитування"
             )
 
-    # 3. Зберігаємо відповіді
-    db.add(DBResponse(survey_id=response.survey_id, answers=response.answers))
+    # 3. Зберігаємо відповіді: respondent_id тільки якщо опитування НЕ анонімне
+    is_anon = template.is_anonymous if template.is_anonymous is not None else True
+    respondent_id = None
+    respondent_name = None
+    if not is_anon:
+        respondent_id = user["user_id"]
+        db_user_obj = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+        respondent_name = db_user_obj.full_name if db_user_obj else None
+
+    db.add(DBResponse(
+        survey_id=response.survey_id,
+        answers=response.answers,
+        respondent_id=respondent_id,
+        respondent_name=respondent_name
+    ))
 
     if user.get("role") != "stakeholder":
         db.add(DBCompletedSurvey(user_id=user["user_id"], survey_id=response.survey_id))
