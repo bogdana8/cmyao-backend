@@ -680,6 +680,28 @@ async def get_single_template(
         raise HTTPException(status_code=404, detail="Опитування не знайдено")
     return {"id": template.id, "title": template.title, "questions": template.questions}
 
+# =========================================================
+# 📊 АНАЛІТИКА ЦМЯО — отримання відповідей по опитуванню
+# =========================================================
+@app.get("/api/cmyo/responses/{survey_id}")
+async def get_survey_responses(
+    survey_id: str,
+    user: dict = Depends(require_cmyo_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    Повертає всі відповіді на конкретне опитування.
+    Доступно тільки для адміністраторів ЦМЯО та superadmin.
+    """
+    responses = db.query(DBResponse).filter(DBResponse.survey_id == survey_id).all()
+    return [
+        {
+            "id": r.id,
+            "answers": r.answers
+        }
+        for r in responses
+    ]
+
 # ✅ ВИПРАВЛЕНО: додано перевірку існування опитування та захист від повторного проходження
 @app.post("/api/responses")
 async def save_student_response(
