@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -185,6 +185,28 @@ class DBBoardState(Base):
     __tablename__ = "board_state"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     state = Column(JSON, nullable=False)
+    
+# =========================================================
+# 📋 АУДИТ — додати до main.py
+# =========================================================
+#
+# КРОК 1: Додати модель після існуючих моделей БД (після DBBoardState)
+#
+class DBAuditLog(Base):
+    __tablename__ = "audit_logs"
+    id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    timestamp    = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    user_id      = Column(String, nullable=True)
+    user_email   = Column(String, nullable=True)
+    ip_address   = Column(String, nullable=True)
+    user_agent   = Column(String, nullable=True)
+    path         = Column(String, nullable=True)
+    method       = Column(String, nullable=True)
+    action       = Column(String, nullable=True)   # create | update | delete | login
+    content_type = Column(String, nullable=True)
+    object_id    = Column(String, nullable=True)
+    object_repr  = Column(String, nullable=True)
+    details      = Column(JSON, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -303,6 +325,34 @@ def require_announcement_admin(user: dict = Depends(get_current_user)) -> dict:
         raise HTTPException(status_code=403, detail="Тільки для адміністраторів")
     return user
 
+def write_audit(
+    db:           Session,
+    request:      Request,
+    action:       str,
+    user:         dict = None,
+    content_type: str  = None,
+    object_id          = None,
+    object_repr:  str  = None,
+    details:      dict = None,
+):
+    try:
+        db.add(DBAuditLog(
+            user_id      = user.get("user_id") if user else None,
+            user_email   = user.get("sub")     if user else None,
+            ip_address   = request.client.host if request.client else None,
+            user_agent   = request.headers.get("user-agent", "")[:300],
+            path         = str(request.url.path),
+            method       = request.method,
+            action       = action,
+            content_type = content_type,
+            object_id    = str(object_id) if object_id is not None else None,
+            object_repr  = object_repr,
+            details      = details,
+        ))
+    except Exception:
+        pass
+ 
+
 # =========================================================
 # 🔐 АВТОРИЗАЦІЯ
 # =========================================================
@@ -331,6 +381,14 @@ async def login(
     access_token = create_access_token(
         data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
     )
+    write_audit(db, request,
+        action       = "login",
+        user         = {"user_id": db_user.id, "sub": db_user.email},
+        content_type = "Users | Користувач",
+        object_id    = db_user.id,
+        object_repr  = db_user.email,
+    )
+    db.commit()
     return {"access_token": access_token, "role": db_user.role}
 
 # ✅ ВИПРАВЛЕНО: додано rate limiting на Google login теж
@@ -356,6 +414,8 @@ async def google_login(
         return {"access_token": access_token, "role": db_user.role}
     except ValueError:
         raise HTTPException(status_code=401, detail="Помилка Google")
+    
+
 
 # =========================================================
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
@@ -374,6 +434,7 @@ async def get_all_users(admin: dict = Depends(require_superadmin), db: Session =
 @app.post("/api/superadmin/users")
 async def create_or_update_user(
     user: UserCreateSchema,
+    request: Request,
     admin: dict = Depends(require_superadmin),
     db: Session = Depends(get_db)
 ):
@@ -400,12 +461,21 @@ async def create_or_update_user(
         db.add(new_user)
         msg = f"Нового користувача {user.email} створено!"
 
+    write_audit(db, request,
+        action       = "update" if db_user else "create",
+        user         = admin,
+        content_type = "Users | Користувач",
+        object_id    = user.email,
+        object_repr  = user.full_name or user.email,
+        details      = {"role": user.role},
+    )
     db.commit()
     return {"message": msg}
 
 @app.post("/api/superadmin/users/bulk")
 async def bulk_import_users(
     payload: dict,
+    request: Request,
     admin: dict = Depends(require_superadmin),
     db: Session = Depends(get_db)
 ):
@@ -433,6 +503,12 @@ async def bulk_import_users(
             db.add(new_user)
             added += 1
 
+    write_audit(db, request,
+        action       = "bulk_import",
+        user         = admin,
+        content_type = "Users | Користувач",
+        details      = {"added": added, "updated": updated},
+    )
     db.commit()
     return {"message": f"Імпорт завершено: додано {added}, оновлено {updated}."}
 
@@ -441,6 +517,7 @@ async def bulk_import_users(
 # =========================================================
 @app.post("/api/csk/upload-grades")
 async def upload_grades(
+    request: Request,
     file: UploadFile = File(...),
     admin: dict = Depends(require_csk_admin),
     db: Session = Depends(get_db)
@@ -512,6 +589,13 @@ async def upload_grades(
                             db.add(new_grade)
                             added_count += 1
 
+    write_audit(db, request,
+        action       = "create",
+        user         = admin,
+        content_type = "Grades | Оцінки",
+        object_repr  = file.filename,
+        details      = {"added_count": added_count},
+    )
     db.commit()
     return {"message": f"Успіх! Оброблено та додано/оновлено {added_count} оцінок."}
 
@@ -548,6 +632,7 @@ async def get_all_students_for_csk(
 async def update_single_grade(
     grade_id: int,
     grade_data: GradeUpdateSchema,
+    request: Request,
     admin: dict = Depends(require_csk_admin),
     db: Session = Depends(get_db)
 ):
@@ -561,6 +646,14 @@ async def update_single_grade(
     grade.control_form = grade_data.control_form
     grade.teacher = grade_data.teacher
 
+    write_audit(db, request,
+        action       = "update",
+        user         = admin,
+        content_type = "Grades | Оцінки",
+        object_id    = grade_id,
+        object_repr  = grade_data.subject,
+        details      = {"score": grade_data.score, "control_form": grade_data.control_form},
+    )
     db.commit()
     return {"message": "Оцінку успішно оновлено!"}
 
@@ -800,7 +893,8 @@ async def save_student_response(
 @app.post("/api/announcements")
 async def create_announcement(
     ann: AnnouncementCreateSchema,
-    user: dict = Depends(require_announcement_admin),  # ← раніше був get_current_user
+    request: Request,
+    user: dict = Depends(require_announcement_admin),
     db: Session = Depends(get_db)
 ):
     sender_map = {
@@ -817,6 +911,13 @@ async def create_announcement(
         sender=sender,
         is_important=ann.is_important
     ))
+    write_audit(db, request,
+        action       = "create",
+        user         = user,
+        content_type = "Announcements | Оголошення",
+        object_repr  = ann.title,
+        details      = {"is_important": ann.is_important, "sender": sender},
+    )
     db.commit()
     return {"message": "Оголошення опубліковано!"}
 
@@ -832,6 +933,7 @@ async def get_announcements(
 async def update_announcement(
     ann_id: int,
     ann: AnnouncementCreateSchema,
+    request: Request,
     user: dict = Depends(require_announcement_admin),
     db: Session = Depends(get_db)
 ):
@@ -846,7 +948,15 @@ async def update_announcement(
     db_ann.title = ann.title
     db_ann.content = ann.content
     db_ann.is_important = ann.is_important
-    db_ann.is_edited = True  # Автоматично ставимо позначку "змінено"
+    db_ann.is_edited = True
+    write_audit(db, request,
+        action       = "update",
+        user         = user,
+        content_type = "Announcements | Оголошення",
+        object_id    = ann_id,
+        object_repr  = ann.title,
+        details      = {"is_important": ann.is_important},
+    )
     db.commit()
     return {"message": "Оголошення оновлено"}
 
@@ -856,13 +966,21 @@ async def update_announcement(
 @app.delete("/api/announcements/{ann_id}")
 async def delete_announcement(
     ann_id: int,
-    user: dict = Depends(require_announcement_admin),  # ← раніше: if role == "student": raise
+    request: Request,
+    user: dict = Depends(require_announcement_admin),
     db: Session = Depends(get_db)
 ):
     ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
     if not ann:
         raise HTTPException(status_code=404, detail="Оголошення не знайдено")
 
+    write_audit(db, request,
+        action       = "delete",
+        user         = user,
+        content_type = "Announcements | Оголошення",
+        object_id    = ann_id,
+        object_repr  = ann.title,
+    )
     db.delete(ann)
     db.commit()
     return {"message": "Видалено"}
@@ -1189,7 +1307,8 @@ async def get_all_certificate_requests(
 async def update_certificate_status(
     req_id: int,
     status_data: CertStatusUpdateSchema,
-    admin: dict = Depends(require_csk_admin), # <--- І ЗАМІНИТИ ТУТ
+    request: Request,
+    admin: dict = Depends(require_csk_admin),
     db: Session = Depends(get_db)
 ):
     req = db.query(DBCertificateRequest).filter(DBCertificateRequest.id == req_id).first()
@@ -1201,7 +1320,15 @@ async def update_certificate_status(
     
     if status_data.status in ["ready", "rejected"]:
         req.completed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-        
+
+    write_audit(db, request,
+        action       = "update",
+        user         = admin,
+        content_type = "Certificates | Довідки",
+        object_id    = req_id,
+        object_repr  = req.doc_type,
+        details      = {"status": status_data.status, "comment": status_data.admin_comment},
+    )
     db.commit()
     return {"message": "Статус оновлено!"}
 
@@ -1209,15 +1336,72 @@ async def update_certificate_status(
 @app.delete("/api/superadmin/certificates/{req_id}")
 async def delete_certificate_request(
     req_id: int,
+    request: Request,
     admin: dict = Depends(require_superadmin),
     db: Session = Depends(get_db)
 ):
     req = db.query(DBCertificateRequest).filter(DBCertificateRequest.id == req_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Заявку не знайдено")
+    write_audit(db, request,
+        action       = "delete",
+        user         = admin,
+        content_type = "Certificates | Довідки",
+        object_id    = req_id,
+        object_repr  = req.doc_type,
+    )
     db.delete(req)
     db.commit()
     return {"message": "Заявку видалено"}
+
+@app.get("/api/superadmin/audit")
+async def get_audit_logs(
+    admin:  dict    = Depends(require_superadmin),
+    db:     Session = Depends(get_db),
+    limit:  int     = Query(default=50, le=200),
+    offset: int     = Query(default=0),
+    action: str     = Query(default=None),
+    search: str     = Query(default=None),
+):
+    q = db.query(DBAuditLog)
+    if action and action != "all":
+        q = q.filter(DBAuditLog.action == action)
+    if search:
+        q = q.filter(DBAuditLog.user_email.ilike(f"%{search}%"))
+    total = q.count()
+    logs  = q.order_by(DBAuditLog.id.desc()).offset(offset).limit(limit).all()
+    return {
+        "total": total,
+        "logs": [
+            {
+                "id":           l.id,
+                "timestamp":    l.timestamp,
+                "user_email":   l.user_email,
+                "ip_address":   l.ip_address,
+                "user_agent":   l.user_agent,
+                "path":         l.path,
+                "method":       l.method,
+                "action":       l.action,
+                "content_type": l.content_type,
+                "object_id":    l.object_id,
+                "object_repr":  l.object_repr,
+                "details":      l.details,
+            }
+            for l in logs
+        ],
+    }
+ 
+ 
+@app.delete("/api/superadmin/audit")
+async def clear_audit_logs(
+    admin: dict    = Depends(require_superadmin),
+    db:    Session = Depends(get_db),
+):
+    deleted = db.query(DBAuditLog).delete()
+    db.commit()
+    return {"message": f"Видалено {deleted} записів"}
+ 
+
 
 # =========================================================
 # 🏓 PING
