@@ -139,7 +139,8 @@ class DBTemplate(Base):
     title = Column(String, index=True)
     questions = Column(JSON)
     target_audience = Column(JSON, nullable=True)
-    is_anonymous = Column(Boolean, default=True)  # ← за замовчуванням АНОНІМНЕ
+    is_anonymous = Column(Boolean, default=True)
+    tags = Column(JSON, nullable=True, default=list)  # список тегів: ["#Студенти", "#Live", ...]
 
 class DBResponse(Base):
     __tablename__ = "responses"
@@ -181,16 +182,13 @@ class DBDictionary(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     data = Column(JSON, nullable=False)
 
-class DBBoardState(Base):
-    __tablename__ = "board_state"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    state = Column(JSON, nullable=False)
+
     
 # =========================================================
 # 📋 АУДИТ — додати до main.py
 # =========================================================
 #
-# КРОК 1: Додати модель після існуючих моделей БД (після DBBoardState)
+# КРОК 1: Модель аудиту
 #
 class DBAuditLog(Base):
     __tablename__ = "audit_logs"
@@ -217,6 +215,7 @@ def _run_migrations():
     """Безпечно додає нові колонки до існуючих таблиць."""
     migrations = [
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE templates ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_id VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_name VARCHAR",
     ]
@@ -267,7 +266,8 @@ class SurveyTemplateSchema(BaseModel):
     title: str
     questions: List[QuestionSchema]
     target_audience: Optional[dict] = None
-    is_anonymous: bool = True  # ← за замовчуванням АНОНІМНЕ
+    is_anonymous: bool = True
+    tags: List[str] = []  # ["#Студенти", "#Live", "#Анонімне", ...]
 
 class StudentResponseSchema(BaseModel):
     survey_id: str
@@ -743,7 +743,14 @@ async def get_templates(
     db: Session = Depends(get_db)
 ):
     templates = db.query(DBTemplate).all()
-    return [{"id": t.id, "title": t.title, "questions": t.questions, "target_audience": t.target_audience, "is_anonymous": t.is_anonymous if t.is_anonymous is not None else True} for t in templates]
+    return [{
+        "id": t.id,
+        "title": t.title,
+        "questions": t.questions,
+        "target_audience": t.target_audience,
+        "is_anonymous": t.is_anonymous if t.is_anonymous is not None else True,
+        "tags": t.tags or []
+    } for t in templates]
 
 @app.post("/api/templates")
 async def save_template(
@@ -754,6 +761,28 @@ async def save_template(
     if not survey.id:
         survey.id = str(uuid.uuid4())[:8]
 
+    # Бізнес-логіка тегів:
+    # 1. #Стейкголдери завжди #Підписане, ніколи #Анонімне
+    tags = list(survey.tags)
+    if "#Стейкголдери" in tags:
+        survey.is_anonymous = False
+        if "#Анонімне" in tags:
+            tags.remove("#Анонімне")
+        if "#Підписане" not in tags:
+            tags.append("#Підписане")
+
+    # 2. Синхронізуємо тег приватності з полем is_anonymous
+    if survey.is_anonymous:
+        if "#Підписане" in tags:
+            tags.remove("#Підписане")
+        if "#Анонімне" not in tags:
+            tags.append("#Анонімне")
+    else:
+        if "#Анонімне" in tags:
+            tags.remove("#Анонімне")
+        if "#Підписане" not in tags:
+            tags.append("#Підписане")
+
     db_template = db.query(DBTemplate).filter(DBTemplate.id == survey.id).first()
     questions_data = [q.model_dump() for q in survey.questions]
 
@@ -762,17 +791,19 @@ async def save_template(
         db_template.questions = questions_data
         db_template.target_audience = survey.target_audience
         db_template.is_anonymous = survey.is_anonymous
+        db_template.tags = tags
     else:
         db.add(DBTemplate(
             id=survey.id,
             title=survey.title,
             questions=questions_data,
             target_audience=survey.target_audience,
-            is_anonymous=survey.is_anonymous
+            is_anonymous=survey.is_anonymous,
+            tags=tags
         ))
 
     db.commit()
-    return {"message": "Шаблон збережено!", "id": survey.id}
+    return {"message": "Шаблон збережено!", "id": survey.id, "tags": tags}
 
 @app.delete("/api/templates/{template_id}")
 async def delete_template(
@@ -791,7 +822,7 @@ async def delete_template(
 @app.get("/api/templates/{template_id}")
 async def get_single_template(
     template_id: str,
-    user: dict = Depends(get_current_user),  # ← раніше не було!
+    user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
@@ -801,7 +832,8 @@ async def get_single_template(
         "id": template.id,
         "title": template.title,
         "questions": template.questions,
-        "is_anonymous": template.is_anonymous if template.is_anonymous is not None else True
+        "is_anonymous": template.is_anonymous if template.is_anonymous is not None else True,
+        "tags": template.tags or []
     }
 
 # =========================================================
@@ -894,7 +926,7 @@ async def save_student_response(
 async def create_announcement(
     ann: AnnouncementCreateSchema,
     request: Request,
-    user: dict = Depends(require_announcement_admin),
+    user: dict = Depends(require_announcement_admin),  # ← раніше був get_current_user
     db: Session = Depends(get_db)
 ):
     sender_map = {
@@ -967,7 +999,7 @@ async def update_announcement(
 async def delete_announcement(
     ann_id: int,
     request: Request,
-    user: dict = Depends(require_announcement_admin),
+    user: dict = Depends(require_announcement_admin),  # ← раніше: if role == "student": raise
     db: Session = Depends(get_db)
 ):
     ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
@@ -1054,35 +1086,6 @@ async def update_dictionaries(
         db.add(DBDictionary(data=new_data))
     db.commit()
     return {"message": "Довідники успішно оновлено!"}
-
-# =========================================================
-# 🗂️ ДОШКА ЦМЯО — СТАН ПАПОК
-# =========================================================
-DEFAULT_BOARD_STATE = {"folders": [], "survey_folders": {}}
-
-@app.get("/api/cmyo/board")
-async def get_board_state(
-    user: dict = Depends(require_cmyo_admin),
-    db: Session = Depends(get_db)
-):
-    record = db.query(DBBoardState).first()
-    if not record:
-        return DEFAULT_BOARD_STATE
-    return record.state
-
-@app.put("/api/cmyo/board")
-async def save_board_state(
-    state: dict,
-    user: dict = Depends(require_cmyo_admin),
-    db: Session = Depends(get_db)
-):
-    record = db.query(DBBoardState).first()
-    if record:
-        record.state = state
-    else:
-        db.add(DBBoardState(state=state))
-    db.commit()
-    return {"message": "Збережено"}
 
 # =========================================================
 # 📝 ГЕНЕРАТОР ЗАЯВ ЦСК
