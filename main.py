@@ -129,6 +129,7 @@ class DBTemplate(Base):
     __tablename__ = "templates"
     id = Column(String, primary_key=True, index=True)
     title = Column(String, index=True)
+    description = Column(String, nullable=True)
     questions = Column(JSON)
     target_audience = Column(JSON, nullable=True)
     is_anonymous = Column(Boolean, default=True)
@@ -238,6 +239,7 @@ Base.metadata.create_all(bind=engine)
 def _run_migrations():
     migrations = [
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE templates ADD COLUMN IF NOT EXISTS description VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_id VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_name VARCHAR",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS feathers_reward INTEGER DEFAULT 0",
@@ -288,6 +290,7 @@ class QuestionSchema(BaseModel):
 class SurveyTemplateSchema(BaseModel):
     id: Optional[str] = None
     title: str
+    description: Optional[str] = None
     questions: List[QuestionSchema]
     target_audience: Optional[dict] = None
     is_anonymous: bool = True
@@ -532,6 +535,12 @@ async def google_login(
         access_token = create_access_token(
             data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
         )
+        write_audit(db, request,
+            action="login", user={"user_id": db_user.id, "sub": db_user.email},
+            content_type="Users | Користувач", object_id=db_user.id,
+            object_repr=f"{db_user.email} (Google)",
+        )
+        db.commit()
         return {"access_token": access_token, "role": db_user.role}
     except ValueError:
         raise HTTPException(status_code=401, detail="Помилка Google")
@@ -800,7 +809,8 @@ async def get_templates(
 ):
     templates = db.query(DBTemplate).all()
     return [{
-        "id": t.id, "title": t.title, "questions": t.questions,
+        "id": t.id, "title": t.title, "description": t.description or "",
+        "questions": t.questions,
         "target_audience": t.target_audience,
         "is_anonymous": t.is_anonymous if t.is_anonymous is not None else True,
         "feathers_reward": t.feathers_reward or 0,
@@ -817,13 +827,15 @@ async def save_template(
     questions_data = [q.model_dump() for q in survey.questions]
     if db_template:
         db_template.title = survey.title
+        db_template.description = survey.description or ""
         db_template.questions = questions_data
         db_template.target_audience = survey.target_audience
         db_template.is_anonymous = survey.is_anonymous
         db_template.feathers_reward = survey.feathers_reward
     else:
         db.add(DBTemplate(
-            id=survey.id, title=survey.title, questions=questions_data,
+            id=survey.id, title=survey.title, description=survey.description or "",
+            questions=questions_data,
             target_audience=survey.target_audience, is_anonymous=survey.is_anonymous,
             feathers_reward=survey.feathers_reward,
         ))
