@@ -133,7 +133,9 @@ class DBTemplate(Base):
     questions = Column(JSON)
     target_audience = Column(JSON, nullable=True)
     is_anonymous = Column(Boolean, default=True)
-    feathers_reward = Column(Integer, default=0)   # 🪶 Пер'я за проходження
+    feathers_reward = Column(Integer, default=0)
+    hashtags = Column(JSON, default=list)      # 🏷 список slug-ів хештегів
+    deadline = Column(String, nullable=True)   # 🗓 дедлайн "DD.MM.YYYY HH:MM"
 
 class DBResponse(Base):
     __tablename__ = "responses"
@@ -231,11 +233,49 @@ class DBActiveTheme(Base):
     student_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
     theme_id   = Column(String, nullable=False)
 
+class DBHashtagCatalog(Base):
+    """Глобальний каталог хештегів — керується SuperAdmin"""
+    __tablename__ = "hashtag_catalog"
+    id          = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    slug        = Column(String, unique=True, nullable=False)
+    label       = Column(String, nullable=False)
+    # audience | visibility | deadline | tag
+    type        = Column(String, nullable=False, default="tag")
+    description = Column(String, nullable=True)
+    color       = Column(String, default="#a78bfa")
+    icon        = Column(String, default="🏷")
+    is_system   = Column(Boolean, default=False)
+    created_at  = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y"))
+
 Base.metadata.create_all(bind=engine)
 
 # =========================================================
 # 🔧 МІГРАЦІЇ
 # =========================================================
+
+DEFAULT_HASHTAGS = [
+    # --- audience ---
+    {"slug": "Студентам",       "label": "Студентам",       "type": "audience",    "color": "#38bdf8", "icon": "🎓", "is_system": True,  "description": "Опитування бачать лише студенти"},
+    {"slug": "Викладачам",      "label": "Викладачам",      "type": "audience",    "color": "#f472b6", "icon": "👨‍🏫", "is_system": True,  "description": "Опитування бачать лише викладачі"},
+    {"slug": "Стейкголдерам",   "label": "Стейкголдерам",   "type": "audience",    "color": "#fb923c", "icon": "💼", "is_system": True,  "description": "Опитування бачать лише стейкголдери"},
+    {"slug": "Всім",            "label": "Всім",            "type": "audience",    "color": "#4ade80", "icon": "🌐", "is_system": True,  "description": "Опитування бачать усі ролі"},
+    # --- visibility ---
+    {"slug": "Анонімне",        "label": "Анонімне",        "type": "visibility",  "color": "#86efac", "icon": "🔒", "is_system": True,  "description": "Відповіді зберігаються без імені"},
+    {"slug": "Не_анонімне",     "label": "Не анонімне",     "type": "visibility",  "color": "#fdba74", "icon": "👁",  "is_system": True,  "description": "Відповіді підписуються іменем"},
+    # --- tag ---
+    {"slug": "По_кафедрам",     "label": "По кафедрам",     "type": "tag",         "color": "#c084fc", "icon": "🏛", "is_system": False, "description": "Опитування стосується кафедр"},
+    {"slug": "По_ОПП",          "label": "По ОПП",          "type": "tag",         "color": "#a78bfa", "icon": "📋", "is_system": False, "description": "Пов'язане з освітньо-професійною програмою"},
+    {"slug": "Акредитація",     "label": "Акредитація",     "type": "tag",         "color": "#fbbf24", "icon": "🏅", "is_system": False, "description": "Акредитаційне опитування"},
+    {"slug": "Невизначене",     "label": "Невизначене",     "type": "tag",         "color": "#94a3b8", "icon": "❓", "is_system": False, "description": "Без чіткої категорії"},
+]
+
+def _seed_hashtags(db_session):
+    for h in DEFAULT_HASHTAGS:
+        exists = db_session.query(DBHashtagCatalog).filter(DBHashtagCatalog.slug == h["slug"]).first()
+        if not exists:
+            db_session.add(DBHashtagCatalog(**h))
+    db_session.commit()
+
 def _run_migrations():
     migrations = [
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT TRUE",
@@ -243,6 +283,8 @@ def _run_migrations():
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_id VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_name VARCHAR",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS feathers_reward INTEGER DEFAULT 0",
+        "ALTER TABLE templates ADD COLUMN IF NOT EXISTS hashtags JSON DEFAULT '[]'",
+        "ALTER TABLE templates ADD COLUMN IF NOT EXISTS deadline VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -253,6 +295,11 @@ def _run_migrations():
                 pass
 
 _run_migrations()
+_seed_db = SessionLocal()
+try:
+    _seed_hashtags(_seed_db)
+finally:
+    _seed_db.close()
 
 # =========================================================
 # 📋 СХЕМИ (Pydantic)
@@ -294,7 +341,9 @@ class SurveyTemplateSchema(BaseModel):
     questions: List[QuestionSchema]
     target_audience: Optional[dict] = None
     is_anonymous: bool = True
-    feathers_reward: int = 0   # 🪶
+    feathers_reward: int = 0
+    hashtags: List[str] = []       # 🏷 slug-и хештегів
+    deadline: Optional[str] = None # 🗓 "DD.MM.YYYY HH:MM"
 
 class StudentResponseSchema(BaseModel):
     survey_id: str
@@ -318,6 +367,21 @@ class ThemePurchaseSchema(BaseModel):
 
 class ActiveThemeSchema(BaseModel):
     theme_id: str
+
+class HashtagCreateSchema(BaseModel):
+    slug: str
+    label: str
+    type: str = "tag"
+    description: Optional[str] = None
+    color: str = "#a78bfa"
+    icon: str = "🏷"
+
+class HashtagUpdateSchema(BaseModel):
+    label: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    icon: Optional[str] = None
 
 # =========================================================
 # 🔑 ФУНКЦІЇ АВТОРИЗАЦІЇ
@@ -774,30 +838,66 @@ async def get_student_surveys(
         except Exception:
             s_data = {}
     student_studies = s_data.get("навчання", []) if isinstance(s_data, dict) else []
+    user_role = user.get("role", "student")
+
+    # Словник аудієнц-хештегів → ролі
+    AUDIENCE_ROLES = {
+        "Студентам":     ["student"],
+        "Викладачам":    ["teacher"],
+        "Стейкголдерам": ["stakeholder"],
+        "Всім":          ["student", "teacher", "stakeholder"],
+    }
+
     all_templates = db.query(DBTemplate).all()
     completed_records = db.query(DBCompletedSurvey).filter(
         DBCompletedSurvey.user_id == user["user_id"]
     ).all()
     completed_ids = {record.survey_id for record in completed_records}
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+
     result = []
     for t in all_templates:
-        t_audience = t.target_audience or {}
-        if isinstance(t_audience, str):
+        hashtags = t.hashtags or []
+
+        # 1. Перевіряємо дедлайн
+        if t.deadline:
             try:
-                t_audience = json.loads(t_audience)
+                dl = datetime.strptime(t.deadline, "%d.%m.%Y %H:%M")
+                if datetime.now() > dl:
+                    continue
             except Exception:
-                t_audience = {}
-        is_allowed = True
-        if t_audience:
-            is_allowed = any(
-                all(study.get(k) == v for k, v in t_audience.items())
-                for study in student_studies
-            )
-        if is_allowed:
-            result.append({
-                "id": t.id, "title": t.title, "is_completed": t.id in completed_ids,
-                "feathers_reward": t.feathers_reward or 0,  # 🪶
-            })
+                pass
+
+        # 2. Перевіряємо аудієнцію через хештеги
+        audience_tags = [h for h in hashtags if h in AUDIENCE_ROLES]
+        if audience_tags:
+            allowed_roles = set()
+            for tag in audience_tags:
+                allowed_roles.update(AUDIENCE_ROLES.get(tag, []))
+            if user_role not in allowed_roles:
+                continue
+        else:
+            # Fallback: старий механізм target_audience (для сумісності)
+            t_audience = t.target_audience or {}
+            if isinstance(t_audience, str):
+                try:
+                    t_audience = json.loads(t_audience)
+                except Exception:
+                    t_audience = {}
+            if t_audience:
+                is_allowed = any(
+                    all(study.get(k) == v for k, v in t_audience.items())
+                    for study in student_studies
+                )
+                if not is_allowed:
+                    continue
+
+        result.append({
+            "id": t.id, "title": t.title, "is_completed": t.id in completed_ids,
+            "feathers_reward": t.feathers_reward or 0,
+            "hashtags": hashtags,
+            "deadline": t.deadline,
+        })
     return result
 
 # =========================================================
@@ -814,6 +914,8 @@ async def get_templates(
         "target_audience": t.target_audience,
         "is_anonymous": t.is_anonymous if t.is_anonymous is not None else True,
         "feathers_reward": t.feathers_reward or 0,
+        "hashtags": t.hashtags or [],
+        "deadline": t.deadline,
     } for t in templates]
 
 @app.post("/api/templates")
@@ -825,19 +927,32 @@ async def save_template(
         survey.id = str(uuid.uuid4())[:8]
     db_template = db.query(DBTemplate).filter(DBTemplate.id == survey.id).first()
     questions_data = [q.model_dump() for q in survey.questions]
+
+    # Деривуємо is_anonymous з хештегів якщо є
+    hashtags = survey.hashtags or []
+    is_anon = survey.is_anonymous
+    if "Анонімне" in hashtags:
+        is_anon = True
+    elif "Не_анонімне" in hashtags:
+        is_anon = False
+
     if db_template:
         db_template.title = survey.title
         db_template.description = survey.description or ""
         db_template.questions = questions_data
         db_template.target_audience = survey.target_audience
-        db_template.is_anonymous = survey.is_anonymous
+        db_template.is_anonymous = is_anon
         db_template.feathers_reward = survey.feathers_reward
+        db_template.hashtags = hashtags
+        db_template.deadline = survey.deadline
     else:
         db.add(DBTemplate(
             id=survey.id, title=survey.title, description=survey.description or "",
             questions=questions_data,
-            target_audience=survey.target_audience, is_anonymous=survey.is_anonymous,
+            target_audience=survey.target_audience, is_anonymous=is_anon,
             feathers_reward=survey.feathers_reward,
+            hashtags=hashtags,
+            deadline=survey.deadline,
         ))
     db.commit()
     return {"message": "Шаблон збережено!", "id": survey.id}
@@ -865,7 +980,82 @@ async def get_single_template(
         "id": template.id, "title": template.title, "questions": template.questions,
         "is_anonymous": template.is_anonymous if template.is_anonymous is not None else True,
         "feathers_reward": template.feathers_reward or 0,
+        "hashtags": template.hashtags or [],
+        "deadline": template.deadline,
     }
+
+# =========================================================
+# 🏷️ КАТАЛОГ ХЕШТЕГІВ
+# =========================================================
+def _hashtag_to_dict(h: DBHashtagCatalog) -> dict:
+    return {
+        "id": h.id, "slug": h.slug, "label": h.label, "type": h.type,
+        "description": h.description, "color": h.color, "icon": h.icon,
+        "is_system": h.is_system, "created_at": h.created_at,
+    }
+
+@app.get("/api/hashtags")
+async def get_hashtags(
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Повертає весь каталог хештегів (доступно всім авторизованим)"""
+    tags = db.query(DBHashtagCatalog).order_by(DBHashtagCatalog.type, DBHashtagCatalog.slug).all()
+    return [_hashtag_to_dict(t) for t in tags]
+
+@app.post("/api/superadmin/hashtags")
+async def create_hashtag(
+    data: HashtagCreateSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    # Нормалізуємо slug
+    slug = data.slug.strip().replace(" ", "_")
+    exists = db.query(DBHashtagCatalog).filter(DBHashtagCatalog.slug == slug).first()
+    if exists:
+        raise HTTPException(status_code=409, detail=f"Хештег #{slug} вже існує")
+    tag = DBHashtagCatalog(
+        slug=slug, label=data.label, type=data.type,
+        description=data.description, color=data.color, icon=data.icon, is_system=False,
+    )
+    db.add(tag)
+    write_audit(db, request, action="create", user=admin,
+        content_type="Hashtag | Хештег", object_repr=f"#{slug}")
+    db.commit()
+    db.refresh(tag)
+    return _hashtag_to_dict(tag)
+
+@app.put("/api/superadmin/hashtags/{tag_id}")
+async def update_hashtag(
+    tag_id: int, data: HashtagUpdateSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    tag = db.query(DBHashtagCatalog).filter(DBHashtagCatalog.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Хештег не знайдено")
+    if data.label is not None:  tag.label       = data.label
+    if data.type is not None:   tag.type        = data.type
+    if data.description is not None: tag.description = data.description
+    if data.color is not None:  tag.color       = data.color
+    if data.icon is not None:   tag.icon        = data.icon
+    write_audit(db, request, action="update", user=admin,
+        content_type="Hashtag | Хештег", object_id=tag_id, object_repr=f"#{tag.slug}")
+    db.commit()
+    return _hashtag_to_dict(tag)
+
+@app.delete("/api/superadmin/hashtags/{tag_id}")
+async def delete_hashtag(
+    tag_id: int, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    tag = db.query(DBHashtagCatalog).filter(DBHashtagCatalog.id == tag_id).first()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Хештег не знайдено")
+    if tag.is_system:
+        raise HTTPException(status_code=403, detail="Системний хештег не можна видалити")
+    write_audit(db, request, action="delete", user=admin,
+        content_type="Hashtag | Хештег", object_id=tag_id, object_repr=f"#{tag.slug}")
+    db.delete(tag)
+    db.commit()
+    return {"message": "Видалено"}
 
 # =========================================================
 # 📊 АНАЛІТИКА ЦМЯО
