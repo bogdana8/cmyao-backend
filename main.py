@@ -673,7 +673,8 @@ def detect_level_from_group_name(group_name: str) -> str:
 def _struct_to_dict(obj, fields):
     return {f: getattr(obj, f) for f in fields}
 
-
+def get_or_create_wallet(db: Session, student_id: str) -> "DBFeathersWallet":
+    """Повертає гаманець студента, створюючи його при першому зверненні"""
     wallet = db.query(DBFeathersWallet).filter(DBFeathersWallet.student_id == student_id).first()
     if not wallet:
         wallet = DBFeathersWallet(student_id=student_id, balance=0)
