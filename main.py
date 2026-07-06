@@ -68,6 +68,9 @@ LOGIN_RATE_LIMIT = 10
 LOGIN_RATE_WINDOW = 60 * 15
 
 def check_login_rate_limit(request: Request):
+    """Перевіряє ліміт, але НЕ рахує спробу — рахуються лише невдалі спроби
+    (див. register_failed_login), щоб успішні логіни в різні акаунти не
+    вважалися 'спробами зламу' і не блокували легітимну роботу."""
     ip = request.client.host
     now = time.time()
     _login_attempts[ip] = [
@@ -77,9 +80,13 @@ def check_login_rate_limit(request: Request):
     if len(_login_attempts[ip]) >= LOGIN_RATE_LIMIT:
         raise HTTPException(
             status_code=429,
-            detail=f"Забагато спроб входу. Спробуйте через 15 хвилин."
+            detail="Забагато спроб входу. Спробуйте через 15 хвилин."
         )
-    _login_attempts[ip].append(now)
+
+def register_failed_login(request: Request):
+    """Реєструє невдалу спробу входу (неправильний пароль / пошта не в базі)"""
+    ip = request.client.host
+    _login_attempts[ip].append(time.time())
 
 # =========================================================
 # 🗄️ БАЗА ДАНИХ
@@ -710,6 +717,7 @@ async def login(
     hash_to_check = db_user.hashed_password if db_user else dummy_hash
     password_valid = pwd_context.verify(user.password, hash_to_check)
     if not db_user or not password_valid:
+        register_failed_login(request)
         raise HTTPException(status_code=401, detail="Неправильна пошта або пароль")
     access_token = create_access_token(
         data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
@@ -735,6 +743,7 @@ async def google_login(
         email = idinfo.get("email")
         db_user = db.query(DBUser).filter(DBUser.email == email).first()
         if not db_user:
+            register_failed_login(request)
             raise HTTPException(status_code=403, detail="Вашої пошти немає в базі.")
         access_token = create_access_token(
             data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
@@ -747,6 +756,7 @@ async def google_login(
         db.commit()
         return {"access_token": access_token, "role": db_user.role}
     except ValueError:
+        register_failed_login(request)
         raise HTTPException(status_code=401, detail="Помилка Google")
 
 # =========================================================
