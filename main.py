@@ -757,7 +757,11 @@ async def google_login(
         return {"access_token": access_token, "role": db_user.role}
     except ValueError:
         register_failed_login(request)
-        raise HTTPException(status_code=401, detail="Помилка Google")
+        raise HTTPException(status_code=401, detail="Недійсний токен Google")
+    except Exception as e: 
+        # Ловимо TransportError та будь-які інші мережеві збої
+        print(f"Помилка з'єднання з Google: {e}")
+        raise HTTPException(status_code=503, detail="Сервер тимчасово не може зв'язатися з Google. Спробуйте пізніше.")
 
 # =========================================================
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
