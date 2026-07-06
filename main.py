@@ -736,33 +736,38 @@ async def google_login(
     db: Session = Depends(get_db)
 ):
     check_login_rate_limit(request)
+
     try:
-        idinfo = id_token.verify_oauth2_token(
-            auth_data.credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        # Замість verify_oauth2_token використовуємо tokeninfo endpoint
+        response = requests.get(
+            f"https://oauth2.googleapis.com/tokeninfo?id_token={auth_data.credential}"
         )
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Невалідний Google токен")
+        
+        idinfo = response.json()
+        
+        # Перевіряємо що токен видано для нашого клієнта
+        if idinfo.get("aud") != GOOGLE_CLIENT_ID:
+            raise HTTPException(status_code=401, detail="Невалідний клієнт")
+        
         email = idinfo.get("email")
+        if not email:
+            raise HTTPException(status_code=401, detail="Email не знайдено")
+            
         db_user = db.query(DBUser).filter(DBUser.email == email).first()
         if not db_user:
-            register_failed_login(request)
             raise HTTPException(status_code=403, detail="Вашої пошти немає в базі.")
+        
         access_token = create_access_token(
             data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
         )
-        write_audit(db, request,
-            action="login", user={"user_id": db_user.id, "sub": db_user.email},
-            content_type="Users | Користувач", object_id=db_user.id,
-            object_repr=f"{db_user.email} (Google)",
-        )
-        db.commit()
         return {"access_token": access_token, "role": db_user.role}
-    except ValueError:
-        register_failed_login(request)
-        raise HTTPException(status_code=401, detail="Недійсний токен Google")
-    except Exception as e: 
-        # Ловимо TransportError та будь-які інші мережеві збої
-        print(f"Помилка з'єднання з Google: {e}")
-        raise HTTPException(status_code=503, detail="Сервер тимчасово не може зв'язатися з Google. Спробуйте пізніше.")
-
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Помилка Google: {str(e)}")
 # =========================================================
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
 # =========================================================
