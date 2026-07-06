@@ -738,18 +738,28 @@ async def google_login(
     check_login_rate_limit(request)
 
     try:
-        # Замість verify_oauth2_token використовуємо tokeninfo endpoint
         response = requests.get(
             f"https://oauth2.googleapis.com/tokeninfo?id_token={auth_data.credential}"
         )
+        
+        # ← ТИМЧАСОВО: логуємо що прийшло
+        print(f"tokeninfo status: {response.status_code}")
+        print(f"tokeninfo body: {response.text[:500]}")
+        print(f"GOOGLE_CLIENT_ID: {GOOGLE_CLIENT_ID[:30]}...")
+        
         if response.status_code != 200:
-            raise HTTPException(status_code=401, detail="Невалідний Google токен")
+            raise HTTPException(status_code=401, detail=f"Google tokeninfo: {response.text[:200]}")
         
         idinfo = response.json()
         
-        # Перевіряємо що токен видано для нашого клієнта
-        if idinfo.get("aud") != GOOGLE_CLIENT_ID:
-            raise HTTPException(status_code=401, detail="Невалідний клієнт")
+        # aud може бути рядком або списком
+        aud = idinfo.get("aud", "")
+        if isinstance(aud, list):
+            if GOOGLE_CLIENT_ID not in aud:
+                raise HTTPException(status_code=401, detail=f"Невалідний aud: {aud}")
+        else:
+            if aud != GOOGLE_CLIENT_ID:
+                raise HTTPException(status_code=401, detail=f"Невалідний aud: {aud} != {GOOGLE_CLIENT_ID[:20]}...")
         
         email = idinfo.get("email")
         if not email:
@@ -767,7 +777,7 @@ async def google_login(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Помилка Google: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Помилка: {str(e)}")
 # =========================================================
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
 # =========================================================
