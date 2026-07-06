@@ -247,6 +247,73 @@ class DBHashtagCatalog(Base):
     is_system   = Column(Boolean, default=False)
     created_at  = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y"))
 
+# =========================================================
+# 🏛️ АКАДЕМІЧНА СТРУКТУРА (Інститут → Кафедра → ОПП → План → Група → Предмети)
+# =========================================================
+class DBInstitute(Base):
+    """ННІ / Факультет"""
+    __tablename__ = "institutes"
+    id   = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True)   # напр. "ФІТ", "ННІЕБО"
+    full_name = Column(String, nullable=True)             # повна назва
+
+class DBDepartment(Base):
+    """Кафедра"""
+    __tablename__ = "departments_struct"
+    id           = Column(String, primary_key=True, index=True)
+    institute_id = Column(String, ForeignKey("institutes.id", ondelete="CASCADE"), nullable=False)
+    name         = Column(String, nullable=False)          # напр. "ІППЗ", "МВ"
+    full_name    = Column(String, nullable=True)
+
+class DBOpp(Base):
+    """Освітньо-професійна програма"""
+    __tablename__ = "opps"
+    id            = Column(String, primary_key=True, index=True)
+    department_id = Column(String, ForeignKey("departments_struct.id", ondelete="CASCADE"), nullable=False)
+    name          = Column(String, nullable=False)          # напр. "ІПЗ-23-Б"
+    level         = Column(String, nullable=False, default="bachelor")  # bachelor | master | phd
+    full_name     = Column(String, nullable=True)
+
+class DBStudyPlan(Base):
+    """Навчальний план"""
+    __tablename__ = "study_plans"
+    id     = Column(String, primary_key=True, index=True)
+    opp_id = Column(String, ForeignKey("opps.id", ondelete="CASCADE"), nullable=False)
+    name   = Column(String, nullable=False)                 # напр. "ІПЗ-23-Б-Д"
+
+class DBAcademicGroup(Base):
+    """Академічна група (статичний довідник груп)"""
+    __tablename__ = "academic_groups"
+    id            = Column(String, primary_key=True, index=True)
+    study_plan_id = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False)
+    name          = Column(String, nullable=False, unique=True)   # напр. "ІПЗ-23-2"
+    # рівень визначається з назви групи (цифра/ск=бакалавр, м=магістр, дф=доктор філософії),
+    # але зберігаємо явно для надійності/можливості ручного перевизначення
+    level         = Column(String, nullable=True)  # bachelor | master | phd
+
+class DBSubject(Base):
+    """Предмет (дисципліна) навчального плану — єдина база для ЦСК і опитувань"""
+    __tablename__ = "subjects"
+    id            = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    study_plan_id = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False)
+    name          = Column(String, nullable=False)          # напр. "Французька мова", "Бази даних"
+    semester      = Column(Integer, nullable=True)
+    # elective_slot: null/"" = обов'язковий предмет; "ВК1", "ВК2" і т.д. = слот вибіркового блоку
+    elective_slot = Column(String, nullable=True)
+    teachers      = Column(JSON, default=list)              # список імен викладачів
+
+class DBStudentSubjectChoice(Base):
+    """Фіксація вибору студента в межах вибіркового слоту (ВК1, ВК2...).
+    Гнучка модель: прив'язка по (student_id, study_plan_id, elective_slot) -> subject_id,
+    легко змінити механізм вибору пізніше без зміни схеми."""
+    __tablename__ = "student_subject_choices"
+    id            = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    student_id    = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    study_plan_id = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False)
+    elective_slot = Column(String, nullable=False)          # "ВК1" і т.д.
+    subject_id    = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    chosen_at     = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
+
 Base.metadata.create_all(bind=engine)
 
 # =========================================================
@@ -285,6 +352,11 @@ def _run_migrations():
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS feathers_reward INTEGER DEFAULT 0",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS hashtags JSON DEFAULT '[]'",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS deadline VARCHAR",
+        # Нові таблиці академічної структури — Base.metadata.create_all їх вже створює,
+        # але на випадок якщо БД старіша — страхуємо ALTER-ами де потрібно
+        "ALTER TABLE academic_groups ADD COLUMN IF NOT EXISTS level VARCHAR",
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS elective_slot VARCHAR",
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS teachers JSON DEFAULT '[]'",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -382,6 +454,50 @@ class HashtagUpdateSchema(BaseModel):
     description: Optional[str] = None
     color: Optional[str] = None
     icon: Optional[str] = None
+
+# --- Академічна структура ---
+class InstituteSchema(BaseModel):
+    id: Optional[str] = None
+    name: str
+    full_name: Optional[str] = None
+
+class DepartmentSchema(BaseModel):
+    id: Optional[str] = None
+    institute_id: str
+    name: str
+    full_name: Optional[str] = None
+
+class OppSchema(BaseModel):
+    id: Optional[str] = None
+    department_id: str
+    name: str
+    level: str = "bachelor"
+    full_name: Optional[str] = None
+
+class StudyPlanSchema(BaseModel):
+    id: Optional[str] = None
+    opp_id: str
+    name: str
+
+class AcademicGroupSchema(BaseModel):
+    id: Optional[str] = None
+    study_plan_id: str
+    name: str
+    level: Optional[str] = None
+
+class SubjectSchema(BaseModel):
+    id: Optional[int] = None
+    study_plan_id: str
+    name: str
+    semester: Optional[int] = None
+    elective_slot: Optional[str] = None
+    teachers: List[str] = []
+
+class StudentSubjectChoiceSchema(BaseModel):
+    student_id: str
+    study_plan_id: str
+    elective_slot: str
+    subject_id: int
 
 # =========================================================
 # 🔑 ФУНКЦІЇ АВТОРИЗАЦІЇ
@@ -534,7 +650,30 @@ THEMES_CATALOG = [
     },
 ]
 
-def get_or_create_wallet(db: Session, student_id: str) -> DBFeathersWallet:
+# =========================================================
+# 🏛️ ДОПОМІЖНІ ФУНКЦІЇ АКАДЕМІЧНОЇ СТРУКТУРИ
+# =========================================================
+def detect_level_from_group_name(group_name: str) -> str:
+    """Визначає рівень освіти за закінченням назви групи.
+    Бакалавр: закінчується на цифру або 'ск'
+    Магістр: закінчується на 'м'
+    Доктор філософії: закінчується на 'дф'
+    """
+    if not group_name:
+        return "bachelor"
+    g = group_name.strip().lower()
+    if g.endswith("дф"):
+        return "phd"
+    if g.endswith("м"):
+        return "master"
+    if g.endswith("ск") or (g and g[-1].isdigit()):
+        return "bachelor"
+    return "bachelor"
+
+def _struct_to_dict(obj, fields):
+    return {f: getattr(obj, f) for f in fields}
+
+
     wallet = db.query(DBFeathersWallet).filter(DBFeathersWallet.student_id == student_id).first()
     if not wallet:
         wallet = DBFeathersWallet(student_id=student_id, balance=0)
@@ -892,11 +1031,60 @@ async def get_student_surveys(
                 if not is_allowed:
                     continue
 
+        # 3. Хештег #По_ОПП — дублюємо опитування для кожної ОПП студента
+        if "По_ОПП" in hashtags and user_role == "student":
+            # Збираємо ОПП студента через структуру груп
+            student_opps = []
+            for study in student_studies:
+                group_name = study.get("Група", "")
+                grp = db.query(DBAcademicGroup).filter(DBAcademicGroup.name == group_name).first()
+                if grp:
+                    plan = db.query(DBStudyPlan).filter(DBStudyPlan.id == grp.study_plan_id).first()
+                    if plan:
+                        opp = db.query(DBOpp).filter(DBOpp.id == plan.opp_id).first()
+                        if opp and not any(o["id"] == opp.id for o in student_opps):
+                            student_opps.append({"id": opp.id, "name": opp.name})
+                else:
+                    # Fallback якщо група ще не прив'язана до структури
+                    opp_name = study.get("ОПП", study.get("Спеціальність", ""))
+                    if opp_name and not any(o["name"] == opp_name for o in student_opps):
+                        student_opps.append({"id": None, "name": opp_name})
+
+            if len(student_opps) <= 1:
+                # Одна ОПП — звичайна картка без приписки
+                opp_label = student_opps[0]["name"] if student_opps else None
+                result.append({
+                    "id": t.id,
+                    "title": f"{t.title} [{opp_label}]" if opp_label else t.title,
+                    "is_completed": t.id in completed_ids,
+                    "feathers_reward": t.feathers_reward or 0,
+                    "hashtags": hashtags,
+                    "deadline": t.deadline,
+                    "opp_context": opp_label,
+                })
+            else:
+                # Кілька ОПП — дублюємо з приміткою для кожної
+                for opp in student_opps:
+                    virtual_id = f"{t.id}__opp__{opp['id'] or opp['name']}"
+                    is_done = virtual_id in completed_ids or t.id in completed_ids
+                    result.append({
+                        "id": virtual_id,
+                        "base_id": t.id,
+                        "title": f"{t.title} [{opp['name']}]",
+                        "is_completed": is_done,
+                        "feathers_reward": t.feathers_reward or 0,
+                        "hashtags": hashtags,
+                        "deadline": t.deadline,
+                        "opp_context": opp["name"],
+                    })
+            continue
+
         result.append({
             "id": t.id, "title": t.title, "is_completed": t.id in completed_ids,
             "feathers_reward": t.feathers_reward or 0,
             "hashtags": hashtags,
             "deadline": t.deadline,
+            "opp_context": None,
         })
     return result
 
@@ -1058,6 +1246,402 @@ async def delete_hashtag(
     return {"message": "Видалено"}
 
 # =========================================================
+# 🏛️ АКАДЕМІЧНА СТРУКТУРА — CRUD ЕНДПОІНТИ
+# Інститут → Кафедра → ОПП → Навчальний план → Група → Предмети
+# =========================================================
+
+# ── ІНСТИТУТИ / ФАКУЛЬТЕТИ ──────────────────────────────
+@app.get("/api/structure/institutes")
+async def get_institutes(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    items = db.query(DBInstitute).order_by(DBInstitute.name).all()
+    return [{"id": i.id, "name": i.name, "full_name": i.full_name} for i in items]
+
+@app.post("/api/superadmin/structure/institutes")
+async def create_institute(
+    data: InstituteSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    new_id = data.id or str(uuid.uuid4())[:8]
+    if db.query(DBInstitute).filter(DBInstitute.id == new_id).first():
+        raise HTTPException(status_code=409, detail="Інститут з таким ID вже існує")
+    obj = DBInstitute(id=new_id, name=data.name, full_name=data.full_name)
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | Інститут", object_repr=data.name)
+    db.commit()
+    return {"id": new_id, "name": obj.name, "full_name": obj.full_name}
+
+@app.put("/api/superadmin/structure/institutes/{item_id}")
+async def update_institute(
+    item_id: str, data: InstituteSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBInstitute).filter(DBInstitute.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.name = data.name
+    obj.full_name = data.full_name
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Інститут", object_id=item_id, object_repr=data.name)
+    db.commit()
+    return {"id": obj.id, "name": obj.name, "full_name": obj.full_name}
+
+@app.delete("/api/superadmin/structure/institutes/{item_id}")
+async def delete_institute(
+    item_id: str, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBInstitute).filter(DBInstitute.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | Інститут", object_id=item_id, object_repr=obj.name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── КАФЕДРИ ──────────────────────────────────────────────
+@app.get("/api/structure/departments")
+async def get_departments(
+    institute_id: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    q = db.query(DBDepartment)
+    if institute_id:
+        q = q.filter(DBDepartment.institute_id == institute_id)
+    items = q.order_by(DBDepartment.name).all()
+    return [{"id": d.id, "institute_id": d.institute_id, "name": d.name, "full_name": d.full_name} for d in items]
+
+@app.post("/api/superadmin/structure/departments")
+async def create_department(
+    data: DepartmentSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    if not db.query(DBInstitute).filter(DBInstitute.id == data.institute_id).first():
+        raise HTTPException(status_code=404, detail="Інститут не знайдено")
+    new_id = data.id or str(uuid.uuid4())[:8]
+    if db.query(DBDepartment).filter(DBDepartment.id == new_id).first():
+        raise HTTPException(status_code=409, detail="Кафедра з таким ID вже існує")
+    obj = DBDepartment(id=new_id, institute_id=data.institute_id, name=data.name, full_name=data.full_name)
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | Кафедра", object_repr=data.name)
+    db.commit()
+    return {"id": new_id, "institute_id": obj.institute_id, "name": obj.name, "full_name": obj.full_name}
+
+@app.put("/api/superadmin/structure/departments/{item_id}")
+async def update_department(
+    item_id: str, data: DepartmentSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBDepartment).filter(DBDepartment.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.institute_id = data.institute_id
+    obj.name = data.name
+    obj.full_name = data.full_name
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Кафедра", object_id=item_id, object_repr=data.name)
+    db.commit()
+    return {"id": obj.id, "institute_id": obj.institute_id, "name": obj.name, "full_name": obj.full_name}
+
+@app.delete("/api/superadmin/structure/departments/{item_id}")
+async def delete_department(
+    item_id: str, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBDepartment).filter(DBDepartment.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | Кафедра", object_id=item_id, object_repr=obj.name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── ОПП ──────────────────────────────────────────────────
+@app.get("/api/structure/opps")
+async def get_opps(
+    department_id: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    q = db.query(DBOpp)
+    if department_id:
+        q = q.filter(DBOpp.department_id == department_id)
+    items = q.order_by(DBOpp.name).all()
+    return [{"id": o.id, "department_id": o.department_id, "name": o.name, "level": o.level, "full_name": o.full_name} for o in items]
+
+@app.post("/api/superadmin/structure/opps")
+async def create_opp(
+    data: OppSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    if not db.query(DBDepartment).filter(DBDepartment.id == data.department_id).first():
+        raise HTTPException(status_code=404, detail="Кафедру не знайдено")
+    new_id = data.id or str(uuid.uuid4())[:8]
+    if db.query(DBOpp).filter(DBOpp.id == new_id).first():
+        raise HTTPException(status_code=409, detail="ОПП з таким ID вже існує")
+    obj = DBOpp(id=new_id, department_id=data.department_id, name=data.name, level=data.level, full_name=data.full_name)
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | ОПП", object_repr=data.name)
+    db.commit()
+    return {"id": new_id, "department_id": obj.department_id, "name": obj.name, "level": obj.level, "full_name": obj.full_name}
+
+@app.put("/api/superadmin/structure/opps/{item_id}")
+async def update_opp(
+    item_id: str, data: OppSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBOpp).filter(DBOpp.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.department_id = data.department_id
+    obj.name = data.name
+    obj.level = data.level
+    obj.full_name = data.full_name
+    write_audit(db, request, action="update", user=admin, content_type="Structure | ОПП", object_id=item_id, object_repr=data.name)
+    db.commit()
+    return {"id": obj.id, "department_id": obj.department_id, "name": obj.name, "level": obj.level, "full_name": obj.full_name}
+
+@app.delete("/api/superadmin/structure/opps/{item_id}")
+async def delete_opp(
+    item_id: str, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBOpp).filter(DBOpp.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | ОПП", object_id=item_id, object_repr=obj.name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── НАВЧАЛЬНІ ПЛАНИ ─────────────────────────────────────
+@app.get("/api/structure/study-plans")
+async def get_study_plans(
+    opp_id: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    q = db.query(DBStudyPlan)
+    if opp_id:
+        q = q.filter(DBStudyPlan.opp_id == opp_id)
+    items = q.order_by(DBStudyPlan.name).all()
+    return [{"id": p.id, "opp_id": p.opp_id, "name": p.name} for p in items]
+
+@app.post("/api/superadmin/structure/study-plans")
+async def create_study_plan(
+    data: StudyPlanSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    if not db.query(DBOpp).filter(DBOpp.id == data.opp_id).first():
+        raise HTTPException(status_code=404, detail="ОПП не знайдено")
+    new_id = data.id or str(uuid.uuid4())[:8]
+    if db.query(DBStudyPlan).filter(DBStudyPlan.id == new_id).first():
+        raise HTTPException(status_code=409, detail="План з таким ID вже існує")
+    obj = DBStudyPlan(id=new_id, opp_id=data.opp_id, name=data.name)
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | План", object_repr=data.name)
+    db.commit()
+    return {"id": new_id, "opp_id": obj.opp_id, "name": obj.name}
+
+@app.put("/api/superadmin/structure/study-plans/{item_id}")
+async def update_study_plan(
+    item_id: str, data: StudyPlanSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBStudyPlan).filter(DBStudyPlan.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.opp_id = data.opp_id
+    obj.name = data.name
+    write_audit(db, request, action="update", user=admin, content_type="Structure | План", object_id=item_id, object_repr=data.name)
+    db.commit()
+    return {"id": obj.id, "opp_id": obj.opp_id, "name": obj.name}
+
+@app.delete("/api/superadmin/structure/study-plans/{item_id}")
+async def delete_study_plan(
+    item_id: str, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBStudyPlan).filter(DBStudyPlan.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | План", object_id=item_id, object_repr=obj.name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── ГРУПИ ────────────────────────────────────────────────
+@app.get("/api/structure/groups")
+async def get_academic_groups(
+    study_plan_id: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    q = db.query(DBAcademicGroup)
+    if study_plan_id:
+        q = q.filter(DBAcademicGroup.study_plan_id == study_plan_id)
+    items = q.order_by(DBAcademicGroup.name).all()
+    return [{"id": g.id, "study_plan_id": g.study_plan_id, "name": g.name, "level": g.level} for g in items]
+
+@app.post("/api/superadmin/structure/groups")
+async def create_academic_group(
+    data: AcademicGroupSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    if not db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first():
+        raise HTTPException(status_code=404, detail="Навчальний план не знайдено")
+    if db.query(DBAcademicGroup).filter(DBAcademicGroup.name == data.name).first():
+        raise HTTPException(status_code=409, detail=f"Група {data.name} вже існує")
+    new_id = data.id or str(uuid.uuid4())[:8]
+    level = data.level or detect_level_from_group_name(data.name)
+    obj = DBAcademicGroup(id=new_id, study_plan_id=data.study_plan_id, name=data.name, level=level)
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | Група", object_repr=data.name)
+    db.commit()
+    return {"id": new_id, "study_plan_id": obj.study_plan_id, "name": obj.name, "level": obj.level}
+
+@app.put("/api/superadmin/structure/groups/{item_id}")
+async def update_academic_group(
+    item_id: str, data: AcademicGroupSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBAcademicGroup).filter(DBAcademicGroup.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.study_plan_id = data.study_plan_id
+    obj.name = data.name
+    obj.level = data.level or detect_level_from_group_name(data.name)
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Група", object_id=item_id, object_repr=data.name)
+    db.commit()
+    return {"id": obj.id, "study_plan_id": obj.study_plan_id, "name": obj.name, "level": obj.level}
+
+@app.delete("/api/superadmin/structure/groups/{item_id}")
+async def delete_academic_group(
+    item_id: str, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBAcademicGroup).filter(DBAcademicGroup.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | Група", object_id=item_id, object_repr=obj.name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── ПРЕДМЕТИ ─────────────────────────────────────────────
+@app.get("/api/structure/subjects")
+async def get_subjects(
+    study_plan_id: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    q = db.query(DBSubject)
+    if study_plan_id:
+        q = q.filter(DBSubject.study_plan_id == study_plan_id)
+    items = q.order_by(DBSubject.semester, DBSubject.name).all()
+    return [{
+        "id": s.id, "study_plan_id": s.study_plan_id, "name": s.name,
+        "semester": s.semester, "elective_slot": s.elective_slot, "teachers": s.teachers or []
+    } for s in items]
+
+@app.post("/api/superadmin/structure/subjects")
+async def create_subject(
+    data: SubjectSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    if not db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first():
+        raise HTTPException(status_code=404, detail="Навчальний план не знайдено")
+    obj = DBSubject(
+        study_plan_id=data.study_plan_id, name=data.name, semester=data.semester,
+        elective_slot=data.elective_slot or None, teachers=data.teachers or [],
+    )
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | Предмет", object_repr=data.name)
+    db.commit()
+    db.refresh(obj)
+    return {"id": obj.id, "study_plan_id": obj.study_plan_id, "name": obj.name, "semester": obj.semester, "elective_slot": obj.elective_slot, "teachers": obj.teachers or []}
+
+@app.put("/api/superadmin/structure/subjects/{item_id}")
+async def update_subject(
+    item_id: int, data: SubjectSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBSubject).filter(DBSubject.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.study_plan_id = data.study_plan_id
+    obj.name = data.name
+    obj.semester = data.semester
+    obj.elective_slot = data.elective_slot or None
+    obj.teachers = data.teachers or []
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Предмет", object_id=item_id, object_repr=data.name)
+    db.commit()
+    return {"id": obj.id, "study_plan_id": obj.study_plan_id, "name": obj.name, "semester": obj.semester, "elective_slot": obj.elective_slot, "teachers": obj.teachers or []}
+
+@app.delete("/api/superadmin/structure/subjects/{item_id}")
+async def delete_subject(
+    item_id: int, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBSubject).filter(DBSubject.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | Предмет", object_id=item_id, object_repr=obj.name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── ВИБІР СТУДЕНТОМ ВИБІРКОВОГО ПРЕДМЕТУ ────────────────
+@app.get("/api/student/elective-choices")
+async def get_my_elective_choices(
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Повертає поточні вибори студента по всіх його навчальних планах"""
+    choices = db.query(DBStudentSubjectChoice).filter(
+        DBStudentSubjectChoice.student_id == user["user_id"]
+    ).all()
+    return [{
+        "study_plan_id": c.study_plan_id, "elective_slot": c.elective_slot,
+        "subject_id": c.subject_id, "chosen_at": c.chosen_at
+    } for c in choices]
+
+@app.get("/api/student/elective-options/{study_plan_id}")
+async def get_elective_options(
+    study_plan_id: str,
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Повертає всі вибіркові слоти і варіанти предметів для конкретного плану"""
+    subjects = db.query(DBSubject).filter(
+        DBSubject.study_plan_id == study_plan_id,
+        DBSubject.elective_slot.isnot(None)
+    ).all()
+    slots = {}
+    for s in subjects:
+        slots.setdefault(s.elective_slot, []).append({
+            "id": s.id, "name": s.name, "semester": s.semester, "teachers": s.teachers or []
+        })
+    return slots
+
+@app.post("/api/student/elective-choices")
+async def set_elective_choice(
+    data: StudentSubjectChoiceSchema,
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    subject = db.query(DBSubject).filter(DBSubject.id == data.subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Предмет не знайдено")
+    if subject.elective_slot != data.elective_slot or subject.study_plan_id != data.study_plan_id:
+        raise HTTPException(status_code=400, detail="Предмет не належить вказаному слоту/плану")
+    existing = db.query(DBStudentSubjectChoice).filter(
+        DBStudentSubjectChoice.student_id == user["user_id"],
+        DBStudentSubjectChoice.study_plan_id == data.study_plan_id,
+        DBStudentSubjectChoice.elective_slot == data.elective_slot,
+    ).first()
+    if existing:
+        existing.subject_id = data.subject_id
+        existing.chosen_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+    else:
+        db.add(DBStudentSubjectChoice(
+            student_id=user["user_id"], study_plan_id=data.study_plan_id,
+            elective_slot=data.elective_slot, subject_id=data.subject_id,
+        ))
+    db.commit()
+    return {"message": "Вибір збережено"}
+
+# =========================================================
 # 📊 АНАЛІТИКА ЦМЯО
 # =========================================================
 @app.get("/api/cmyo/responses/{survey_id}")
@@ -1089,14 +1673,20 @@ async def save_student_response(
     response: StudentResponseSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    template = db.query(DBTemplate).filter(DBTemplate.id == response.survey_id).first()
+    # Розпаковуємо virtual_id для По_ОПП опитувань (формат: "baseId__opp__oppIdOrName")
+    raw_survey_id = response.survey_id
+    base_survey_id = raw_survey_id.split("__opp__")[0] if "__opp__" in raw_survey_id else raw_survey_id
+    opp_context = raw_survey_id.split("__opp__")[1] if "__opp__" in raw_survey_id else None
+
+    template = db.query(DBTemplate).filter(DBTemplate.id == base_survey_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="Опитування не знайдено")
 
     if user.get("role") != "stakeholder":
+        # Перевіряємо за virtual_id (щоб одна і та ж база-опитування могла пройтися двічі по різних ОПП)
         already_completed = db.query(DBCompletedSurvey).filter(
             DBCompletedSurvey.user_id == user["user_id"],
-            DBCompletedSurvey.survey_id == response.survey_id
+            DBCompletedSurvey.survey_id == raw_survey_id
         ).first()
         if already_completed:
             raise HTTPException(status_code=409, detail="Ви вже проходили це опитування")
@@ -1110,12 +1700,15 @@ async def save_student_response(
         respondent_name = db_user_obj.full_name if db_user_obj else None
 
     db.add(DBResponse(
-        survey_id=response.survey_id, answers=response.answers,
-        respondent_id=respondent_id, respondent_name=respondent_name
+        survey_id=base_survey_id,
+        answers=response.answers,
+        respondent_id=respondent_id,
+        respondent_name=respondent_name,
     ))
 
     if user.get("role") != "stakeholder":
-        db.add(DBCompletedSurvey(user_id=user["user_id"], survey_id=response.survey_id))
+        # Зберігаємо virtual_id щоб кожна ОПП-копія вважалась окремо пройденою
+        db.add(DBCompletedSurvey(user_id=user["user_id"], survey_id=raw_survey_id))
 
     # 🪶 Нараховуємо пер'я лише студентам
     if user.get("role") == "student" and template.feathers_reward and template.feathers_reward > 0:
@@ -1123,12 +1716,13 @@ async def save_student_response(
             db=db,
             student_id=user["user_id"],
             amount=template.feathers_reward,
-            reason=f"Опитування: {template.title}",
-            survey_id=response.survey_id
+            reason=f"Опитування: {template.title}" + (f" [{opp_context}]" if opp_context else ""),
+            survey_id=base_survey_id
         )
 
     db.commit()
     return {"message": "Збережено.", "feathers_earned": template.feathers_reward or 0}
+
 
 # =========================================================
 # 🪶 ЕНДПОІНТИ СИСТЕМИ ПЕР'ЯТА
@@ -1640,6 +2234,47 @@ async def clear_audit_logs(
 # =========================================================
 # 🏓 PING
 # =========================================================
+@app.get("/api/structure/tree")
+async def get_structure_tree(
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """Повертає повне дерево: Інститут → Кафедра → ОПП → Plan → Групи + Предмети плану"""
+    institutes = db.query(DBInstitute).order_by(DBInstitute.name).all()
+    result = []
+    for inst in institutes:
+        departments = db.query(DBDepartment).filter(DBDepartment.institute_id == inst.id).order_by(DBDepartment.name).all()
+        dept_list = []
+        for dept in departments:
+            opps = db.query(DBOpp).filter(DBOpp.department_id == dept.id).order_by(DBOpp.name).all()
+            opp_list = []
+            for opp in opps:
+                plans = db.query(DBStudyPlan).filter(DBStudyPlan.opp_id == opp.id).order_by(DBStudyPlan.name).all()
+                plan_list = []
+                for plan in plans:
+                    groups = db.query(DBAcademicGroup).filter(DBAcademicGroup.study_plan_id == plan.id).order_by(DBAcademicGroup.name).all()
+                    subjects = db.query(DBSubject).filter(DBSubject.study_plan_id == plan.id).order_by(DBSubject.semester, DBSubject.name).all()
+                    plan_list.append({
+                        "id": plan.id, "name": plan.name,
+                        "groups": [{"id": g.id, "name": g.name, "level": g.level} for g in groups],
+                        "subjects": [{
+                            "id": s.id, "name": s.name, "semester": s.semester,
+                            "elective_slot": s.elective_slot, "teachers": s.teachers or []
+                        } for s in subjects],
+                    })
+                opp_list.append({
+                    "id": opp.id, "name": opp.name, "level": opp.level, "full_name": opp.full_name,
+                    "plans": plan_list
+                })
+            dept_list.append({
+                "id": dept.id, "name": dept.name, "full_name": dept.full_name,
+                "opps": opp_list
+            })
+        result.append({
+            "id": inst.id, "name": inst.name, "full_name": inst.full_name,
+            "departments": dept_list
+        })
+    return result
+
 @app.get("/api/ping")
 async def ping(db: Session = Depends(get_db)):
     try:
