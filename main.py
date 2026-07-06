@@ -4,6 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional, Generator
 import uuid
+import requests
 from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from passlib.context import CryptContext
