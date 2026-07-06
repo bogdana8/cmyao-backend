@@ -776,8 +776,12 @@ async def google_login(
         
     except HTTPException:
         raise
+    except requests.exceptions.ConnectionError as e:
+        raise HTTPException(status_code=503, detail=f"Render блокує вихідні запити: {str(e)[:300]}")
+    except requests.exceptions.Timeout as e:
+        raise HTTPException(status_code=503, detail=f"Timeout: {str(e)[:300]}")
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Помилка: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Тип помилки: {type(e).__name__} | {str(e)[:300]}")
 # =========================================================
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
 # =========================================================
