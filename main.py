@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Generator
 import uuid
 import requests
-from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean, text
+from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean, text, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -169,6 +169,12 @@ class DBGrade(Base):
     score = Column(String)
     control_form = Column(String)
     teacher = Column(String)
+    # 🔗 Канонічні зв'язки (Крок 3 реформи бази): якщо вдалось зіставити текст із
+    # довідниками Структури — тут зберігається справжній id. Текстові поля вище
+    # лишаються як резервне відображення для записів, які ще не вдалось зіставити.
+    group_id = Column(String, ForeignKey("academic_groups.id", ondelete="SET NULL"), nullable=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="SET NULL"), nullable=True)
+    teacher_id = Column(String, ForeignKey("teachers.id", ondelete="SET NULL"), nullable=True)
 
 class DBAnnouncement(Base):
     __tablename__ = "announcements"
@@ -299,16 +305,45 @@ class DBAcademicGroup(Base):
     # але зберігаємо явно для надійності/можливості ручного перевизначення
     level         = Column(String, nullable=True)  # bachelor | master | phd
 
+class DBTeacher(Base):
+    """Викладач — єдиний довідник (замінює вільний текст teachers/викладач у Subject і Grade)"""
+    __tablename__ = "teachers"
+    id            = Column(String, primary_key=True, index=True)
+    full_name     = Column(String, nullable=False, index=True)
+    department_id = Column(String, ForeignKey("departments_struct.id", ondelete="SET NULL"), nullable=True)
+    email         = Column(String, nullable=True)
+    position      = Column(String, nullable=True)   # посада, напр. "доцент"
+
 class DBSubject(Base):
-    """Предмет (дисципліна) навчального плану — єдина база для ЦСК і опитувань"""
+    """Предмет (дисципліна) ОПП — семестр і форма контролю живуть тут,
+    бо це властивості освітньої програми, а не конкретного навчального плану.
+    Години для предмета — в DBPlanSubjectHours (там вони різні для різних форм навчання)."""
     __tablename__ = "subjects"
     id            = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    study_plan_id = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False)
+    opp_id        = Column(String, ForeignKey("opps.id", ondelete="CASCADE"), nullable=True)
+    # DEPRECATED: старе поле, залишене лише для міграції існуючих даних на opp_id.
+    # Новий код завжди повинен використовувати opp_id.
+    study_plan_id = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=True)
     name          = Column(String, nullable=False)          # напр. "Французька мова", "Бази даних"
     semester      = Column(Integer, nullable=True)
+    # control_form: форма контролю — "Екзамен" | "Залік" | "Диф. залік" і т.д.
+    control_form  = Column(String, nullable=True)
     # elective_slot: null/"" = обов'язковий предмет; "ВК1", "ВК2" і т.д. = слот вибіркового блоку
     elective_slot = Column(String, nullable=True)
-    teachers      = Column(JSON, default=list)              # список імен викладачів
+    teachers      = Column(JSON, default=list)              # список id викладачів (DBTeacher.id)
+
+class DBPlanSubjectHours(Base):
+    """Години предмета в межах конкретного навчального плану.
+    Один предмет ОПП може мати різні години у денного/заочного/іншого плану —
+    тому години прив'язані до пари (план, предмет), а не до предмета напряму."""
+    __tablename__ = "plan_subject_hours"
+    id               = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    study_plan_id    = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=False)
+    subject_id       = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    hours            = Column(Integer, nullable=True)
+    lecture_hours    = Column(Integer, nullable=True)
+    practice_hours   = Column(Integer, nullable=True)
+    self_study_hours = Column(Integer, nullable=True)
 
 class DBStudentSubjectChoice(Base):
     """Фіксація вибору студента в межах вибіркового слоту (ВК1, ВК2...).
@@ -365,6 +400,17 @@ def _run_migrations():
         "ALTER TABLE academic_groups ADD COLUMN IF NOT EXISTS level VARCHAR",
         "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS elective_slot VARCHAR",
         "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS teachers JSON DEFAULT '[]'",
+        # 🏗 Реформа: Subject переїжджає на рівень ОПП, години — окремо по планах,
+        # з'являється довідник викладачів
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS opp_id VARCHAR",
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS control_form VARCHAR",
+        "ALTER TABLE subjects ALTER COLUMN study_plan_id DROP NOT NULL",
+        "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS email VARCHAR",
+        "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS position VARCHAR",
+        # 🔗 Grade: канонічні зв'язки замість вільного тексту
+        "ALTER TABLE grades ADD COLUMN IF NOT EXISTS group_id VARCHAR",
+        "ALTER TABLE grades ADD COLUMN IF NOT EXISTS subject_id INTEGER",
+        "ALTER TABLE grades ADD COLUMN IF NOT EXISTS teacher_id VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -374,10 +420,101 @@ def _run_migrations():
             except Exception:
                 pass
 
+def _migrate_subjects_to_opp_level(db_session):
+    """Одноразова міграція: для предметів, які ще мають лише study_plan_id (стара схема),
+    підставляємо opp_id з їхнього навчального плану, і переносимо прив'язку в plan_subject_hours,
+    щоб нічого не загубилось при переході на нову структуру."""
+    legacy_subjects = db_session.query(DBSubject).filter(
+        DBSubject.opp_id.is_(None), DBSubject.study_plan_id.isnot(None)
+    ).all()
+    for subj in legacy_subjects:
+        plan = db_session.query(DBStudyPlan).filter(DBStudyPlan.id == subj.study_plan_id).first()
+        if not plan:
+            continue
+        subj.opp_id = plan.opp_id
+        exists = db_session.query(DBPlanSubjectHours).filter(
+            DBPlanSubjectHours.study_plan_id == subj.study_plan_id,
+            DBPlanSubjectHours.subject_id == subj.id,
+        ).first()
+        if not exists:
+            db_session.add(DBPlanSubjectHours(study_plan_id=subj.study_plan_id, subject_id=subj.id))
+    if legacy_subjects:
+        db_session.commit()
+
+def resolve_group_id(db_session, group_name: str):
+    """Зіставляє вільний текст назви групи з канонічним записом Структури.
+    Спершу точний збіг, потім без урахування регістру/пробілів."""
+    if not group_name:
+        return None
+    gname = group_name.strip()
+    grp = db_session.query(DBAcademicGroup).filter(DBAcademicGroup.name == gname).first()
+    if grp:
+        return grp.id
+    grp = db_session.query(DBAcademicGroup).filter(func.lower(DBAcademicGroup.name) == gname.lower()).first()
+    return grp.id if grp else None
+
+def resolve_subject_id(db_session, subject_name: str, group_id: str = None):
+    """Зіставляє вільний текст назви предмета з канонічним предметом ОПП,
+    до якої належить дана група (якщо group_id відомий) — інакше шукає глобально."""
+    if not subject_name:
+        return None
+    sname = subject_name.strip()
+    opp_id = None
+    if group_id:
+        grp = db_session.query(DBAcademicGroup).filter(DBAcademicGroup.id == group_id).first()
+        if grp:
+            plan = db_session.query(DBStudyPlan).filter(DBStudyPlan.id == grp.study_plan_id).first()
+            if plan:
+                opp_id = plan.opp_id
+    q = db_session.query(DBSubject).filter(func.lower(DBSubject.name) == sname.lower())
+    if opp_id:
+        q = q.filter(DBSubject.opp_id == opp_id)
+    subj = q.first()
+    return subj.id if subj else None
+
+def resolve_teacher_id(db_session, teacher_name: str):
+    """Зіставляє вільний текст ПІБ викладача з довідником Teacher (точний, потім без регістру)."""
+    if not teacher_name:
+        return None
+    tname = teacher_name.strip()
+    if not tname:
+        return None
+    t = db_session.query(DBTeacher).filter(DBTeacher.full_name == tname).first()
+    if t:
+        return t.id
+    t = db_session.query(DBTeacher).filter(func.lower(DBTeacher.full_name) == tname.lower()).first()
+    return t.id if t else None
+
+def _migrate_grades_to_canonical_links(db_session):
+    """Одноразова міграція: для оцінок, які ще не мають group_id/subject_id/teacher_id,
+    пробує зіставити текстові поля з довідниками Структури. Те, що не зіставилось,
+    залишається з порожнім id — текстове поле й далі відображається як є (нічого не губиться)."""
+    legacy_grades = db_session.query(DBGrade).filter(DBGrade.group_id.is_(None)).all()
+    if not legacy_grades:
+        return
+    changed = 0
+    for g in legacy_grades:
+        gid = resolve_group_id(db_session, g.group_name)
+        if gid:
+            g.group_id = gid
+            changed += 1
+        sid = resolve_subject_id(db_session, g.subject, gid)
+        if sid:
+            g.subject_id = sid
+        tid = resolve_teacher_id(db_session, g.teacher)
+        if tid:
+            g.teacher_id = tid
+    if changed:
+        db_session.commit()
+    else:
+        db_session.rollback()
+
 _run_migrations()
 _seed_db = SessionLocal()
 try:
     _seed_hashtags(_seed_db)
+    _migrate_subjects_to_opp_level(_seed_db)
+    _migrate_grades_to_canonical_links(_seed_db)
 finally:
     _seed_db.close()
 
@@ -495,11 +632,28 @@ class AcademicGroupSchema(BaseModel):
 
 class SubjectSchema(BaseModel):
     id: Optional[int] = None
-    study_plan_id: str
+    opp_id: str
     name: str
     semester: Optional[int] = None
+    control_form: Optional[str] = None
     elective_slot: Optional[str] = None
-    teachers: List[str] = []
+    teachers: List[str] = []   # список id викладачів (DBTeacher.id)
+
+class PlanSubjectHoursSchema(BaseModel):
+    id: Optional[int] = None
+    study_plan_id: str
+    subject_id: int
+    hours: Optional[int] = None
+    lecture_hours: Optional[int] = None
+    practice_hours: Optional[int] = None
+    self_study_hours: Optional[int] = None
+
+class TeacherSchema(BaseModel):
+    id: Optional[str] = None
+    full_name: str
+    department_id: Optional[str] = None
+    email: Optional[str] = None
+    position: Optional[str] = None
 
 class StudentSubjectChoiceSchema(BaseModel):
     student_id: str
@@ -681,6 +835,26 @@ def detect_level_from_group_name(group_name: str) -> str:
 def _struct_to_dict(obj, fields):
     return {f: getattr(obj, f) for f in fields}
 
+def _subject_to_dict(s: "DBSubject") -> dict:
+    return {
+        "id": s.id, "opp_id": s.opp_id, "name": s.name, "semester": s.semester,
+        "control_form": s.control_form, "elective_slot": s.elective_slot,
+        "teachers": s.teachers or [],
+    }
+
+def _plan_subject_hours_to_dict(h: "DBPlanSubjectHours") -> dict:
+    return {
+        "id": h.id, "study_plan_id": h.study_plan_id, "subject_id": h.subject_id,
+        "hours": h.hours, "lecture_hours": h.lecture_hours,
+        "practice_hours": h.practice_hours, "self_study_hours": h.self_study_hours,
+    }
+
+def _teacher_to_dict(t: "DBTeacher") -> dict:
+    return {
+        "id": t.id, "full_name": t.full_name, "department_id": t.department_id,
+        "email": t.email, "position": t.position,
+    }
+
 def get_or_create_wallet(db: Session, student_id: str) -> "DBFeathersWallet":
     """Повертає гаманець студента, створюючи його при першому зверненні"""
     wallet = db.query(DBFeathersWallet).filter(DBFeathersWallet.student_id == student_id).first()
@@ -794,18 +968,43 @@ async def get_all_users(admin: dict = Depends(require_superadmin), db: Session =
         "role": u.role, "student_data": u.student_data
     } for u in users]
 
+def _normalize_student_data_groups(db_session, student_data):
+    """Нормалізує 'Група' в student_data['навчання'][] за канонічним довідником AcademicGroup —
+    щоб та сама група завжди писалась однаково, незалежно від того, звідки її внесли
+    (ручна форма SuperAdmin, масовий імпорт, тощо). Групи, яких ще немає в Структурі,
+    залишаються як є — це не блокує створення користувача."""
+    if not isinstance(student_data, dict):
+        return student_data
+    studies = student_data.get("навчання")
+    if not isinstance(studies, list):
+        return student_data
+    for s in studies:
+        if not isinstance(s, dict):
+            continue
+        raw_group = s.get("Група")
+        if not raw_group:
+            continue
+        gid = resolve_group_id(db_session, str(raw_group))
+        if gid:
+            grp = db_session.query(DBAcademicGroup).filter(DBAcademicGroup.id == gid).first()
+            if grp:
+                s["Група"] = grp.name
+                s["_group_id"] = grp.id
+    return student_data
+
 @app.post("/api/superadmin/users")
 async def create_or_update_user(
     user: UserCreateSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
     db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
+    normalized_data = _normalize_student_data_groups(db, user.student_data)
     if db_user:
         if user.password:
             db_user.hashed_password = pwd_context.hash(user.password)
         db_user.role = user.role
         db_user.full_name = user.full_name
-        db_user.student_data = user.student_data
+        db_user.student_data = normalized_data
         msg = f"Профіль {user.email} успішно оновлено!"
     else:
         if not user.password:
@@ -813,7 +1012,7 @@ async def create_or_update_user(
         new_user = DBUser(
             id=str(uuid.uuid4())[:8], email=user.email,
             hashed_password=pwd_context.hash(user.password),
-            role=user.role, full_name=user.full_name, student_data=user.student_data
+            role=user.role, full_name=user.full_name, student_data=normalized_data
         )
         db.add(new_user)
         msg = f"Нового користувача {user.email} створено!"
@@ -834,10 +1033,11 @@ async def bulk_import_users(
     added, updated = 0, 0
     for u in users_data:
         existing = db.query(DBUser).filter(DBUser.email == u.get("email")).first()
+        normalized_data = _normalize_student_data_groups(db, u.get("student_data"))
         if existing:
             existing.role = u.get("role", existing.role)
             existing.full_name = u.get("full_name", existing.full_name)
-            existing.student_data = u.get("student_data", existing.student_data)
+            existing.student_data = normalized_data if normalized_data is not None else existing.student_data
             if u.get("password"):
                 existing.hashed_password = pwd_context.hash(u["password"])
             updated += 1
@@ -846,7 +1046,7 @@ async def bulk_import_users(
                 id=str(uuid.uuid4())[:8], email=u.get("email"),
                 hashed_password=pwd_context.hash(u.get("password", "changeme")),
                 role=u.get("role", "student"), full_name=u.get("full_name"),
-                student_data=u.get("student_data")
+                student_data=normalized_data
             )
             db.add(new_user)
             added += 1
@@ -871,10 +1071,14 @@ async def upload_grades(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Помилка читання Excel: {str(e)}")
     added_count = 0
+    resolved_groups = 0
     for sheet_name, df in xls.items():
         group_name = str(sheet_name).strip()
         if df.empty:
             continue
+        resolved_group_id = resolve_group_id(db, group_name)
+        if resolved_group_id:
+            resolved_groups += 1
         subjects = df.iloc[0, 1:].fillna("").astype(str).tolist()
         semester_row, teacher_row, control_row = None, [], []
         for index, row in df.iterrows():
@@ -897,6 +1101,8 @@ async def upload_grades(
                 semesters.append(current_sem)
         else:
             semesters = [1] * len(subjects)
+        # Кешуємо резолв предмет/викладач по (текст → id) в межах листа, щоб не бити базу на кожному студенті
+        subject_id_cache, teacher_id_cache = {}, {}
         for index, row in df.iterrows():
             student_name = str(row[0]).strip()
             if not student_name or student_name.lower() == "nan":
@@ -912,22 +1118,34 @@ async def upload_grades(
                     score = str(row[i]).strip()
                     if score and score.lower() != "nan":
                         if i - 1 < len(subjects) and subjects[i - 1].strip():
+                            subject_text = subjects[i - 1].strip()
+                            teacher_text = teacher_row[i].strip() if i < len(teacher_row) else ""
+                            control_text = control_row[i].strip() if i < len(control_row) else ""
+
+                            if subject_text not in subject_id_cache:
+                                subject_id_cache[subject_text] = resolve_subject_id(db, subject_text, resolved_group_id)
+                            if teacher_text and teacher_text not in teacher_id_cache:
+                                teacher_id_cache[teacher_text] = resolve_teacher_id(db, teacher_text)
+
                             new_grade = DBGrade(
                                 student_id=student_id, group_name=group_name,
-                                subject=subjects[i - 1].strip(),
+                                subject=subject_text,
                                 semester=semesters[i - 1] if i - 1 < len(semesters) else 1,
                                 score=score,
-                                control_form=control_row[i].strip() if i < len(control_row) else "",
-                                teacher=teacher_row[i].strip() if i < len(teacher_row) else ""
+                                control_form=control_text,
+                                teacher=teacher_text,
+                                group_id=resolved_group_id,
+                                subject_id=subject_id_cache.get(subject_text),
+                                teacher_id=teacher_id_cache.get(teacher_text) if teacher_text else None,
                             )
                             db.add(new_grade)
                             added_count += 1
     write_audit(db, request,
         action="create", user=admin, content_type="Grades | Оцінки",
-        object_repr=file.filename, details={"added_count": added_count},
+        object_repr=file.filename, details={"added_count": added_count, "resolved_groups": resolved_groups},
     )
     db.commit()
-    return {"message": f"Успіх! Оброблено та додано/оновлено {added_count} оцінок."}
+    return {"message": f"Успіх! Оброблено та додано/оновлено {added_count} оцінок.", "resolved_groups": resolved_groups}
 
 @app.get("/api/csk/students")
 async def get_all_students_for_csk(
@@ -948,7 +1166,8 @@ async def get_all_students_for_csk(
             "grades": [{
                 "id": g.id, "subject": g.subject, "score": g.score,
                 "semester": g.semester, "control_form": g.control_form,
-                "teacher": g.teacher, "group_name": g.group_name
+                "teacher": g.teacher, "group_name": g.group_name,
+                "group_id": g.group_id, "subject_id": g.subject_id, "teacher_id": g.teacher_id,
             } for g in grades]
         })
     return result
@@ -966,6 +1185,9 @@ async def update_single_grade(
     grade.semester = grade_data.semester
     grade.control_form = grade_data.control_form
     grade.teacher = grade_data.teacher
+    # Пробуємо повторно зіставити з довідниками Структури (текст могли виправити вручну)
+    grade.subject_id = resolve_subject_id(db, grade_data.subject, grade.group_id)
+    grade.teacher_id = resolve_teacher_id(db, grade_data.teacher)
     write_audit(db, request,
         action="update", user=admin, content_type="Grades | Оцінки",
         object_id=grade_id, object_repr=grade_data.subject,
@@ -1557,37 +1779,151 @@ async def delete_academic_group(
     db.commit()
     return {"message": "Видалено"}
 
+# ── ІМПОРТ ГРУП/ОПП З EXCEL (формат Groups_Query) ───────
+GROUP_IMPORT_LEVEL_MAP = {
+    "бакалавр": "bachelor",
+    "магістр": "master", "магістратура": "master",
+    "доктор філософії": "phd", "аспірантура": "phd", "phd": "phd",
+}
+UNASSIGNED_DEPT_SUFFIX = "__unassigned"
+UNASSIGNED_DEPT_NAME = "🗂 Без кафедри"
+
+@app.post("/api/superadmin/structure/import-groups")
+async def import_groups(
+    request: Request, file: UploadFile = File(...),
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    """Імпортує Інститути/ОПП/Навчальні плани/Групи з файлу типу Groups_Query.xlsx.
+    Очікувані колонки: NameShort, Name, Speciality, isFullTime, Groups_Name,
+    EducationalLevel_Name, study_program.
+    Кафедра у файлі відсутня — нові ОПП тимчасово потрапляють у службову
+    кафедру "Без кафедри" цього інституту, звідки ви самі перенесете їх у потрібну
+    (просто відредагуйте ОПП і оберіть кафедру — так само, як завжди)."""
+    content = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Помилка читання Excel: {str(e)}")
+
+    required_cols = {"NameShort", "Name", "isFullTime", "Groups_Name", "EducationalLevel_Name", "study_program"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"У файлі бракує колонок: {', '.join(sorted(missing))}")
+
+    stats = {
+        "institutes_created": 0, "opps_created": 0, "plans_created": 0,
+        "groups_created": 0, "groups_updated": 0, "rows_skipped": 0, "errors": [],
+    }
+
+    for idx, row in df.iterrows():
+        try:
+            inst_short = str(row.get("NameShort") or "").strip()
+            inst_full = str(row.get("Name") or "").strip()
+            opp_name = str(row.get("study_program") or "").strip()
+            group_name = str(row.get("Groups_Name") or "").strip()
+            raw_ft = row.get("isFullTime")
+            is_denna = str(raw_ft).strip() in ("1", "1.0", "True", "true")
+            level_raw = str(row.get("EducationalLevel_Name") or "").strip().lower()
+
+            if not inst_short or not opp_name or not group_name or inst_short.lower() == "nan":
+                stats["rows_skipped"] += 1
+                stats["errors"].append(f"Рядок {idx + 2}: пропущено — немає інституту/ОПП/групи")
+                continue
+
+            level = GROUP_IMPORT_LEVEL_MAP.get(level_raw) or detect_level_from_group_name(group_name)
+
+            # 1) Інститут
+            inst = db.query(DBInstitute).filter(DBInstitute.name == inst_short).first()
+            if not inst:
+                inst = DBInstitute(id=str(uuid.uuid4())[:8], name=inst_short, full_name=inst_full or None)
+                db.add(inst)
+                db.flush()
+                stats["institutes_created"] += 1
+
+            # 2) Службова кафедра "Без кафедри" для цього інституту (щоб не порушувати
+            #    обов'язковий зв'язок ОПП→кафедра, доки ви самі не призначите справжню)
+            placeholder_id = f"{inst.id}{UNASSIGNED_DEPT_SUFFIX}"
+            placeholder_dept = db.query(DBDepartment).filter(DBDepartment.id == placeholder_id).first()
+            if not placeholder_dept:
+                placeholder_dept = DBDepartment(
+                    id=placeholder_id, institute_id=inst.id, name=UNASSIGNED_DEPT_NAME,
+                    full_name="Створено автоматично імпортом — розподіліть ОПП по кафедрах вручну",
+                )
+                db.add(placeholder_dept)
+                db.flush()
+
+            # 3) ОПП — шукаємо серед УСІХ кафедр цього інституту (щоб не плодити дублі
+            #    після того, як ви вручну перенесли ОПП у справжню кафедру)
+            opp = db.query(DBOpp).join(DBDepartment, DBOpp.department_id == DBDepartment.id).filter(
+                DBDepartment.institute_id == inst.id, DBOpp.name == opp_name
+            ).first()
+            if not opp:
+                opp = DBOpp(id=str(uuid.uuid4())[:8], department_id=placeholder_dept.id, name=opp_name, level=level)
+                db.add(opp)
+                db.flush()
+                stats["opps_created"] += 1
+
+            # 4) Навчальний план — окремо для денної/заочної форми цієї ОПП
+            form_label = "Денна" if is_denna else "Заочна"
+            plan_name = f"{opp_name} — {form_label}"
+            plan = db.query(DBStudyPlan).filter(DBStudyPlan.opp_id == opp.id, DBStudyPlan.name == plan_name).first()
+            if not plan:
+                plan = DBStudyPlan(id=str(uuid.uuid4())[:8], opp_id=opp.id, name=plan_name)
+                db.add(plan)
+                db.flush()
+                stats["plans_created"] += 1
+
+            # 5) Група — назва унікальна в усій системі (щоб ЦСК/ЦМЯО завжди бачили ту саму групу)
+            existing_group = db.query(DBAcademicGroup).filter(DBAcademicGroup.name == group_name).first()
+            if existing_group:
+                if existing_group.study_plan_id != plan.id or existing_group.level != level:
+                    existing_group.study_plan_id = plan.id
+                    existing_group.level = level
+                    stats["groups_updated"] += 1
+            else:
+                db.add(DBAcademicGroup(id=str(uuid.uuid4())[:8], study_plan_id=plan.id, name=group_name, level=level))
+                stats["groups_created"] += 1
+
+        except Exception as e:
+            stats["rows_skipped"] += 1
+            stats["errors"].append(f"Рядок {idx + 2}: {str(e)}")
+
+    write_audit(db, request, action="bulk_import", user=admin,
+        content_type="Structure | Імпорт груп", object_repr=file.filename, details=stats)
+    db.commit()
+    return {"message": "Імпорт завершено", **stats}
+
 # ── ПРЕДМЕТИ ─────────────────────────────────────────────
 @app.get("/api/structure/subjects")
 async def get_subjects(
-    study_plan_id: str = Query(default=None),
+    opp_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
+    """Предмети живуть на рівні ОПП: семестр і форма контролю тут спільні
+    для всіх навчальних планів цієї програми. Години — окремо, дивись /api/structure/plan-subject-hours."""
     q = db.query(DBSubject)
-    if study_plan_id:
-        q = q.filter(DBSubject.study_plan_id == study_plan_id)
+    if opp_id:
+        q = q.filter(DBSubject.opp_id == opp_id)
     items = q.order_by(DBSubject.semester, DBSubject.name).all()
-    return [{
-        "id": s.id, "study_plan_id": s.study_plan_id, "name": s.name,
-        "semester": s.semester, "elective_slot": s.elective_slot, "teachers": s.teachers or []
-    } for s in items]
+    return [_subject_to_dict(s) for s in items]
 
 @app.post("/api/superadmin/structure/subjects")
 async def create_subject(
     data: SubjectSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
-    if not db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first():
-        raise HTTPException(status_code=404, detail="Навчальний план не знайдено")
+    if not db.query(DBOpp).filter(DBOpp.id == data.opp_id).first():
+        raise HTTPException(status_code=404, detail="ОПП не знайдено")
     obj = DBSubject(
-        study_plan_id=data.study_plan_id, name=data.name, semester=data.semester,
+        opp_id=data.opp_id, name=data.name, semester=data.semester,
+        control_form=data.control_form or None,
         elective_slot=data.elective_slot or None, teachers=data.teachers or [],
     )
     db.add(obj)
     write_audit(db, request, action="create", user=admin, content_type="Structure | Предмет", object_repr=data.name)
     db.commit()
     db.refresh(obj)
-    return {"id": obj.id, "study_plan_id": obj.study_plan_id, "name": obj.name, "semester": obj.semester, "elective_slot": obj.elective_slot, "teachers": obj.teachers or []}
+    return _subject_to_dict(obj)
 
 @app.put("/api/superadmin/structure/subjects/{item_id}")
 async def update_subject(
@@ -1597,14 +1933,15 @@ async def update_subject(
     obj = db.query(DBSubject).filter(DBSubject.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
-    obj.study_plan_id = data.study_plan_id
+    obj.opp_id = data.opp_id
     obj.name = data.name
     obj.semester = data.semester
+    obj.control_form = data.control_form or None
     obj.elective_slot = data.elective_slot or None
     obj.teachers = data.teachers or []
     write_audit(db, request, action="update", user=admin, content_type="Structure | Предмет", object_id=item_id, object_repr=data.name)
     db.commit()
-    return {"id": obj.id, "study_plan_id": obj.study_plan_id, "name": obj.name, "semester": obj.semester, "elective_slot": obj.elective_slot, "teachers": obj.teachers or []}
+    return _subject_to_dict(obj)
 
 @app.delete("/api/superadmin/structure/subjects/{item_id}")
 async def delete_subject(
@@ -1618,6 +1955,235 @@ async def delete_subject(
     db.delete(obj)
     db.commit()
     return {"message": "Видалено"}
+
+# ── ГОДИНИ ПРЕДМЕТА В МЕЖАХ НАВЧАЛЬНОГО ПЛАНУ ───────────
+@app.get("/api/structure/plan-subject-hours")
+async def get_plan_subject_hours(
+    study_plan_id: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    q = db.query(DBPlanSubjectHours)
+    if study_plan_id:
+        q = q.filter(DBPlanSubjectHours.study_plan_id == study_plan_id)
+    items = q.all()
+    return [_plan_subject_hours_to_dict(h) for h in items]
+
+@app.put("/api/superadmin/structure/plan-subject-hours")
+async def upsert_plan_subject_hours(
+    data: PlanSubjectHoursSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    """Upsert: якщо для пари (план, предмет) вже є запис годин — оновлює його, інакше створює.
+    Так предмет ОПП 'підключається' до конкретного навчального плану зі своїми годинами."""
+    if not db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first():
+        raise HTTPException(status_code=404, detail="Навчальний план не знайдено")
+    subject = db.query(DBSubject).filter(DBSubject.id == data.subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Предмет не знайдено")
+    obj = db.query(DBPlanSubjectHours).filter(
+        DBPlanSubjectHours.study_plan_id == data.study_plan_id,
+        DBPlanSubjectHours.subject_id == data.subject_id,
+    ).first()
+    if not obj:
+        obj = DBPlanSubjectHours(study_plan_id=data.study_plan_id, subject_id=data.subject_id)
+        db.add(obj)
+    obj.hours = data.hours
+    obj.lecture_hours = data.lecture_hours
+    obj.practice_hours = data.practice_hours
+    obj.self_study_hours = data.self_study_hours
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Години предмета", object_repr=subject.name)
+    db.commit()
+    db.refresh(obj)
+    return _plan_subject_hours_to_dict(obj)
+
+@app.delete("/api/superadmin/structure/plan-subject-hours/{item_id}")
+async def delete_plan_subject_hours(
+    item_id: int, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    """Видаляє прив'язку предмета до плану (сам предмет в ОПП залишається)"""
+    obj = db.query(DBPlanSubjectHours).filter(DBPlanSubjectHours.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | Години предмета", object_id=item_id)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── ВИКЛАДАЧІ ────────────────────────────────────────────
+@app.get("/api/structure/teachers")
+async def get_teachers(
+    department_id: str = Query(default=None),
+    q: str = Query(default=None),
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    query = db.query(DBTeacher)
+    if department_id:
+        query = query.filter(DBTeacher.department_id == department_id)
+    if q:
+        query = query.filter(DBTeacher.full_name.ilike(f"%{q}%"))
+    items = query.order_by(DBTeacher.full_name).all()
+    return [_teacher_to_dict(t) for t in items]
+
+@app.post("/api/superadmin/structure/teachers")
+async def create_teacher(
+    data: TeacherSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    if data.department_id and not db.query(DBDepartment).filter(DBDepartment.id == data.department_id).first():
+        raise HTTPException(status_code=404, detail="Кафедру не знайдено")
+    obj = DBTeacher(
+        id=str(uuid.uuid4())[:8], full_name=data.full_name,
+        department_id=data.department_id, email=data.email, position=data.position,
+    )
+    db.add(obj)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | Викладач", object_repr=data.full_name)
+    db.commit()
+    return _teacher_to_dict(obj)
+
+@app.put("/api/superadmin/structure/teachers/{item_id}")
+async def update_teacher(
+    item_id: str, data: TeacherSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBTeacher).filter(DBTeacher.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.full_name = data.full_name
+    obj.department_id = data.department_id
+    obj.email = data.email
+    obj.position = data.position
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Викладач", object_id=item_id, object_repr=data.full_name)
+    db.commit()
+    return _teacher_to_dict(obj)
+
+@app.delete("/api/superadmin/structure/teachers/{item_id}")
+async def delete_teacher(
+    item_id: str, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBTeacher).filter(DBTeacher.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    write_audit(db, request, action="delete", user=admin, content_type="Structure | Викладач", object_id=item_id, object_repr=obj.full_name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── ІМПОРТ ВИКЛАДАЧІВ (формат Список_викладачів_ДУЕТ.xlsx) ─
+def _norm_dept_name(name: str) -> str:
+    n = (name or "").strip()
+    if n.lower().startswith("кафедра"):
+        n = n[len("кафедра"):].strip()
+    return n.lower()
+
+@app.post("/api/superadmin/structure/import-teachers")
+async def import_teachers(
+    request: Request, file: UploadFile = File(...),
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    """Імпортує довідник викладачів з файлу типу Список_викладачів_ДУЕТ.xlsx.
+    Очікує два листи:
+    - "Список": колонки Кафедра, Прізвище, Ім'я, По батькові, Навантаження, Навантаження (дпд)
+      (рядки з ПІБ що починається на "." — вакансії, пропускаються)
+    - "Аркуш1": колонки Ім'я викладача, Прізвище викладача, Електронна пошта (для email)
+    Один викладач може мати навантаження на кількох кафедрах одразу (сумісництво) —
+    основною кафедрою обирається та, де сумарне навантаження найбільше.
+    Кафедра з файлу зіставляється з вашою Структурою за повною назвою; якщо збігу
+    немає — викладач імпортується без кафедри, а назва потрапляє у список
+    'незіставлених кафедр', щоб ви або перейменували, або створили потрібну."""
+    content = await file.read()
+    try:
+        xls = pd.ExcelFile(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Помилка читання Excel: {str(e)}")
+    if "Список" not in xls.sheet_names:
+        raise HTTPException(status_code=400, detail="У файлі немає листа 'Список'")
+
+    df = pd.read_excel(xls, sheet_name="Список")
+    required_cols = {"Кафедра", "ПІБ", "Прізвище", "Ім'я", "По батькові"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"У листі 'Список' бракує колонок: {', '.join(sorted(missing))}")
+
+    # email за (прізвище, ім'я) з другого листа, якщо він є
+    email_map = {}
+    if "Аркуш1" in xls.sheet_names:
+        df_email = pd.read_excel(xls, sheet_name="Аркуш1")
+        if {"Прізвище викладача", "Ім'я викладача", "Електронна пошта"}.issubset(df_email.columns):
+            for _, r in df_email.iterrows():
+                last = str(r.get("Прізвище викладача") or "").strip().lower()
+                first = str(r.get("Ім'я викладача") or "").strip().lower()
+                email = str(r.get("Електронна пошта") or "").strip()
+                if last and first and email and email.lower() != "nan":
+                    email_map.setdefault((last, first), email)
+
+    # довідник кафедр Структури: нормалізована назва -> id
+    dept_lookup = {}
+    for d in db.query(DBDepartment).all():
+        if d.full_name:
+            dept_lookup.setdefault(_norm_dept_name(d.full_name), d.id)
+        dept_lookup.setdefault(_norm_dept_name(d.name), d.id)
+
+    # накопичуємо навантаження по (ПІБ, кафедра) щоб визначити основну кафедру
+    teacher_loads = {}      # full_name -> { dept_name_from_file: total_hours }
+    teacher_names_parts = {}  # full_name -> (last, first)
+    for _, row in df.iterrows():
+        pib = str(row.get("ПІБ") or "").strip()
+        if not pib or pib.startswith("."):
+            continue  # вакансія
+        last = str(row.get("Прізвище") or "").strip()
+        first = str(row.get("Ім'я") or "").strip()
+        patronymic = str(row.get("По батькові") or "").strip()
+        if patronymic.lower() == "nan":
+            patronymic = ""
+        full_name = " ".join(p for p in [last, first, patronymic] if p and p.lower() != "nan")
+        if not full_name:
+            continue
+        dept_name_file = str(row.get("Кафедра") or "").strip()
+        hours = 0
+        for col in ("Навантаження", "Навантаження (дпд)"):
+            val = row.get(col)
+            try:
+                hours += float(val) if val is not None and str(val).lower() != "nan" else 0
+            except (TypeError, ValueError):
+                pass
+        teacher_loads.setdefault(full_name, {})
+        teacher_loads[full_name][dept_name_file] = teacher_loads[full_name].get(dept_name_file, 0) + hours
+        teacher_names_parts[full_name] = (last.lower(), first.lower())
+
+    stats = {"teachers_created": 0, "teachers_updated": 0, "emails_matched": 0, "unmatched_departments": []}
+    unmatched_dept_names = set()
+
+    for full_name, loads in teacher_loads.items():
+        primary_dept_file_name = max(loads, key=loads.get) if loads else None
+        dept_id = dept_lookup.get(_norm_dept_name(primary_dept_file_name)) if primary_dept_file_name else None
+        if primary_dept_file_name and not dept_id:
+            unmatched_dept_names.add(primary_dept_file_name)
+
+        last, first = teacher_names_parts.get(full_name, ("", ""))
+        email = email_map.get((last, first))
+
+        existing = db.query(DBTeacher).filter(DBTeacher.full_name == full_name).first()
+        if existing:
+            changed = False
+            if dept_id and existing.department_id != dept_id:
+                existing.department_id = dept_id; changed = True
+            if email and not existing.email:
+                existing.email = email; changed = True
+            if changed:
+                stats["teachers_updated"] += 1
+        else:
+            db.add(DBTeacher(id=str(uuid.uuid4())[:8], full_name=full_name, department_id=dept_id, email=email))
+            stats["teachers_created"] += 1
+        if email:
+            stats["emails_matched"] += 1
+
+    stats["unmatched_departments"] = sorted(unmatched_dept_names)
+    write_audit(db, request, action="bulk_import", user=admin,
+        content_type="Structure | Імпорт викладачів", object_repr=file.filename, details=stats)
+    db.commit()
+    return {"message": "Імпорт завершено", **stats}
 
 # ── ВИБІР СТУДЕНТОМ ВИБІРКОВОГО ПРЕДМЕТУ ────────────────
 @app.get("/api/student/elective-choices")
@@ -1638,9 +2204,13 @@ async def get_elective_options(
     study_plan_id: str,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Повертає всі вибіркові слоти і варіанти предметів для конкретного плану"""
+    """Повертає всі вибіркові слоти і варіанти предметів для конкретного плану.
+    Вибіркові предмети визначені на рівні ОПП цього плану."""
+    plan = db.query(DBStudyPlan).filter(DBStudyPlan.id == study_plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Навчальний план не знайдено")
     subjects = db.query(DBSubject).filter(
-        DBSubject.study_plan_id == study_plan_id,
+        DBSubject.opp_id == plan.opp_id,
         DBSubject.elective_slot.isnot(None)
     ).all()
     slots = {}
@@ -1658,7 +2228,8 @@ async def set_elective_choice(
     subject = db.query(DBSubject).filter(DBSubject.id == data.subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Предмет не знайдено")
-    if subject.elective_slot != data.elective_slot or subject.study_plan_id != data.study_plan_id:
+    plan = db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first()
+    if not plan or subject.elective_slot != data.elective_slot or subject.opp_id != plan.opp_id:
         raise HTTPException(status_code=400, detail="Предмет не належить вказаному слоту/плану")
     existing = db.query(DBStudentSubjectChoice).filter(
         DBStudentSubjectChoice.student_id == user["user_id"],
@@ -2273,35 +2844,37 @@ async def clear_audit_logs(
 async def get_structure_tree(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Повертає повне дерево: Інститут → Кафедра → ОПП → Plan → Групи + Предмети плану"""
+    """Повертає повне дерево: Інститут → Кафедра (+ викладачі) → ОПП (+ предмети: семестр/форма
+    контролю) → Навчальний план (+ групи, + години предметів у цьому плані)."""
     institutes = db.query(DBInstitute).order_by(DBInstitute.name).all()
     result = []
     for inst in institutes:
         departments = db.query(DBDepartment).filter(DBDepartment.institute_id == inst.id).order_by(DBDepartment.name).all()
         dept_list = []
         for dept in departments:
+            teachers = db.query(DBTeacher).filter(DBTeacher.department_id == dept.id).order_by(DBTeacher.full_name).all()
             opps = db.query(DBOpp).filter(DBOpp.department_id == dept.id).order_by(DBOpp.name).all()
             opp_list = []
             for opp in opps:
+                subjects = db.query(DBSubject).filter(DBSubject.opp_id == opp.id).order_by(DBSubject.semester, DBSubject.name).all()
                 plans = db.query(DBStudyPlan).filter(DBStudyPlan.opp_id == opp.id).order_by(DBStudyPlan.name).all()
                 plan_list = []
                 for plan in plans:
                     groups = db.query(DBAcademicGroup).filter(DBAcademicGroup.study_plan_id == plan.id).order_by(DBAcademicGroup.name).all()
-                    subjects = db.query(DBSubject).filter(DBSubject.study_plan_id == plan.id).order_by(DBSubject.semester, DBSubject.name).all()
+                    hours_rows = db.query(DBPlanSubjectHours).filter(DBPlanSubjectHours.study_plan_id == plan.id).all()
                     plan_list.append({
                         "id": plan.id, "name": plan.name,
                         "groups": [{"id": g.id, "name": g.name, "level": g.level} for g in groups],
-                        "subjects": [{
-                            "id": s.id, "name": s.name, "semester": s.semester,
-                            "elective_slot": s.elective_slot, "teachers": s.teachers or []
-                        } for s in subjects],
+                        "subject_hours": [_plan_subject_hours_to_dict(h) for h in hours_rows],
                     })
                 opp_list.append({
                     "id": opp.id, "name": opp.name, "level": opp.level, "full_name": opp.full_name,
+                    "subjects": [_subject_to_dict(s) for s in subjects],
                     "plans": plan_list
                 })
             dept_list.append({
                 "id": dept.id, "name": dept.name, "full_name": dept.full_name,
+                "teachers": [_teacher_to_dict(t) for t in teachers],
                 "opps": opp_list
             })
         result.append({
