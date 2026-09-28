@@ -5,8 +5,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Generator
 import uuid
 import requests
-from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean, text, func
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean, text, func, UniqueConstraint
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
@@ -314,10 +314,14 @@ class DBTeacher(Base):
     email         = Column(String, nullable=True)
     position      = Column(String, nullable=True)   # посада, напр. "доцент"
 
+CONTROL_FORMS = ("Екзамен", "Залік", "Диф. залік")
+
 class DBSubject(Base):
     """Предмет (дисципліна) ОПП — семестр і форма контролю живуть тут,
     бо це властивості освітньої програми, а не конкретного навчального плану.
-    Години для предмета — в DBPlanSubjectHours (там вони різні для різних форм навчання)."""
+    Години для предмета — в DBPlanSubjectHours (там вони різні для різних форм навчання).
+    name_norm — нормалізована назва для надійного пошуку/унікальності
+    (регістр, пробіли, різні апострофи), бо lower() у Postgres залежить від локалі БД."""
     __tablename__ = "subjects"
     id            = Column(Integer, primary_key=True, index=True, autoincrement=True)
     opp_id        = Column(String, ForeignKey("opps.id", ondelete="CASCADE"), nullable=True)
@@ -325,12 +329,36 @@ class DBSubject(Base):
     # Новий код завжди повинен використовувати opp_id.
     study_plan_id = Column(String, ForeignKey("study_plans.id", ondelete="CASCADE"), nullable=True)
     name          = Column(String, nullable=False)          # напр. "Французька мова", "Бази даних"
+    name_norm     = Column(String, index=True)
     semester      = Column(Integer, nullable=True)
-    # control_form: форма контролю — "Екзамен" | "Залік" | "Диф. залік" і т.д.
+    # control_form: форма контролю — "Екзамен" | "Залік" | "Диф. залік"
     control_form  = Column(String, nullable=True)
-    # elective_slot: null/"" = обов'язковий предмет; "ВК1", "ВК2" і т.д. = слот вибіркового блоку
+    # elective_slot: null = обов'язковий предмет; "ВК1", "ВК2" і т.д. = слот вибіркового блоку
     elective_slot = Column(String, nullable=True)
-    teachers      = Column(JSON, default=list)              # список id викладачів (DBTeacher.id)
+    # DEPRECATED: замінено таблицею subject_teachers. Читається лише одноразовою міграцією.
+    teachers      = Column(JSON, default=list)
+    # False = чернетка, автоматично створена імпортом оцінок; чекає підтвердження/злиття
+    is_verified   = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+
+    teacher_links = relationship("DBSubjectTeacher", cascade="all, delete-orphan",
+                                 passive_deletes=True, lazy="selectin")
+    aliases       = relationship("DBSubjectAlias", cascade="all, delete-orphan",
+                                 passive_deletes=True, lazy="selectin")
+
+class DBSubjectTeacher(Base):
+    """Зв'язок предмет ↔ викладач (many-to-many). Видалили викладача — зв'язок зник сам."""
+    __tablename__ = "subject_teachers"
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), primary_key=True)
+    teacher_id = Column(String, ForeignKey("teachers.id", ondelete="CASCADE"), primary_key=True)
+
+class DBSubjectAlias(Base):
+    """Інші написання назви предмета (з Excel-відомостей). Наступний імпорт зіставляється сам."""
+    __tablename__ = "subject_aliases"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False, index=True)
+    alias_text = Column(String, nullable=False)
+    alias_norm = Column(String, nullable=False, index=True)
+    __table_args__ = (UniqueConstraint("subject_id", "alias_norm", name="uq_subject_alias"),)
 
 class DBPlanSubjectHours(Base):
     """Години предмета в межах конкретного навчального плану.
@@ -411,6 +439,9 @@ def _run_migrations():
         "ALTER TABLE grades ADD COLUMN IF NOT EXISTS group_id VARCHAR",
         "ALTER TABLE grades ADD COLUMN IF NOT EXISTS subject_id INTEGER",
         "ALTER TABLE grades ADD COLUMN IF NOT EXISTS teacher_id VARCHAR",
+        # 🧱 Реформа предметів: нормалізована назва + прапорець чернетки
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS name_norm VARCHAR",
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT TRUE",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -418,7 +449,7 @@ def _run_migrations():
                 conn.execute(text(sql))
                 conn.commit()
             except Exception:
-                pass
+                conn.rollback()  # інакше у Postgres усі наступні міграції мовчки не виконуються
 
 def _migrate_subjects_to_opp_level(db_session):
     """Одноразова міграція: для предметів, які ще мають лише study_plan_id (стара схема),
@@ -453,24 +484,152 @@ def resolve_group_id(db_session, group_name: str):
     grp = db_session.query(DBAcademicGroup).filter(func.lower(DBAcademicGroup.name) == gname.lower()).first()
     return grp.id if grp else None
 
-def resolve_subject_id(db_session, subject_name: str, group_id: str = None):
-    """Зіставляє вільний текст назви предмета з канонічним предметом ОПП,
-    до якої належить дана група (якщо group_id відомий) — інакше шукає глобально."""
-    if not subject_name:
+def _norm(s) -> str:
+    """Нормалізація для порівняння назв: різні апострофи → ', зайві пробіли, регістр."""
+    s = (s or "")
+    for ch in ("’", "ʼ", "`", "´"):
+        s = s.replace(ch, "'")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+def _clean(s) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def _normalize_slot(slot):
+    """'вк 1' / 'Вк1' → 'ВК1'; порожнє → None."""
+    s = re.sub(r"\s+", "", (slot or "")).upper()
+    return s or None
+
+def _validate_control_form(cf):
+    if not cf:
         return None
-    sname = subject_name.strip()
-    opp_id = None
-    if group_id:
-        grp = db_session.query(DBAcademicGroup).filter(DBAcademicGroup.id == group_id).first()
-        if grp:
-            plan = db_session.query(DBStudyPlan).filter(DBStudyPlan.id == grp.study_plan_id).first()
-            if plan:
-                opp_id = plan.opp_id
-    q = db_session.query(DBSubject).filter(func.lower(DBSubject.name) == sname.lower())
+    for allowed in CONTROL_FORMS:
+        if cf.strip().lower() == allowed.lower():
+            return allowed
+    raise HTTPException(status_code=400, detail=f"Форма контролю має бути однією з: {', '.join(CONTROL_FORMS)}")
+
+def _validate_semester(sem):
+    if sem is not None and not (1 <= sem <= 12):
+        raise HTTPException(status_code=400, detail="Семестр має бути від 1 до 12")
+
+def _sync_subject_teachers(db_session, subject, teacher_ids):
+    """Приводить зв'язки викладачів предмета до заданого списку (з перевіркою існування)."""
+    ids = list(dict.fromkeys(teacher_ids or []))
+    if ids:
+        found = {r[0] for r in db_session.query(DBTeacher.id).filter(DBTeacher.id.in_(ids)).all()}
+        missing = [i for i in ids if i not in found]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Викладачів не знайдено: {', '.join(missing)}")
+    current = {l.teacher_id: l for l in subject.teacher_links}
+    for tid, link in current.items():
+        if tid not in ids:
+            subject.teacher_links.remove(link)
+    for tid in ids:
+        if tid not in current:
+            subject.teacher_links.append(DBSubjectTeacher(teacher_id=tid))
+
+def _find_duplicate_subject(db_session, opp_id, name, semester, exclude_id=None):
+    q = db_session.query(DBSubject).filter(
+        DBSubject.opp_id == opp_id,
+        DBSubject.name_norm == _norm(name),
+        func.coalesce(DBSubject.semester, 0) == (semester or 0),
+    )
+    if exclude_id is not None:
+        q = q.filter(DBSubject.id != exclude_id)
+    return q.first()
+
+def _opp_id_of_group(db_session, group_id):
+    if not group_id:
+        return None
+    grp = db_session.query(DBAcademicGroup).filter(DBAcademicGroup.id == group_id).first()
+    if not grp:
+        return None
+    plan = db_session.query(DBStudyPlan).filter(DBStudyPlan.id == grp.study_plan_id).first()
+    return plan.opp_id if plan else None
+
+def resolve_subject_id(db_session, subject_name: str, group_id: str = None):
+    """Точний збіг за name_norm → збіг за аліасом. Якщо відома група — тільки в межах її ОПП."""
+    n = _norm(subject_name)
+    if not n:
+        return None
+    opp_id = _opp_id_of_group(db_session, group_id)
+
+    q = db_session.query(DBSubject).filter(DBSubject.name_norm == n)
     if opp_id:
         q = q.filter(DBSubject.opp_id == opp_id)
-    subj = q.first()
-    return subj.id if subj else None
+    subj = q.order_by(DBSubject.is_verified.desc(), DBSubject.id).first()
+    if subj:
+        return subj.id
+
+    aq = db_session.query(DBSubjectAlias).join(DBSubject, DBSubject.id == DBSubjectAlias.subject_id)\
+        .filter(DBSubjectAlias.alias_norm == n)
+    if opp_id:
+        aq = aq.filter(DBSubject.opp_id == opp_id)
+    alias = aq.first()
+    return alias.subject_id if alias else None
+
+def resolve_or_create_subject(db_session, subject_name, group_id, semester=None, control_form=None):
+    """Як resolve_subject_id, але якщо збігу нема і ОПП групи відома — створює
+    ЧЕРНЕТКУ (is_verified=False), щоб оцінка не лишалась без канонічного предмета."""
+    sid = resolve_subject_id(db_session, subject_name, group_id)
+    if sid:
+        return sid
+    opp_id = _opp_id_of_group(db_session, group_id)
+    name = _clean(subject_name)
+    if not opp_id or not name:
+        return None
+    cf = next((c for c in CONTROL_FORMS if (control_form or "").strip().lower() == c.lower()), None)
+    draft = DBSubject(opp_id=opp_id, name=name, name_norm=_norm(name),
+                      semester=semester if semester and 1 <= semester <= 12 else None,
+                      control_form=cf, is_verified=False)
+    db_session.add(draft)
+    db_session.flush()
+    return draft.id
+
+def merge_subjects(db_session, source_id: int, target_id: int):
+    """Зливає source у target: оцінки, вибори, години, викладачі, аліаси переїжджають;
+    назва source стає аліасом target (щоб наступний імпорт зіставився автоматично)."""
+    if source_id == target_id:
+        raise HTTPException(status_code=400, detail="Не можна злити предмет сам із собою")
+    db_session.flush()  # autoflush вимкнено — синхронізуємо стан перед запитами
+    src = db_session.query(DBSubject).filter(DBSubject.id == source_id).first()
+    tgt = db_session.query(DBSubject).filter(DBSubject.id == target_id).first()
+    if not src or not tgt:
+        raise HTTPException(status_code=404, detail="Предмет не знайдено")
+    if src.opp_id != tgt.opp_id:
+        raise HTTPException(status_code=400, detail="Злиття можливе лише в межах однієї ОПП")
+
+    db_session.query(DBGrade).filter(DBGrade.subject_id == src.id)\
+        .update({DBGrade.subject_id: tgt.id}, synchronize_session=False)
+    db_session.query(DBStudentSubjectChoice).filter(DBStudentSubjectChoice.subject_id == src.id)\
+        .update({DBStudentSubjectChoice.subject_id: tgt.id}, synchronize_session=False)
+
+    tgt_plans = {h.study_plan_id for h in
+                 db_session.query(DBPlanSubjectHours).filter(DBPlanSubjectHours.subject_id == tgt.id)}
+    for h in db_session.query(DBPlanSubjectHours).filter(DBPlanSubjectHours.subject_id == src.id).all():
+        if h.study_plan_id in tgt_plans:
+            db_session.delete(h)          # у target уже є години для цього плану — лишаємо їх
+        else:
+            h.subject_id = tgt.id
+            tgt_plans.add(h.study_plan_id)
+
+    have_t = {l.teacher_id for l in tgt.teacher_links}
+    for l in src.teacher_links:
+        if l.teacher_id not in have_t:
+            tgt.teacher_links.append(DBSubjectTeacher(teacher_id=l.teacher_id))
+            have_t.add(l.teacher_id)
+
+    have_a = {a.alias_norm for a in tgt.aliases} | {tgt.name_norm}
+    for a in list(src.aliases):
+        if a.alias_norm not in have_a:
+            tgt.aliases.append(DBSubjectAlias(alias_text=a.alias_text, alias_norm=a.alias_norm))
+            have_a.add(a.alias_norm)
+    if src.name_norm not in have_a:
+        tgt.aliases.append(DBSubjectAlias(alias_text=src.name, alias_norm=src.name_norm))
+
+    db_session.flush()
+    db_session.delete(src)
+    db_session.flush()
+    return tgt
 
 def resolve_teacher_id(db_session, teacher_name: str):
     """Зіставляє вільний текст ПІБ викладача з довідником Teacher (точний, потім без регістру)."""
@@ -509,14 +668,103 @@ def _migrate_grades_to_canonical_links(db_session):
     else:
         db_session.rollback()
 
+def _backfill_subject_norms(db_session):
+    changed = False
+    for sj in db_session.query(DBSubject).all():
+        n = _norm(sj.name)
+        if sj.name_norm != n:
+            sj.name_norm = n; changed = True
+        slot = _normalize_slot(sj.elective_slot)
+        if slot != sj.elective_slot:
+            sj.elective_slot = slot; changed = True
+        if sj.control_form:
+            canon = next((c for c in CONTROL_FORMS if sj.control_form.strip().lower() == c.lower()), None)
+            if canon and canon != sj.control_form:
+                sj.control_form = canon; changed = True
+    if changed:
+        db_session.commit()
+
+def _migrate_subject_teachers_json_to_links(db_session):
+    """Одноразово: subjects.teachers (JSON) → subject_teachers. JSON очищається,
+    інакше при кожному старті видалені зв'язки «воскресали» б."""
+    valid = {r[0] for r in db_session.query(DBTeacher.id).all()}
+    changed = False
+    for sj in db_session.query(DBSubject).all():
+        legacy = sj.teachers or []
+        if not legacy:
+            continue
+        have = {l.teacher_id for l in sj.teacher_links}
+        for tid in legacy:
+            if tid in valid and tid not in have:
+                sj.teacher_links.append(DBSubjectTeacher(teacher_id=tid))
+                have.add(tid)
+        sj.teachers = []
+        changed = True
+    if changed:
+        db_session.commit()
+
+def _dedupe_subjects(db_session):
+    groups = defaultdict(list)
+    for sj in db_session.query(DBSubject).filter(DBSubject.opp_id.isnot(None)).order_by(DBSubject.id):
+        groups[(sj.opp_id, sj.name_norm, sj.semester or 0)].append(sj)
+    merged = 0
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        keep = next((x for x in items if x.is_verified), items[0])
+        for dup in items:
+            if dup.id != keep.id:
+                merge_subjects(db_session, dup.id, keep.id)
+                merged += 1
+    if merged:
+        db_session.commit()
+        print(f"[migration] злито дублікатів предметів: {merged}")
+
+def _dedupe_plan_hours(db_session):
+    seen, removed = set(), 0
+    for h in db_session.query(DBPlanSubjectHours).order_by(DBPlanSubjectHours.id).all():
+        key = (h.study_plan_id, h.subject_id)
+        if key in seen:
+            db_session.delete(h); removed += 1
+        else:
+            seen.add(key)
+    if removed:
+        db_session.commit()
+        print(f"[migration] видалено дублікатів годин: {removed}")
+
+def _apply_subject_constraints():
+    """Застосовується ПІСЛЯ дедуплікації. Якщо в даних лишились порушення — констрейнт
+    не створиться, причина буде в логах (сервер при цьому не падає)."""
+    stmts = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_subject_opp_name_sem ON subjects (opp_id, name_norm, (COALESCE(semester, 0)))",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_subject ON plan_subject_hours (study_plan_id, subject_id)",
+        "ALTER TABLE subjects ADD CONSTRAINT ck_subject_semester CHECK (semester IS NULL OR semester BETWEEN 1 AND 12)",
+        "ALTER TABLE subjects ADD CONSTRAINT ck_subject_control_form CHECK (control_form IS NULL OR control_form IN ('Екзамен','Залік','Диф. залік'))",
+        "ALTER TABLE plan_subject_hours ADD CONSTRAINT ck_hours_nonneg CHECK (COALESCE(hours,0) >= 0 AND COALESCE(lecture_hours,0) >= 0 AND COALESCE(practice_hours,0) >= 0 AND COALESCE(self_study_hours,0) >= 0)",
+    ]
+    with engine.connect() as conn:
+        for sql in stmts:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                if "already exists" not in str(e):
+                    print(f"[migration] не застосовано: {sql[:70]}… → {str(e)[:160]}")
+
 _run_migrations()
 _seed_db = SessionLocal()
 try:
     _seed_hashtags(_seed_db)
     _migrate_subjects_to_opp_level(_seed_db)
+    _backfill_subject_norms(_seed_db)
+    _migrate_subject_teachers_json_to_links(_seed_db)
+    _dedupe_subjects(_seed_db)
+    _dedupe_plan_hours(_seed_db)
     _migrate_grades_to_canonical_links(_seed_db)
 finally:
     _seed_db.close()
+_apply_subject_constraints()
 
 # =========================================================
 # 📋 СХЕМИ (Pydantic)
@@ -839,7 +1087,8 @@ def _subject_to_dict(s: "DBSubject") -> dict:
     return {
         "id": s.id, "opp_id": s.opp_id, "name": s.name, "semester": s.semester,
         "control_form": s.control_form, "elective_slot": s.elective_slot,
-        "teachers": s.teachers or [],
+        "teachers": [l.teacher_id for l in s.teacher_links],
+        "is_verified": s.is_verified,
     }
 
 def _plan_subject_hours_to_dict(h: "DBPlanSubjectHours") -> dict:
@@ -1123,7 +1372,11 @@ async def upload_grades(
                             control_text = control_row[i].strip() if i < len(control_row) else ""
 
                             if subject_text not in subject_id_cache:
-                                subject_id_cache[subject_text] = resolve_subject_id(db, subject_text, resolved_group_id)
+                                subject_id_cache[subject_text] = resolve_or_create_subject(
+                                    db, subject_text, resolved_group_id,
+                                    semester=semesters[i - 1] if i - 1 < len(semesters) else None,
+                                    control_form=control_text,
+                                )
                             if teacher_text and teacher_text not in teacher_id_cache:
                                 teacher_id_cache[teacher_text] = resolve_teacher_id(db, teacher_text)
 
@@ -1145,7 +1398,12 @@ async def upload_grades(
         object_repr=file.filename, details={"added_count": added_count, "resolved_groups": resolved_groups},
     )
     db.commit()
-    return {"message": f"Успіх! Оброблено та додано/оновлено {added_count} оцінок.", "resolved_groups": resolved_groups}
+    drafts = db.query(DBSubject).filter(DBSubject.is_verified == False).count()
+    return {
+        "message": f"Успіх! Оброблено та додано/оновлено {added_count} оцінок."
+                   + (f" Непідтверджених предметів (чернеток): {drafts}." if drafts else ""),
+        "resolved_groups": resolved_groups, "unverified_subjects": drafts,
+    }
 
 @app.get("/api/csk/students")
 async def get_all_students_for_csk(
@@ -1914,13 +2172,21 @@ async def create_subject(
 ):
     if not db.query(DBOpp).filter(DBOpp.id == data.opp_id).first():
         raise HTTPException(status_code=404, detail="ОПП не знайдено")
+    name = _clean(data.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Назва предмета порожня")
+    _validate_semester(data.semester)
+    control_form = _validate_control_form(data.control_form)
+    if _find_duplicate_subject(db, data.opp_id, name, data.semester):
+        raise HTTPException(status_code=409, detail="Такий предмет (назва + семестр) у цій ОПП вже існує")
     obj = DBSubject(
-        opp_id=data.opp_id, name=data.name, semester=data.semester,
-        control_form=data.control_form or None,
-        elective_slot=data.elective_slot or None, teachers=data.teachers or [],
+        opp_id=data.opp_id, name=name, name_norm=_norm(name), semester=data.semester,
+        control_form=control_form, elective_slot=_normalize_slot(data.elective_slot),
+        is_verified=True,
     )
     db.add(obj)
-    write_audit(db, request, action="create", user=admin, content_type="Structure | Предмет", object_repr=data.name)
+    _sync_subject_teachers(db, obj, data.teachers)
+    write_audit(db, request, action="create", user=admin, content_type="Structure | Предмет", object_repr=name)
     db.commit()
     db.refresh(obj)
     return _subject_to_dict(obj)
@@ -1933,14 +2199,31 @@ async def update_subject(
     obj = db.query(DBSubject).filter(DBSubject.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
+    name = _clean(data.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Назва предмета порожня")
+    _validate_semester(data.semester)
+    control_form = _validate_control_form(data.control_form)
+    if data.opp_id != obj.opp_id:
+        if not db.query(DBOpp).filter(DBOpp.id == data.opp_id).first():
+            raise HTTPException(status_code=404, detail="ОПП не знайдено")
+        if db.query(DBPlanSubjectHours).filter(DBPlanSubjectHours.subject_id == obj.id).first():
+            raise HTTPException(status_code=400,
+                detail="Спершу видаліть прив'язки годин: предмет прив'язаний до планів іншої ОПП")
+    if _find_duplicate_subject(db, data.opp_id, name, data.semester, exclude_id=obj.id):
+        raise HTTPException(status_code=409, detail="Такий предмет (назва + семестр) у цій ОПП вже існує")
+
     obj.opp_id = data.opp_id
-    obj.name = data.name
+    obj.name = name
+    obj.name_norm = _norm(name)
     obj.semester = data.semester
-    obj.control_form = data.control_form or None
-    obj.elective_slot = data.elective_slot or None
-    obj.teachers = data.teachers or []
-    write_audit(db, request, action="update", user=admin, content_type="Structure | Предмет", object_id=item_id, object_repr=data.name)
+    obj.control_form = control_form
+    obj.elective_slot = _normalize_slot(data.elective_slot)
+    obj.is_verified = True                      # ручне редагування = підтвердження
+    _sync_subject_teachers(db, obj, data.teachers)
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Предмет", object_id=item_id, object_repr=name)
     db.commit()
+    db.refresh(obj)
     return _subject_to_dict(obj)
 
 @app.delete("/api/superadmin/structure/subjects/{item_id}")
@@ -1955,6 +2238,52 @@ async def delete_subject(
     db.delete(obj)
     db.commit()
     return {"message": "Видалено"}
+
+# ── ЧЕРНЕТКИ ПРЕДМЕТІВ (створені імпортом оцінок) ───────
+@app.get("/api/superadmin/structure/subjects/unverified")
+async def get_unverified_subjects(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    subs = db.query(DBSubject).filter(DBSubject.is_verified == False).order_by(DBSubject.name).all()
+    ids = [x.id for x in subs]
+    counts = {}
+    if ids:
+        counts = dict(db.query(DBGrade.subject_id, func.count(DBGrade.id))
+                        .filter(DBGrade.subject_id.in_(ids)).group_by(DBGrade.subject_id).all())
+    opp_names = {}
+    if subs:
+        opp_names = {o.id: o.name for o in db.query(DBOpp).filter(DBOpp.id.in_({x.opp_id for x in subs})).all()}
+    return [{**_subject_to_dict(x), "opp_name": opp_names.get(x.opp_id), "grades_count": counts.get(x.id, 0)} for x in subs]
+
+@app.post("/api/superadmin/structure/subjects/{item_id}/verify")
+async def verify_subject(
+    item_id: int, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    obj = db.query(DBSubject).filter(DBSubject.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    obj.is_verified = True
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Предмет",
+                object_id=item_id, object_repr=obj.name, details={"verified": True})
+    db.commit()
+    db.refresh(obj)
+    return _subject_to_dict(obj)
+
+class SubjectMergeSchema(BaseModel):
+    target_id: int
+
+@app.post("/api/superadmin/structure/subjects/{item_id}/merge")
+async def merge_subject_endpoint(
+    item_id: int, data: SubjectMergeSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    src = db.query(DBSubject).filter(DBSubject.id == item_id).first()
+    src_name = src.name if src else None
+    tgt = merge_subjects(db, item_id, data.target_id)
+    write_audit(db, request, action="update", user=admin, content_type="Structure | Злиття предметів",
+                object_id=item_id, object_repr=f"{src_name} → {tgt.name}")
+    db.commit()
+    db.refresh(tgt)
+    return _subject_to_dict(tgt)
 
 # ── ГОДИНИ ПРЕДМЕТА В МЕЖАХ НАВЧАЛЬНОГО ПЛАНУ ───────────
 @app.get("/api/structure/plan-subject-hours")
@@ -1975,11 +2304,19 @@ async def upsert_plan_subject_hours(
 ):
     """Upsert: якщо для пари (план, предмет) вже є запис годин — оновлює його, інакше створює.
     Так предмет ОПП 'підключається' до конкретного навчального плану зі своїми годинами."""
-    if not db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first():
+    plan = db.query(DBStudyPlan).filter(DBStudyPlan.id == data.study_plan_id).first()
+    if not plan:
         raise HTTPException(status_code=404, detail="Навчальний план не знайдено")
     subject = db.query(DBSubject).filter(DBSubject.id == data.subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Предмет не знайдено")
+    if subject.opp_id != plan.opp_id:
+        raise HTTPException(status_code=400, detail="Предмет належить іншій ОПП, ніж навчальний план")
+    parts = [data.hours, data.lecture_hours, data.practice_hours, data.self_study_hours]
+    if any(p is not None and p < 0 for p in parts):
+        raise HTTPException(status_code=400, detail="Години не можуть бути від'ємними")
+    if data.hours is not None and sum(p or 0 for p in parts[1:]) > data.hours:
+        raise HTTPException(status_code=400, detail="Лекції + практичні + самостійна перевищують загальні години")
     obj = db.query(DBPlanSubjectHours).filter(
         DBPlanSubjectHours.study_plan_id == data.study_plan_id,
         DBPlanSubjectHours.subject_id == data.subject_id,
@@ -2216,7 +2553,7 @@ async def get_elective_options(
     slots = {}
     for s in subjects:
         slots.setdefault(s.elective_slot, []).append({
-            "id": s.id, "name": s.name, "semester": s.semester, "teachers": s.teachers or []
+            "id": s.id, "name": s.name, "semester": s.semester, "teachers": [l.teacher_id for l in s.teacher_links]
         })
     return slots
 
