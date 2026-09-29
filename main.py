@@ -54,9 +54,15 @@ app = FastAPI()
 os.makedirs("static/uploads", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# CORS: домени фронтенду через змінну середовища ALLOWED_ORIGINS
+# (через кому, напр. "https://my-site.vercel.app,http://localhost:5173").
+# Якщо змінну не задано — лишається "*" (як було), щоб нічого не зламати до налаштування.
+_origins_env = os.environ.get("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _origins_env.split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1161,51 +1167,58 @@ async def google_login(
 ):
     check_login_rate_limit(request)
 
+    # Технічні подробиці — лише в серверний лог; користувачу віддаємо загальні повідомлення
     try:
         response = requests.get(
-            f"https://oauth2.googleapis.com/tokeninfo?id_token={auth_data.credential}"
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": auth_data.credential},
+            timeout=10,
         )
-        
-        # ← ТИМЧАСОВО: логуємо що прийшло
-        print(f"tokeninfo status: {response.status_code}")
-        print(f"tokeninfo body: {response.text[:500]}")
-        print(f"GOOGLE_CLIENT_ID: {GOOGLE_CLIENT_ID[:30]}...")
-        
-        if response.status_code != 200:
-            raise HTTPException(status_code=401, detail=f"Google tokeninfo: {response.text[:200]}")
-        
-        idinfo = response.json()
-        
-        # aud може бути рядком або списком
-        aud = idinfo.get("aud", "")
-        if isinstance(aud, list):
-            if GOOGLE_CLIENT_ID not in aud:
-                raise HTTPException(status_code=401, detail=f"Невалідний aud: {aud}")
-        else:
-            if aud != GOOGLE_CLIENT_ID:
-                raise HTTPException(status_code=401, detail=f"Невалідний aud: {aud} != {GOOGLE_CLIENT_ID[:20]}...")
-        
-        email = idinfo.get("email")
-        if not email:
-            raise HTTPException(status_code=401, detail="Email не знайдено")
-            
-        db_user = db.query(DBUser).filter(DBUser.email == email).first()
-        if not db_user:
-            raise HTTPException(status_code=403, detail="Вашої пошти немає в базі.")
-        
-        access_token = create_access_token(
-            data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
+    except requests.exceptions.RequestException as e:
+        print(f"[google-login] помилка зв'язку з Google: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Не вдалося зв'язатися з Google. Спробуйте пізніше.")
+
+    if response.status_code != 200:
+        register_failed_login(request)
+        raise HTTPException(status_code=401, detail="Не вдалося підтвердити вхід через Google")
+
+    idinfo = response.json()
+
+    # aud (для якого додатка виданий токен) — рядок або список
+    aud = idinfo.get("aud", "")
+    aud_ok = GOOGLE_CLIENT_ID in aud if isinstance(aud, list) else aud == GOOGLE_CLIENT_ID
+    if not aud_ok or idinfo.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        register_failed_login(request)
+        raise HTTPException(status_code=401, detail="Не вдалося підтвердити вхід через Google")
+
+    # пошта має бути підтверджена Google
+    if str(idinfo.get("email_verified", "")).lower() != "true":
+        register_failed_login(request)
+        raise HTTPException(status_code=401, detail="Пошта Google не підтверджена")
+
+    email = (idinfo.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=401, detail="Не вдалося отримати пошту з Google")
+
+    db_user = db.query(DBUser).filter(func.lower(DBUser.email) == email.lower()).first()
+    if not db_user:
+        register_failed_login(request)
+        raise HTTPException(
+            status_code=403,
+            detail="Вашої пошти немає в системі. Зверніться до підтримки: moodle@duet.edu.ua"
         )
-        return {"access_token": access_token, "role": db_user.role}
-        
-    except HTTPException:
-        raise
-    except requests.exceptions.ConnectionError as e:
-        raise HTTPException(status_code=503, detail=f"Render блокує вихідні запити: {str(e)[:300]}")
-    except requests.exceptions.Timeout as e:
-        raise HTTPException(status_code=503, detail=f"Timeout: {str(e)[:300]}")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Тип помилки: {type(e).__name__} | {str(e)[:300]}")
+
+    access_token = create_access_token(
+        data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
+    )
+    write_audit(db, request,
+        action="login", user={"user_id": db_user.id, "sub": db_user.email},
+        content_type="Users | Користувач", object_id=db_user.id,
+        object_repr=db_user.email, details={"method": "google"},
+    )
+    db.commit()
+    return {"access_token": access_token, "role": db_user.role}
+
 # =========================================================
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
 # =========================================================
