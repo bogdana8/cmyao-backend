@@ -1293,6 +1293,7 @@ async def bulk_import_users(
 ):
     users_data = payload.get("users", [])
     added, updated = 0, 0
+    skipped = []
     for u in users_data:
         existing = db.query(DBUser).filter(DBUser.email == u.get("email")).first()
         normalized_data = _normalize_student_data_groups(db, u.get("student_data"))
@@ -1304,9 +1305,13 @@ async def bulk_import_users(
                 existing.hashed_password = pwd_context.hash(u["password"])
             updated += 1
         else:
+            # Новий користувач без пароля не створюється (раніше отримував «changeme»)
+            if not u.get("password"):
+                skipped.append(u.get("email") or "—")
+                continue
             new_user = DBUser(
                 id=str(uuid.uuid4())[:8], email=u.get("email"),
-                hashed_password=pwd_context.hash(u.get("password", "changeme")),
+                hashed_password=pwd_context.hash(u["password"]),
                 role=u.get("role", "student"), full_name=u.get("full_name"),
                 student_data=normalized_data
             )
@@ -1314,10 +1319,13 @@ async def bulk_import_users(
             added += 1
     write_audit(db, request,
         action="bulk_import", user=admin, content_type="Users | Користувач",
-        details={"added": added, "updated": updated},
+        details={"added": added, "updated": updated, "skipped_no_password": skipped},
     )
     db.commit()
-    return {"message": f"Імпорт завершено: додано {added}, оновлено {updated}."}
+    msg = f"Імпорт завершено: додано {added}, оновлено {updated}."
+    if skipped:
+        msg += f" Пропущено {len(skipped)} нових без пароля: {', '.join(skipped[:10])}" + ("…" if len(skipped) > 10 else "")
+    return {"message": msg, "added": added, "updated": updated, "skipped": skipped}
 
 # =========================================================
 # 📊 ЦСК — ЗАВАНТАЖЕННЯ ТА РЕДАГУВАННЯ ОЦІНОК
@@ -2831,6 +2839,8 @@ async def update_announcement(
         raise HTTPException(status_code=404, detail="Оголошення не знайдено")
     if user.get("role") == "admin_csk" and db_ann.sender != "ЦСК":
         raise HTTPException(status_code=403, detail="Ви можете змінювати лише оголошення ЦСК")
+    if user.get("role") == "admin_cmyo" and db_ann.sender != "ЦМЯО":
+        raise HTTPException(status_code=403, detail="Ви можете змінювати лише оголошення ЦМЯО")
     db_ann.title = ann.title
     db_ann.content = ann.content
     db_ann.is_important = ann.is_important
