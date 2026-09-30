@@ -158,6 +158,7 @@ class DBResponse(Base):
     answers = Column(JSON)
     respondent_id = Column(String, nullable=True)
     respondent_name = Column(String, nullable=True)
+    opp_context = Column(String, nullable=True)   # 🎓 назва ОПП для #По_ОПП опитувань
 
 class DBCompletedSurvey(Base):
     __tablename__ = "completed_surveys"
@@ -426,6 +427,7 @@ def _run_migrations():
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS description VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_id VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_name VARCHAR",
+        "ALTER TABLE responses ADD COLUMN IF NOT EXISTS opp_context VARCHAR",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS feathers_reward INTEGER DEFAULT 0",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS hashtags JSON DEFAULT '[]'",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS deadline VARCHAR",
@@ -2618,7 +2620,7 @@ async def get_survey_responses(
     responses = db.query(DBResponse).filter(DBResponse.survey_id == survey_id).all()
     result = []
     for r in responses:
-        entry = {"id": r.id, "answers": r.answers}
+        entry = {"id": r.id, "answers": r.answers, "opp_context": r.opp_context}
         if not is_anonymous:
             if r.respondent_id:
                 resp_user = db.query(DBUser).filter(DBUser.id == r.respondent_id).first()
@@ -2631,6 +2633,33 @@ async def get_survey_responses(
                 entry["respondent"] = {"name": r.respondent_name or "Анонімно", "email": "—", "role": "—"}
         result.append(entry)
     return result
+
+def _resolve_response_opp(db_session, template, user: dict, opp_ctx_raw):
+    """Визначає назву ОПП для відповіді на #По_ОПП опитування.
+    1) якщо в virtual_id є контекст — це id ОПП або (fallback) її назва;
+    2) якщо опитування #По_ОПП, а студент має рівно одну ОПП — беремо її;
+    3) інакше None."""
+    if opp_ctx_raw:
+        opp = db_session.query(DBOpp).filter(DBOpp.id == opp_ctx_raw).first()
+        return opp.name if opp else opp_ctx_raw
+    if "По_ОПП" not in (template.hashtags or []) or user.get("role") != "student":
+        return None
+    db_user = db_session.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+    s_data = (db_user.student_data or {}) if db_user else {}
+    if isinstance(s_data, str):
+        try:
+            s_data = json.loads(s_data)
+        except Exception:
+            s_data = {}
+    names = []
+    for study in (s_data.get("навчання", []) if isinstance(s_data, dict) else []):
+        grp = db_session.query(DBAcademicGroup).filter(DBAcademicGroup.name == study.get("Група", "")).first()
+        plan = db_session.query(DBStudyPlan).filter(DBStudyPlan.id == grp.study_plan_id).first() if grp else None
+        opp = db_session.query(DBOpp).filter(DBOpp.id == plan.opp_id).first() if plan else None
+        name = opp.name if opp else (study.get("ОПП") or study.get("Спеціальність") or "")
+        if name and name not in names:
+            names.append(name)
+    return names[0] if len(names) == 1 else None
 
 @app.post("/api/responses")
 async def save_student_response(
@@ -2663,11 +2692,13 @@ async def save_student_response(
         db_user_obj = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
         respondent_name = db_user_obj.full_name if db_user_obj else None
 
+    resolved_opp = _resolve_response_opp(db, template, user, opp_context)
     db.add(DBResponse(
         survey_id=base_survey_id,
         answers=response.answers,
         respondent_id=respondent_id,
         respondent_name=respondent_name,
+        opp_context=resolved_opp,
     ))
 
     if user.get("role") != "stakeholder":
@@ -2680,7 +2711,7 @@ async def save_student_response(
             db=db,
             student_id=user["user_id"],
             amount=template.feathers_reward,
-            reason=f"Опитування: {template.title}" + (f" [{opp_context}]" if opp_context else ""),
+            reason=f"Опитування: {template.title}" + (f" [{resolved_opp}]" if resolved_opp else ""),
             survey_id=base_survey_id
         )
 
@@ -2860,6 +2891,10 @@ async def delete_announcement(
     ann = db.query(DBAnnouncement).filter(DBAnnouncement.id == ann_id).first()
     if not ann:
         raise HTTPException(status_code=404, detail="Оголошення не знайдено")
+    if user.get("role") == "admin_csk" and ann.sender != "ЦСК":
+        raise HTTPException(status_code=403, detail="Ви можете видаляти лише оголошення ЦСК")
+    if user.get("role") == "admin_cmyo" and ann.sender != "ЦМЯО":
+        raise HTTPException(status_code=403, detail="Ви можете видаляти лише оголошення ЦМЯО")
     write_audit(db, request,
         action="delete", user=user, content_type="Announcements | Оголошення",
         object_id=ann_id, object_repr=ann.title,
@@ -2881,14 +2916,14 @@ async def upload_opp(file: UploadFile = File(...), user: dict = Depends(get_curr
     return {"message": "ОПП успішно завантажено!"}
 
 @app.get("/api/opp/download")
-async def download_opp():
+async def download_opp(user: dict = Depends(get_current_user)):
     file_path = "static/uploads/current_opp.pdf"
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type="application/pdf", filename="OPP.pdf")
     raise HTTPException(status_code=404, detail="Файл не знайдено")
 
 @app.get("/api/opp")
-async def get_opp():
+async def get_opp(user: dict = Depends(get_current_user)):
     if os.path.exists("static/uploads/current_opp.pdf"):
         return {"url": f"/api/opp/download?t={int(time.time())}"}
     return {"url": None}
