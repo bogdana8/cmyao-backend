@@ -1711,6 +1711,61 @@ async def delete_template(
         db.commit()
     return {"message": "Видалено"}
 
+# 🔐 Перевірка доступу до опитування на сервері (аудиторія + дедлайн)
+SURVEY_AUDIENCE_ROLES = {
+    "Студентам":     ["student"],
+    "Викладачам":    ["teacher"],
+    "Стейкголдерам": ["stakeholder"],
+    "Всім":          ["student", "teacher", "stakeholder"],
+}
+SURVEY_ADMIN_ROLES = ("superadmin", "admin_cmyo", "admin_csk")
+
+def _survey_access_error(db_session, template, user: dict):
+    """Повертає текст помилки, якщо користувач НЕ має права відкривати/заповнювати опитування,
+    або None, якщо доступ дозволено. Адміністратори (перегляд/тест) не обмежуються."""
+    role = user.get("role")
+    if role in SURVEY_ADMIN_ROLES:
+        return None
+
+    # 1. Дедлайн
+    if template.deadline:
+        try:
+            if datetime.now() > datetime.strptime(template.deadline, "%d.%m.%Y %H:%M"):
+                return "Термін проходження цього опитування минув"
+        except Exception:
+            pass
+
+    # 2. Аудиторія за хештегами
+    hashtags = template.hashtags or []
+    audience_tags = [h for h in hashtags if h in SURVEY_AUDIENCE_ROLES]
+    if audience_tags:
+        allowed = set()
+        for tag in audience_tags:
+            allowed.update(SURVEY_AUDIENCE_ROLES[tag])
+        if role not in allowed:
+            return "Це опитування недоступне для вашої ролі"
+        return None
+
+    # 3. Старий механізм target_audience (збіг із полями «навчання»)
+    t_audience = template.target_audience or {}
+    if isinstance(t_audience, str):
+        try:
+            t_audience = json.loads(t_audience)
+        except Exception:
+            t_audience = {}
+    if t_audience:
+        db_user = db_session.query(DBUser).filter(DBUser.id == user.get("user_id")).first()
+        s_data = (db_user.student_data or {}) if db_user else {}
+        if isinstance(s_data, str):
+            try:
+                s_data = json.loads(s_data)
+            except Exception:
+                s_data = {}
+        studies = s_data.get("навчання", []) if isinstance(s_data, dict) else []
+        if not any(all(st.get(k) == v for k, v in t_audience.items()) for st in studies):
+            return "Це опитування недоступне для вашої групи"
+    return None
+
 @app.get("/api/templates/{template_id}")
 async def get_single_template(
     template_id: str,
@@ -1719,6 +1774,9 @@ async def get_single_template(
     template = db.query(DBTemplate).filter(DBTemplate.id == template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="Опитування не знайдено")
+    access_error = _survey_access_error(db, template, user)
+    if access_error:
+        raise HTTPException(status_code=403, detail=access_error)
     return {
         "id": template.id, "title": template.title, "questions": template.questions,
         "is_anonymous": template.is_anonymous if template.is_anonymous is not None else True,
@@ -2691,6 +2749,10 @@ async def save_student_response(
     template = db.query(DBTemplate).filter(DBTemplate.id == base_survey_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="Опитування не знайдено")
+
+    access_error = _survey_access_error(db, template, user)
+    if access_error:
+        raise HTTPException(status_code=403, detail=access_error)
 
     if user.get("role") != "stakeholder":
         # Перевіряємо за virtual_id (щоб одна і та ж база-опитування могла пройтися двічі по різних ОПП)
