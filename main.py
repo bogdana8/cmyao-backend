@@ -392,6 +392,23 @@ class DBStudentSubjectChoice(Base):
     subject_id    = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
     chosen_at     = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
 
+# =========================================================
+# 🔏 ЗГОДА НА ОБРОБКУ ПЕРСОНАЛЬНИХ ДАНИХ (студенти, викладачі)
+# =========================================================
+CONSENT_ROLES = ("student", "teacher")
+CONSENT_VERSION = 1   # збільшіть число — і всі побачать повідомлення знову
+CONSENT_LOCATIONS = {"city": "У місті", "ukraine": "В Україні", "abroad": "За кордоном"}
+
+class DBUserConsent(Base):
+    """Підтвердження ознайомлення з повідомленням про персональні дані + місце перебування"""
+    __tablename__ = "user_consents"
+    id             = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id        = Column(String, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    version        = Column(Integer, default=0)
+    accepted_at    = Column(String, nullable=True)
+    location       = Column(String, nullable=True)      # city | ukraine | abroad
+    reset_required = Column(Boolean, default=False)     # суперадмін вимагає показати знову
+
 Base.metadata.create_all(bind=engine)
 
 # =========================================================
@@ -2831,6 +2848,102 @@ async def set_active_theme(
         db.add(DBActiveTheme(student_id=user["user_id"], theme_id=data.theme_id))
     db.commit()
     return {"message": "Тему активовано!"}
+
+# =========================================================
+# 🔏 ЗГОДА НА ОБРОБКУ ПЕРСОНАЛЬНИХ ДАНИХ — ЕНДПОІНТИ
+# =========================================================
+class ConsentAcceptSchema(BaseModel):
+    location: str
+
+class ConsentResetSchema(BaseModel):
+    user_ids: Optional[List[str]] = None
+    role: Optional[str] = None
+
+def _consent_status(rec) -> str:
+    """confirmed | pending (ще не підтверджував) | reset (потрібно підтвердити знову)"""
+    if rec is None or not rec.accepted_at:
+        return "pending"
+    if rec.reset_required or (rec.version or 0) < CONSENT_VERSION:
+        return "reset"
+    return "confirmed"
+
+@app.get("/api/me/consent")
+async def get_my_consent(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    applicable = user.get("role") in CONSENT_ROLES
+    rec = db.query(DBUserConsent).filter(DBUserConsent.user_id == user["user_id"]).first()
+    status = _consent_status(rec)
+    return {
+        "applicable": applicable,
+        "required": applicable and status != "confirmed",
+        "status": status,
+        "location": rec.location if rec else None,
+        "accepted_at": rec.accepted_at if rec else None,
+        "version": CONSENT_VERSION,
+    }
+
+@app.post("/api/me/consent")
+async def accept_my_consent(
+    data: ConsentAcceptSchema, request: Request,
+    user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    if user.get("role") not in CONSENT_ROLES:
+        raise HTTPException(status_code=403, detail="Для вашої ролі підтвердження не потрібне")
+    if data.location not in CONSENT_LOCATIONS:
+        raise HTTPException(status_code=400, detail="Оберіть, де ви перебуваєте")
+    rec = db.query(DBUserConsent).filter(DBUserConsent.user_id == user["user_id"]).first()
+    if not rec:
+        rec = DBUserConsent(user_id=user["user_id"])
+        db.add(rec)
+    rec.version = CONSENT_VERSION
+    rec.accepted_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+    rec.location = data.location
+    rec.reset_required = False
+    write_audit(db, request, action="update", user=user, content_type="Consent | Згода",
+        object_id=user["user_id"], object_repr=user.get("sub"),
+        details={"location": data.location, "version": CONSENT_VERSION})
+    db.commit()
+    return {"message": "Дякуємо!"}
+
+@app.get("/api/superadmin/consents")
+async def list_consents(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    users = db.query(DBUser).filter(DBUser.role.in_(CONSENT_ROLES)).order_by(DBUser.full_name).all()
+    recs = {r.user_id: r for r in db.query(DBUserConsent).all()}
+    items = []
+    for u in users:
+        r = recs.get(u.id)
+        items.append({
+            "user_id": u.id, "full_name": u.full_name, "email": u.email, "role": u.role,
+            "status": _consent_status(r),
+            "accepted_at": r.accepted_at if r else None,
+            "location": r.location if r else None,
+        })
+    return {"version": CONSENT_VERSION, "items": items}
+
+@app.post("/api/superadmin/consents/reset")
+async def reset_consents(
+    data: ConsentResetSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    """Показати повідомлення знову: конкретним користувачам (user_ids) або всій ролі (role)."""
+    if data.user_ids:
+        q = db.query(DBUser).filter(DBUser.id.in_(data.user_ids), DBUser.role.in_(CONSENT_ROLES))
+    elif data.role in CONSENT_ROLES:
+        q = db.query(DBUser).filter(DBUser.role == data.role)
+    else:
+        raise HTTPException(status_code=400, detail="Вкажіть користувачів або роль (student / teacher)")
+    users = q.all()
+    existing = {r.user_id: r for r in db.query(DBUserConsent).filter(
+        DBUserConsent.user_id.in_([u.id for u in users])).all()} if users else {}
+    for u in users:
+        rec = existing.get(u.id)
+        if not rec:
+            rec = DBUserConsent(user_id=u.id)
+            db.add(rec)
+        rec.reset_required = True
+    write_audit(db, request, action="update", user=admin, content_type="Consent | Згода",
+        object_repr=f"reset: {len(users)}", details={"role": data.role, "user_ids": data.user_ids, "count": len(users)})
+    db.commit()
+    return {"message": f"Повідомлення буде показано знову: {len(users)} користувачів", "count": len(users)}
 
 # =========================================================
 # 📢 ОГОЛОШЕННЯ
