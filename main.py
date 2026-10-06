@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Generator
 import uuid
 import requests
-from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, Boolean, text, func, UniqueConstraint
+from sqlalchemy import create_engine, Column, String, Integer, Float, JSON, ForeignKey, Boolean, text, func, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -70,30 +70,55 @@ app.add_middleware(
 # =========================================================
 # 🛡️ RATE LIMITER
 # =========================================================
-_login_attempts: dict = defaultdict(list)
 LOGIN_RATE_LIMIT = 10
 LOGIN_RATE_WINDOW = 60 * 15
 
-def check_login_rate_limit(request: Request):
+def get_client_ip(request: Request) -> str:
+    """IP клієнта. За проксі (Render) request.client.host — адреса проксі, тому
+    спершу беремо перший елемент X-Forwarded-For, інакше — адресу з'єднання."""
+    xff = request.headers.get("x-forwarded-for", "")
+    first = xff.split(",")[0].strip() if xff else ""
+    if first:
+        return first[:64]
+    return request.client.host if request.client else "unknown"
+
+def _rate_keys(request: Request, email: Optional[str] = None) -> list:
+    keys = [f"ip:{get_client_ip(request)}"]
+    if email:
+        # окремий ліміт на конкретний акаунт — працює, навіть якщо атакуючий міняє IP
+        keys.append(f"email:{email.strip().lower()[:200]}")
+    return keys
+
+def check_login_rate_limit(request: Request, db: Session, email: Optional[str] = None):
     """Перевіряє ліміт, але НЕ рахує спробу — рахуються лише невдалі спроби
     (див. register_failed_login), щоб успішні логіни в різні акаунти не
-    вважалися 'спробами зламу' і не блокували легітимну роботу."""
-    ip = request.client.host
-    now = time.time()
-    _login_attempts[ip] = [
-        t for t in _login_attempts[ip]
-        if now - t < LOGIN_RATE_WINDOW
-    ]
-    if len(_login_attempts[ip]) >= LOGIN_RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Забагато спроб входу. Спробуйте через 15 хвилин."
-        )
+    вважалися 'спробами зламу' і не блокували легітимну роботу.
+    Лічильник зберігається в БД, тож переживає перезапуск сервера."""
+    since = time.time() - LOGIN_RATE_WINDOW
+    for key in _rate_keys(request, email):
+        attempts = db.query(func.count(DBLoginAttempt.id)).filter(
+            DBLoginAttempt.key == key, DBLoginAttempt.ts > since
+        ).scalar() or 0
+        if attempts >= LOGIN_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Забагато спроб входу. Спробуйте через 15 хвилин."
+            )
 
-def register_failed_login(request: Request):
+def register_failed_login(request: Request, db: Session, email: Optional[str] = None):
     """Реєструє невдалу спробу входу (неправильний пароль / пошта не в базі)"""
-    ip = request.client.host
-    _login_attempts[ip].append(time.time())
+    now = time.time()
+    for key in _rate_keys(request, email):
+        db.add(DBLoginAttempt(key=key, ts=now))
+    db.query(DBLoginAttempt).filter(DBLoginAttempt.ts < now - LOGIN_RATE_WINDOW)\
+        .delete(synchronize_session=False)
+    db.commit()   # інакше запис загубиться через HTTPException нижче
+
+def clear_failed_logins(db: Session, email: str):
+    """Після успішного входу скидаємо лічильник невдач для цього акаунта"""
+    db.query(DBLoginAttempt).filter(DBLoginAttempt.key == f"email:{email.strip().lower()[:200]}")\
+        .delete(synchronize_session=False)
+    db.commit()
 
 # =========================================================
 # 🗄️ БАЗА ДАНИХ
@@ -408,6 +433,13 @@ class DBUserConsent(Base):
     accepted_at    = Column(String, nullable=True)
     location       = Column(String, nullable=True)      # city | ukraine | abroad
     reset_required = Column(Boolean, default=False)     # суперадмін вимагає показати знову
+
+class DBLoginAttempt(Base):
+    """Невдалі спроби входу для ліміту (ключ: ip:<адреса> або email:<пошта>)"""
+    __tablename__ = "login_attempts"
+    id  = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    key = Column(String, index=True, nullable=False)
+    ts  = Column(Float, index=True, nullable=False)
 
 Base.metadata.create_all(bind=engine)
 
@@ -980,7 +1012,7 @@ def write_audit(
         db.add(DBAuditLog(
             user_id      = user.get("user_id") if user else None,
             user_email   = user.get("sub")     if user else None,
-            ip_address   = request.client.host if request.client else None,
+            ip_address   = get_client_ip(request),
             user_agent   = request.headers.get("user-agent", "")[:300],
             path         = str(request.url.path),
             method       = request.method,
@@ -1160,14 +1192,15 @@ async def login(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    check_login_rate_limit(request)
+    check_login_rate_limit(request, db, user.email)
     db_user = db.query(DBUser).filter(DBUser.email == user.email).first()
     dummy_hash = "$2b$12$KIX6s9S8sS8sS8sS8sS8sOKIX6s9S8sS8sS8sS8sS8sS8sS8sS8s"
     hash_to_check = db_user.hashed_password if db_user else dummy_hash
     password_valid = pwd_context.verify(user.password, hash_to_check)
     if not db_user or not password_valid:
-        register_failed_login(request)
+        register_failed_login(request, db, user.email)
         raise HTTPException(status_code=401, detail="Неправильна пошта або пароль")
+    clear_failed_logins(db, user.email)
     access_token = create_access_token(
         data={"sub": db_user.email, "role": db_user.role, "user_id": db_user.id}
     )
@@ -1184,7 +1217,7 @@ async def google_login(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    check_login_rate_limit(request)
+    check_login_rate_limit(request, db)
 
     # Технічні подробиці — лише в серверний лог; користувачу віддаємо загальні повідомлення
     try:
@@ -1198,7 +1231,7 @@ async def google_login(
         raise HTTPException(status_code=503, detail="Не вдалося зв'язатися з Google. Спробуйте пізніше.")
 
     if response.status_code != 200:
-        register_failed_login(request)
+        register_failed_login(request, db)
         raise HTTPException(status_code=401, detail="Не вдалося підтвердити вхід через Google")
 
     idinfo = response.json()
@@ -1207,12 +1240,12 @@ async def google_login(
     aud = idinfo.get("aud", "")
     aud_ok = GOOGLE_CLIENT_ID in aud if isinstance(aud, list) else aud == GOOGLE_CLIENT_ID
     if not aud_ok or idinfo.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
-        register_failed_login(request)
+        register_failed_login(request, db)
         raise HTTPException(status_code=401, detail="Не вдалося підтвердити вхід через Google")
 
     # пошта має бути підтверджена Google
     if str(idinfo.get("email_verified", "")).lower() != "true":
-        register_failed_login(request)
+        register_failed_login(request, db)
         raise HTTPException(status_code=401, detail="Пошта Google не підтверджена")
 
     email = (idinfo.get("email") or "").strip()
@@ -1221,7 +1254,7 @@ async def google_login(
 
     db_user = db.query(DBUser).filter(func.lower(DBUser.email) == email.lower()).first()
     if not db_user:
-        register_failed_login(request)
+        register_failed_login(request, db, email)
         raise HTTPException(
             status_code=403,
             detail="Вашої пошти немає в системі. Зверніться до підтримки: moodle@duet.edu.ua"
