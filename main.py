@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Generator
 import uuid
 import requests
-from sqlalchemy import create_engine, Column, String, Integer, Float, JSON, ForeignKey, Boolean, text, func, UniqueConstraint
+from sqlalchemy import create_engine, Column, String, Integer, Float, LargeBinary, JSON, ForeignKey, Boolean, text, func, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -217,6 +217,7 @@ class DBAnnouncement(Base):
     sender = Column(String)
     is_important = Column(Boolean, default=False)
     is_edited = Column(Boolean, default=False)
+    target_groups = Column(JSON, nullable=True)   # null = для всіх; список назв груп = лише студентам цих груп
 
 class DBDictionary(Base):
     __tablename__ = "dictionaries"
@@ -434,6 +435,38 @@ class DBUserConsent(Base):
     location       = Column(String, nullable=True)      # city | ukraine | abroad
     reset_required = Column(Boolean, default=False)     # суперадмін вимагає показати знову
 
+# =========================================================
+# 📨 СЛУЖБОВІ ЗАПИСКИ (СЗ) ПРО ВІДСУТНІСТЬ ВИКЛАДАЧІВ
+# =========================================================
+SERVICE_NOTE_REASONS = ["Відпустка", "Лікарняний", "Сімейні обставини", "Відрядження", "Інше"]
+SERVICE_NOTE_MAX_FILE = 5 * 1024 * 1024
+SERVICE_NOTE_EXT = (".pdf", ".doc", ".docx")
+
+class DBServiceNote(Base):
+    """Рядок таблиці службових записок. Файл зберігається в БД (диск Render не постійний)."""
+    __tablename__ = "service_notes"
+    id               = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    teacher_id       = Column(String, ForeignKey("teachers.id", ondelete="SET NULL"), nullable=True)
+    teacher_name     = Column(String, nullable=False)            # ПІБ (з довідника або вписаний вручну)
+    date_from        = Column(String, nullable=False)            # YYYY-MM-DD
+    date_to          = Column(String, nullable=True)             # YYYY-MM-DD
+    note_number      = Column(String, nullable=True)
+    note_date        = Column(String, nullable=True)             # дата написання СЗ, YYYY-MM-DD
+    note_written     = Column(Boolean, default=False)            # «є в наявності»
+    reason           = Column(String, nullable=True)
+    schedule_changed = Column(Boolean, default=False)
+    group_names      = Column(JSON, default=list)                # назви змінених груп
+    notes            = Column(String, nullable=True)
+    file_url         = Column(String, nullable=True)             # посилання на файл (Google Drive тощо)
+    file_name        = Column(String, nullable=True)
+    file_mime        = Column(String, nullable=True)
+    file_data        = Column(LargeBinary, nullable=True)
+    notified_at      = Column(String, nullable=True)
+    announcement_id  = Column(Integer, nullable=True)
+    created_by       = Column(String, nullable=True)
+    created_at       = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
+    updated_at       = Column(String, nullable=True)
+
 class DBLoginAttempt(Base):
     """Невдалі спроби входу для ліміту (ключ: ip:<адреса> або email:<пошта>)"""
     __tablename__ = "login_attempts"
@@ -477,6 +510,7 @@ def _run_migrations():
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_id VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS respondent_name VARCHAR",
         "ALTER TABLE responses ADD COLUMN IF NOT EXISTS opp_context VARCHAR",
+        "ALTER TABLE announcements ADD COLUMN IF NOT EXISTS target_groups JSON",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS feathers_reward INTEGER DEFAULT 0",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS hashtags JSON DEFAULT '[]'",
         "ALTER TABLE templates ADD COLUMN IF NOT EXISTS deadline VARCHAR",
@@ -3041,6 +3075,230 @@ async def reset_consents(
     return {"message": f"Повідомлення буде показано знову: {len(users)} користувачів", "count": len(users)}
 
 # =========================================================
+# 📨 СЛУЖБОВІ ЗАПИСКИ — ЕНДПОІНТИ
+# Редагують: ЦМЯО і суперадмін. Переглядає також ЦСК.
+# =========================================================
+class ServiceNoteSchema(BaseModel):
+    teacher_id: Optional[str] = None
+    teacher_name: Optional[str] = None
+    date_from: str
+    date_to: Optional[str] = None
+    note_number: Optional[str] = None
+    note_date: Optional[str] = None
+    note_written: bool = False
+    reason: Optional[str] = None
+    schedule_changed: bool = False
+    group_names: List[str] = []
+    notes: Optional[str] = None
+    file_url: Optional[str] = None
+
+class ServiceNoteNotifySchema(BaseModel):
+    title: str
+    content: str = ""
+    is_important: bool = False
+    force: bool = False
+
+def require_notes_reader(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") not in ["superadmin", "admin_cmyo", "admin_csk"]:
+        raise HTTPException(status_code=403, detail="Доступ заборонено")
+    return user
+
+def require_notes_editor(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") not in ["superadmin", "admin_cmyo"]:
+        raise HTTPException(status_code=403, detail="Службові записки вносить лише ЦМЯО")
+    return user
+
+def _note_to_dict(n: "DBServiceNote") -> dict:
+    return {
+        "id": n.id, "teacher_id": n.teacher_id, "teacher_name": n.teacher_name,
+        "date_from": n.date_from, "date_to": n.date_to,
+        "note_number": n.note_number, "note_date": n.note_date, "note_written": bool(n.note_written),
+        "reason": n.reason, "schedule_changed": bool(n.schedule_changed),
+        "group_names": n.group_names or [], "notes": n.notes, "file_url": n.file_url,
+        "has_file": bool(n.file_data), "file_name": n.file_name,
+        "notified_at": n.notified_at, "created_by": n.created_by,
+        "created_at": n.created_at, "updated_at": n.updated_at,
+    }
+
+def _parse_iso_date(value, field):
+    if not value:
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return value
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Невірна дата в полі «{field}»")
+
+def _apply_service_note(db_session, obj, data: "ServiceNoteSchema"):
+    date_from = _parse_iso_date(data.date_from, "Початок")
+    date_to = _parse_iso_date(data.date_to, "Кінець")
+    note_date = _parse_iso_date(data.note_date, "Дата СЗ")
+    if not date_from:
+        raise HTTPException(status_code=400, detail="Вкажіть дату початку")
+    if date_to and date_to < date_from:
+        raise HTTPException(status_code=400, detail="Кінець періоду раніше за початок")
+    teacher_name = _clean(data.teacher_name)
+    teacher_id = None
+    if data.teacher_id:
+        t = db_session.query(DBTeacher).filter(DBTeacher.id == data.teacher_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Викладача не знайдено")
+        teacher_id, teacher_name = t.id, t.full_name
+    if not teacher_name:
+        raise HTTPException(status_code=400, detail="Вкажіть викладача")
+    groups = list(dict.fromkeys(_clean(g) for g in (data.group_names or []) if _clean(g)))
+    if groups:
+        found = {r[0] for r in db_session.query(DBAcademicGroup.name).filter(DBAcademicGroup.name.in_(groups)).all()}
+        missing = [g for g in groups if g not in found]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Груп немає в Структурі: {', '.join(missing)}")
+    url = (data.file_url or "").strip() or None
+    if url and not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Посилання має починатися з http:// або https://")
+    obj.teacher_id = teacher_id
+    obj.teacher_name = teacher_name
+    obj.date_from, obj.date_to, obj.note_date = date_from, date_to, note_date
+    obj.note_number = _clean(data.note_number) or None
+    obj.note_written = data.note_written
+    obj.reason = _clean(data.reason)[:100] or None
+    obj.schedule_changed = data.schedule_changed
+    obj.group_names = groups
+    obj.notes = (data.notes or "").strip() or None
+    obj.file_url = url
+    obj.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+@app.get("/api/service-notes")
+async def list_service_notes(user: dict = Depends(require_notes_reader), db: Session = Depends(get_db)):
+    items = db.query(DBServiceNote).order_by(DBServiceNote.date_from.desc(), DBServiceNote.id.desc()).all()
+    return {"reasons": SERVICE_NOTE_REASONS, "items": [_note_to_dict(n) for n in items]}
+
+@app.post("/api/service-notes")
+async def create_service_note(
+    data: ServiceNoteSchema, request: Request,
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    obj = DBServiceNote(created_by=user.get("sub"))
+    _apply_service_note(db, obj, data)
+    db.add(obj)
+    write_audit(db, request, action="create", user=user, content_type="ServiceNote | СЗ",
+        object_repr=obj.teacher_name, details={"date_from": obj.date_from, "date_to": obj.date_to, "reason": obj.reason})
+    db.commit()
+    db.refresh(obj)
+    return _note_to_dict(obj)
+
+@app.put("/api/service-notes/{note_id}")
+async def update_service_note(
+    note_id: int, data: ServiceNoteSchema, request: Request,
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    _apply_service_note(db, obj, data)
+    write_audit(db, request, action="update", user=user, content_type="ServiceNote | СЗ",
+        object_id=note_id, object_repr=obj.teacher_name)
+    db.commit()
+    db.refresh(obj)
+    return _note_to_dict(obj)
+
+@app.delete("/api/service-notes/{note_id}")
+async def delete_service_note(
+    note_id: int, request: Request,
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    write_audit(db, request, action="delete", user=user, content_type="ServiceNote | СЗ",
+        object_id=note_id, object_repr=obj.teacher_name)
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+@app.post("/api/service-notes/{note_id}/file")
+async def upload_service_note_file(
+    note_id: int, request: Request, file: UploadFile = File(...),
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    name = os.path.basename(file.filename or "")
+    if not name.lower().endswith(SERVICE_NOTE_EXT):
+        raise HTTPException(status_code=400, detail="Дозволені файли: PDF, DOC, DOCX")
+    content = await file.read()
+    if len(content) > SERVICE_NOTE_MAX_FILE:
+        raise HTTPException(status_code=413, detail="Файл завеликий (максимум 5 МБ)")
+    if not content:
+        raise HTTPException(status_code=400, detail="Файл порожній")
+    obj.file_name = name[:200]
+    obj.file_mime = file.content_type or "application/octet-stream"
+    obj.file_data = content
+    obj.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+    write_audit(db, request, action="update", user=user, content_type="ServiceNote | СЗ (файл)",
+        object_id=note_id, object_repr=name, details={"size": len(content)})
+    db.commit()
+    return _note_to_dict(obj)
+
+@app.get("/api/service-notes/{note_id}/file")
+async def download_service_note_file(
+    note_id: int, user: dict = Depends(require_notes_reader), db: Session = Depends(get_db)
+):
+    obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
+    if not obj or not obj.file_data:
+        raise HTTPException(status_code=404, detail="Файл не знайдено")
+    return StreamingResponse(
+        io.BytesIO(obj.file_data),
+        media_type=obj.file_mime or "application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(obj.file_name or 'file')}"},
+    )
+
+@app.delete("/api/service-notes/{note_id}/file")
+async def delete_service_note_file(
+    note_id: int, request: Request,
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    obj.file_name = obj.file_mime = obj.file_data = None
+    write_audit(db, request, action="delete", user=user, content_type="ServiceNote | СЗ (файл)", object_id=note_id)
+    db.commit()
+    return _note_to_dict(obj)
+
+@app.post("/api/service-notes/{note_id}/notify")
+async def notify_service_note(
+    note_id: int, data: ServiceNoteNotifySchema, request: Request,
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    """Публікує оголошення, яке бачать лише студенти вказаних груп."""
+    obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    if not obj.schedule_changed:
+        raise HTTPException(status_code=400, detail="Спершу позначте, що зміни внесено в розклад")
+    if not obj.group_names:
+        raise HTTPException(status_code=400, detail="Не вказано групи, яким потрібно надіслати повідомлення")
+    if not data.title.strip():
+        raise HTTPException(status_code=400, detail="Заголовок обов'язковий")
+    if obj.notified_at and not data.force:
+        raise HTTPException(status_code=409, detail=f"Повідомлення вже надсилалося {obj.notified_at}")
+    sender = {"admin_cmyo": "ЦМЯО", "superadmin": "Адміністрація"}.get(user.get("role"), "Деканат")
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ann = DBAnnouncement(
+        title=data.title.strip(), content=data.content, date=now, sender=sender,
+        is_important=data.is_important, target_groups=list(obj.group_names),
+    )
+    db.add(ann)
+    db.flush()
+    obj.notified_at = now
+    obj.announcement_id = ann.id
+    write_audit(db, request, action="create", user=user, content_type="Announcements | Оголошення",
+        object_id=ann.id, object_repr=ann.title, details={"service_note_id": note_id, "groups": obj.group_names})
+    db.commit()
+    return _note_to_dict(obj)
+
+# =========================================================
 # 📢 ОГОЛОШЕННЯ
 # =========================================================
 @app.post("/api/announcements")
@@ -3066,7 +3324,24 @@ async def create_announcement(
 async def get_announcements(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    return db.query(DBAnnouncement).order_by(DBAnnouncement.id.desc()).all()
+    anns = db.query(DBAnnouncement).order_by(DBAnnouncement.id.desc()).all()
+    role = user.get("role")
+    if role in ("superadmin", "admin_csk", "admin_cmyo"):
+        return anns
+    # Оголошення з target_groups бачать лише студенти цих груп
+    my_groups = set()
+    if role == "student":
+        db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+        s_data = (db_user.student_data or {}) if db_user else {}
+        if isinstance(s_data, str):
+            try:
+                s_data = json.loads(s_data)
+            except Exception:
+                s_data = {}
+        for study in (s_data.get("навчання", []) if isinstance(s_data, dict) else []):
+            if study.get("Група"):
+                my_groups.add(study["Група"])
+    return [a for a in anns if not a.target_groups or (set(a.target_groups) & my_groups)]
 
 @app.put("/api/announcements/{ann_id}")
 async def update_announcement(
