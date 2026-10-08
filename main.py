@@ -3266,6 +3266,161 @@ async def delete_service_note_file(
     db.commit()
     return _note_to_dict(obj)
 
+# ── ІМПОРТ СЗ З EXCEL/CSV (формат чинної таблиці) ───────
+_DATE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
+
+def _to_iso(d, mth, y):
+    try:
+        return datetime(int(y), int(mth), int(d)).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+def _parse_period_cell(val):
+    """'15.09.2026-21.09.2026' / '29.09.2026' / datetime → (date_from, date_to) у ISO."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None, None
+    if hasattr(val, "strftime"):
+        iso = val.strftime("%Y-%m-%d")
+        return iso, None
+    dates = [_to_iso(*g) for g in _DATE_RE.findall(str(val))]
+    dates = [d for d in dates if d]
+    if not dates:
+        return None, None
+    return dates[0], (dates[-1] if len(dates) > 1 and dates[-1] != dates[0] else None)
+
+def _name_initials(text):
+    """('Нестеренко К.О.' | 'Нестеренко Катерина Олексіївна') → (прізвище_norm, [ініціали])"""
+    parts = (text or "").replace(",", " ").split()
+    if not parts:
+        return "", []
+    surname = _norm(parts[0])
+    rest = " ".join(parts[1:])
+    if "." in rest:
+        initials = re.findall(r"[A-Za-zА-ЯІЇЄҐа-яіїєґ]", rest.replace(".", " . ").replace(" . ", ""))
+    else:
+        initials = [p[0] for p in parts[1:] if p]
+    return surname, [i.lower() for i in initials]
+
+def _match_teacher(teachers, text):
+    """Повертає DBTeacher, якщо збіг однозначний (прізвище + ініціали), інакше None."""
+    surname, ini = _name_initials(text)
+    if not surname:
+        return None
+    cands = []
+    for t in teachers:
+        t_sur, t_ini = _name_initials(t.full_name)
+        if t_sur != surname:
+            continue
+        if ini and t_ini[:len(ini)] != ini[:len(t_ini)] and t_ini[:len(ini)] != ini:
+            continue
+        cands.append(t)
+    return cands[0] if len(cands) == 1 else None
+
+def _norm_reason(text):
+    t = _clean(text)
+    if not t:
+        return None
+    for r in SERVICE_NOTE_REASONS:
+        if t.lower() == r.lower():
+            return r
+    return t[:100]
+
+@app.post("/api/service-notes/import")
+async def import_service_notes(
+    request: Request, file: UploadFile = File(...), dry_run: bool = Query(default=True),
+    user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
+):
+    """Імпорт рядків зі старої таблиці (xlsx/xls/csv). dry_run=true — лише перевірка без запису.
+    Очікувані колонки (за заголовком): НПП/ПП, Дата…, Службові записки, Причина, Змінено в розкладі?,
+    Примітки, Посилання на файл. Рядки-заголовки років («2027 н.р.») пропускаються."""
+    name = (file.filename or "").lower()
+    content = await file.read()
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(content), header=None, dtype=object)
+        else:
+            df = pd.read_excel(io.BytesIO(content), header=None, dtype=object)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Помилка читання файлу: {str(e)}")
+
+    # знаходимо рядок заголовків
+    header_idx, cols = None, {}
+    for idx in range(min(len(df), 15)):
+        cells = [str(c).strip().lower() if not pd.isna(c) else "" for c in df.iloc[idx].tolist()]
+        if any("нпп" in c for c in cells) and any("причин" in c for c in cells):
+            header_idx = idx
+            for ci, c in enumerate(cells):
+                if "нпп" in c: cols["teacher"] = ci
+                elif c.startswith("дата") or "термін" in c: cols["period"] = ci
+                elif "службов" in c: cols["note"] = ci
+                elif "причин" in c: cols["reason"] = ci
+                elif "змінено" in c: cols["schedule"] = ci
+                elif "примітк" in c: cols["notes"] = ci
+                elif "посилан" in c: cols["url"] = ci
+            break
+    if header_idx is None or "teacher" not in cols or "period" not in cols:
+        raise HTTPException(status_code=400, detail="Не знайдено рядок заголовків (потрібні колонки «НПП/ПП» і «Дата…»)")
+
+    def cell(row, key):
+        ci = cols.get(key)
+        if ci is None or ci >= len(row):
+            return ""
+        v = row[ci]
+        return "" if pd.isna(v) else v
+
+    teachers = db.query(DBTeacher).all()
+    existing = {(n.teacher_name, n.date_from, n.date_to or "") for n in db.query(DBServiceNote).all()}
+    stats = {"rows": 0, "created": 0, "duplicates": 0, "matched_teachers": 0, "unmatched_teachers": [], "errors": []}
+    preview = []
+    seen_unmatched = set()
+
+    for idx in range(header_idx + 1, len(df)):
+        row = df.iloc[idx].tolist()
+        teacher_raw = _clean(str(cell(row, "teacher")))
+        others = [c for i, c in enumerate(row) if i != cols["teacher"] and not pd.isna(c) and str(c).strip()]
+        if not teacher_raw or not others or re.search(r"\d{4}.*н\.?\s?р", teacher_raw.lower()):
+            continue   # порожній рядок або заголовок року
+        date_from, date_to = _parse_period_cell(cell(row, "period"))
+        if not date_from:
+            stats["errors"].append(f"Рядок {idx + 1}: «{teacher_raw}» — немає коректної дати")
+            continue
+        stats["rows"] += 1
+        t = _match_teacher(teachers, teacher_raw)
+        teacher_name = t.full_name if t else teacher_raw
+        if t:
+            stats["matched_teachers"] += 1
+        elif teacher_raw not in seen_unmatched:
+            seen_unmatched.add(teacher_raw)
+            stats["unmatched_teachers"].append(teacher_raw)
+        key = (teacher_name, date_from, date_to or "")
+        if key in existing:
+            stats["duplicates"] += 1
+            continue
+        existing.add(key)
+        note_txt = str(cell(row, "note")).lower()
+        url = str(cell(row, "url")).strip()
+        rec = dict(
+            teacher_id=t.id if t else None, teacher_name=teacher_name,
+            date_from=date_from, date_to=date_to,
+            note_written=("є" in note_txt.split() or "наявн" in note_txt),
+            reason=_norm_reason(str(cell(row, "reason"))),
+            schedule_changed=str(cell(row, "schedule")).strip().lower() in ("так", "yes", "true", "1", "+"),
+            notes=(str(cell(row, "notes")).strip() or None),
+            file_url=url if url.lower().startswith(("http://", "https://")) else None,
+        )
+        stats["created"] += 1
+        if len(preview) < 15:
+            preview.append({**rec, "teacher_matched": bool(t)})
+        if not dry_run:
+            db.add(DBServiceNote(created_by=user.get("sub"),
+                updated_at=datetime.now().strftime("%d.%m.%Y %H:%M"), group_names=[], **rec))
+
+    if not dry_run:
+        write_audit(db, request, action="bulk_import", user=user, content_type="ServiceNote | Імпорт СЗ",
+            object_repr=file.filename, details={k: v for k, v in stats.items() if k != "errors"})
+        db.commit()
+    return {"dry_run": dry_run, "preview": preview, **stats}
+
 @app.post("/api/service-notes/{note_id}/notify")
 async def notify_service_note(
     note_id: int, data: ServiceNoteNotifySchema, request: Request,
