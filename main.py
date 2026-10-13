@@ -1512,30 +1512,88 @@ async def upload_grades(
         "resolved_groups": resolved_groups, "unverified_subjects": drafts,
     }
 
+def _student_data_dict(raw):
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+def _student_study_values(sd: dict, key: str) -> list:
+    return [str(x.get(key)).strip() for x in (sd.get("навчання") or []) if isinstance(x, dict) and x.get(key) not in (None, "")]
+
 @app.get("/api/csk/students")
-async def get_all_students_for_csk(
+async def get_students_for_csk(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    q: str = Query(default=None),
+    group: str = Query(default=None),
+    course: str = Query(default=None),
+    status: str = Query(default="all"),
     admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
 ):
-    students = db.query(DBUser).filter(DBUser.role == "student").all()
-    result = []
-    for s in students:
-        grades = db.query(DBGrade).filter(DBGrade.student_id == s.id).all()
-        group_name = "Невідомо"
-        if s.student_data and isinstance(s.student_data, dict):
-            studies = s.student_data.get("навчання", [])
-            if studies:
-                group_name = studies[0].get("Група", "Невідомо")
-        result.append({
-            "id": s.id, "full_name": s.full_name or "Без імені",
-            "email": s.email, "group": group_name, "student_data": s.student_data,
-            "grades": [{
-                "id": g.id, "subject": g.subject, "score": g.score,
-                "semester": g.semester, "control_form": g.control_form,
-                "teacher": g.teacher, "group_name": g.group_name,
-                "group_id": g.group_id, "subject_id": g.subject_id, "teacher_id": g.teacher_id,
-            } for g in grades]
-        })
-    return result
+    """Список студентів зі серверною пагінацією, пошуком і фільтрами.
+    Оцінки в список НЕ входять (вони завантажуються окремо: GET /api/csk/students/{id}) —
+    тільки кількість оцінок і групи. Два легкі запити замість N+1."""
+    users = db.query(DBUser.id, DBUser.full_name, DBUser.email, DBUser.student_data)\
+        .filter(DBUser.role == "student").order_by(DBUser.full_name).all()
+
+    grade_groups = defaultdict(set)
+    grade_counts = defaultdict(int)
+    for sid, gname, cnt in db.query(DBGrade.student_id, DBGrade.group_name, func.count(DBGrade.id))\
+            .group_by(DBGrade.student_id, DBGrade.group_name).all():
+        if gname:
+            grade_groups[sid].add(gname)
+        grade_counts[sid] += cnt
+
+    ql = (q or "").strip().lower()
+    facet_groups, facet_courses = set(), set()
+    rows = []
+    for u in users:
+        sd = _student_data_dict(u.student_data)
+        groups = sorted(set(_student_study_values(sd, "Група")) | grade_groups.get(u.id, set()))
+        courses = sorted(set(_student_study_values(sd, "Курс")))
+        facet_groups.update(groups); facet_courses.update(courses)
+        if group and group != "all" and group not in groups:
+            continue
+        if course and course != "all" and course not in courses:
+            continue
+        cnt = grade_counts.get(u.id, 0)
+        if status == "has_grades" and cnt == 0:
+            continue
+        if status == "no_grades" and cnt > 0:
+            continue
+        if ql and not ((u.full_name or "").lower().find(ql) >= 0 or (u.email or "").lower().find(ql) >= 0
+                       or any(ql in g.lower() for g in groups)):
+            continue
+        rows.append({"id": u.id, "full_name": u.full_name or "Без імені", "email": u.email,
+                     "groups": groups, "courses": courses, "grades_count": cnt})
+
+    return {
+        "total": len(rows), "limit": limit, "offset": offset,
+        "items": rows[offset: offset + limit],
+        "facets": {"groups": sorted(facet_groups), "courses": sorted(facet_courses)},
+    }
+
+@app.get("/api/csk/students/{student_id}")
+async def get_student_for_csk(
+    student_id: str, admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
+):
+    s = db.query(DBUser).filter(DBUser.id == student_id, DBUser.role == "student").first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Студента не знайдено")
+    grades = db.query(DBGrade).filter(DBGrade.student_id == s.id).all()
+    return {
+        "id": s.id, "full_name": s.full_name or "Без імені", "email": s.email,
+        "student_data": s.student_data,
+        "grades": [{
+            "id": g.id, "subject": g.subject, "score": g.score,
+            "semester": g.semester, "control_form": g.control_form,
+            "teacher": g.teacher, "group_name": g.group_name,
+            "group_id": g.group_id, "subject_id": g.subject_id, "teacher_id": g.teacher_id,
+        } for g in grades],
+    }
 
 @app.put("/api/csk/grades/{grade_id}")
 async def update_single_grade(
