@@ -495,12 +495,20 @@ class DBLessonGroup(Base):
     name      = Column(String, nullable=False)
     name_norm = Column(String, nullable=False, unique=True, index=True)
 
+class DBLessonTeacher(Base):
+    """Власний список викладачів для перевірки пар (окремо від довідника Структури)"""
+    __tablename__ = "lesson_teachers"
+    id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name      = Column(String, nullable=False)
+    name_norm = Column(String, nullable=False, unique=True, index=True)
+
 class DBLessonCheck(Base):
-    """Рядок таблиці перевірки пар. На teachers лише текстове посилання (без FK)."""
+    """Рядок таблиці перевірки пар. Усі довідники — власні (lesson_*), без FK на інші таблиці."""
     __tablename__ = "lesson_checks"
     id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
     subject_id   = Column(Integer, nullable=True, index=True)     # lesson_subjects.id
-    teacher_id   = Column(String, nullable=True)                  # teachers.id (без FK)
+    teacher_id   = Column(String, nullable=True)                  # застаріле (id з довідника Структури), більше не використовується
+    lesson_teacher_id = Column(Integer, nullable=True, index=True)  # lesson_teachers.id
     teacher_name = Column(String, nullable=False)                 # ПІБ на момент запису
     group_ids    = Column(JSON, default=list)                     # [lesson_groups.id, ...]
     lesson_date  = Column(String, nullable=False, index=True)     # YYYY-MM-DD
@@ -572,6 +580,9 @@ def _run_migrations():
         # 🧱 Реформа предметів: нормалізована назва + прапорець чернетки
         "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS name_norm VARCHAR",
         "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT TRUE",
+        # 🧾 Перевірка пар: власний список викладачів
+        "ALTER TABLE lesson_checks ADD COLUMN IF NOT EXISTS lesson_teacher_id INTEGER",
+        "CREATE INDEX IF NOT EXISTS ix_lesson_checks_lesson_teacher_id ON lesson_checks (lesson_teacher_id)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3729,14 +3740,14 @@ async def save_board_state(
 # =========================================================
 # 🧾 ПЕРЕВІРКА ПАР (ЦМЯО) — API
 # Усе під /api/cmyo/lessons, доступ: ЦМЯО + суперадмін.
-# Викладачі беруться з існуючого довідника (лише читання).
+# Предмети, групи й викладачі — власні списки (lesson_subjects / lesson_groups / lesson_teachers).
 # =========================================================
 class LessonNameSchema(BaseModel):
     name: str
 
 class LessonCheckSchema(BaseModel):
     subject_id: Optional[int] = None
-    teacher_id: Optional[str] = None
+    teacher_id: Optional[int] = None
     teacher_name: Optional[str] = None
     group_ids: List[int] = []
     lesson_date: str
@@ -3749,7 +3760,7 @@ def _lesson_check_to_dict(c: "DBLessonCheck", subj_map: dict, grp_map: dict) -> 
     gids = c.group_ids or []
     return {
         "id": c.id, "subject_id": c.subject_id, "subject_name": subj_map.get(c.subject_id),
-        "teacher_id": c.teacher_id, "teacher_name": c.teacher_name,
+        "teacher_id": c.lesson_teacher_id, "teacher_name": c.teacher_name,
         "group_ids": gids, "group_names": [grp_map[g] for g in gids if g in grp_map],
         "lesson_date": c.lesson_date, "pairs": c.pairs or [],
         "pairs_count": c.pairs_count, "minutes": c.minutes,
@@ -3757,10 +3768,27 @@ def _lesson_check_to_dict(c: "DBLessonCheck", subj_map: dict, grp_map: dict) -> 
         "created_by": c.created_by, "created_at": c.created_at, "updated_at": c.updated_at,
     }
 
+def _lesson_backfill_teacher_links(db, teachers):
+    """Старі рядки, збережені лише з текстовим ПІБ, підв'язуємо до списку викладачів за збігом імені."""
+    rows = db.query(DBLessonCheck).filter(DBLessonCheck.lesson_teacher_id.is_(None)).all()
+    if not rows or not teachers:
+        return
+    tmap = {t.name_norm: t.id for t in teachers}
+    changed = False
+    for r in rows:
+        tid = tmap.get(_norm(r.teacher_name))
+        if tid:
+            r.lesson_teacher_id = tid
+            changed = True
+    if changed:
+        db.commit()
+
 @app.get("/api/cmyo/lessons")
 async def list_lesson_checks(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     subjects = db.query(DBLessonSubject).order_by(DBLessonSubject.name).all()
     groups = db.query(DBLessonGroup).order_by(DBLessonGroup.name).all()
+    teachers = db.query(DBLessonTeacher).order_by(DBLessonTeacher.name).all()
+    _lesson_backfill_teacher_links(db, teachers)
     subj_map = {s.id: s.name for s in subjects}
     grp_map = {g.id: g.name for g in groups}
     items = db.query(DBLessonCheck).order_by(DBLessonCheck.lesson_date.desc(), DBLessonCheck.id.desc()).all()
@@ -3770,6 +3798,7 @@ async def list_lesson_checks(user: dict = Depends(require_cmyo_admin), db: Sessi
         "alarm_options": list(LESSON_ALARM_OPTIONS),
         "subjects": [{"id": s.id, "name": s.name} for s in subjects],
         "groups": [{"id": g.id, "name": g.name} for g in groups],
+        "teachers": [{"id": t.id, "name": t.name} for t in teachers],
         "items": [_lesson_check_to_dict(c, subj_map, grp_map) for c in items],
     }
 
@@ -3847,6 +3876,118 @@ async def delete_lesson_group(item_id: int, user: dict = Depends(require_cmyo_ad
     db.commit()
     return {"message": "Видалено"}
 
+# ── Викладачі ────────────────────────────────────────────
+@app.post("/api/cmyo/lessons/teachers")
+async def create_lesson_teacher(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    o = _lesson_catalog_create(db, DBLessonTeacher, data.name, "ПІБ викладача")
+    return {"id": o.id, "name": o.name}
+
+@app.put("/api/cmyo/lessons/teachers/{item_id}")
+async def rename_lesson_teacher(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    o = _lesson_catalog_rename(db, DBLessonTeacher, item_id, data.name, "ПІБ викладача")
+    # у вже збережених рядках оновлюємо ПІБ, щоб назви не розходились
+    db.query(DBLessonCheck).filter(DBLessonCheck.lesson_teacher_id == item_id).update({"teacher_name": o.name})
+    db.commit()
+    return {"id": o.id, "name": o.name}
+
+@app.delete("/api/cmyo/lessons/teachers/{item_id}")
+async def delete_lesson_teacher(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    used = db.query(func.count(DBLessonCheck.id)).filter(DBLessonCheck.lesson_teacher_id == item_id).scalar() or 0
+    if used:
+        raise HTTPException(status_code=409, detail=f"Викладач використовується в записах ({used}). Спочатку змініть їх.")
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+# ── Масове додавання / імпорт зі списку чи файлу (для предметів, груп, викладачів) ──
+LESSON_CATALOGS = {"subjects": DBLessonSubject, "groups": DBLessonGroup, "teachers": DBLessonTeacher}
+_LESSON_HEADER_WORDS = {"працівник", "піб", "викладач", "викладачі", "прізвище", "назва", "предмет", "предмети", "група", "групи", "потік", "потоки"}
+
+class LessonBulkSchema(BaseModel):
+    names: List[str] = []
+
+def _lesson_catalog_bulk(db, model, names):
+    if len(names) > 5000:
+        raise HTTPException(status_code=400, detail="Забагато рядків за раз (максимум 5000)")
+    existing = {n for (n,) in db.query(model.name_norm).all()}
+    seen, added, already, dups, too_long = set(), [], 0, [], 0
+    for raw in names:
+        name = _clean(raw)
+        if not name or name.lower() == "nan":
+            continue
+        if len(name) > 300:
+            too_long += 1
+            continue
+        n = _norm(name)
+        if n in seen:
+            dups.append(name)
+            continue
+        seen.add(n)
+        if n in existing:
+            already += 1
+            continue
+        db.add(model(name=name, name_norm=n))
+        added.append(name)
+    db.commit()
+    return {"added_count": len(added), "already_count": already, "duplicates_in_input": dups, "too_long": too_long}
+
+def _lesson_names_from_file(content: bytes, filename: str):
+    fn = (filename or "").lower()
+    rows = []
+    try:
+        if fn.endswith((".csv", ".txt")):
+            text_ = None
+            for enc in ("utf-8-sig", "cp1251"):
+                try:
+                    text_ = content.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text_ is None:
+                raise ValueError("невідоме кодування")
+            rows = [re.split(r"[;\t]", line) for line in text_.splitlines()]
+        else:
+            df = pd.read_excel(io.BytesIO(content), header=None, dtype=str)
+            rows = df.fillna("").values.tolist()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
+    if not rows:
+        raise HTTPException(status_code=400, detail="Файл порожній")
+    col, start = 0, 0
+    for i, cell in enumerate(rows[0]):
+        if _norm(str(cell)) in _LESSON_HEADER_WORDS:
+            col, start = i, 1
+            break
+    return [str(r[col]) for r in rows[start:] if len(r) > col]
+
+@app.post("/api/cmyo/lessons/{kind}/bulk")
+async def bulk_lesson_catalog(kind: str, data: LessonBulkSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    model = LESSON_CATALOGS.get(kind)
+    if not model:
+        raise HTTPException(status_code=404, detail="Невідомий список")
+    return _lesson_catalog_bulk(db, model, data.names)
+
+@app.post("/api/cmyo/lessons/{kind}/import")
+async def import_lesson_catalog(kind: str, file: UploadFile = File(...), user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    model = LESSON_CATALOGS.get(kind)
+    if not model:
+        raise HTTPException(status_code=404, detail="Невідомий список")
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Файл завеликий (максимум 5 МБ)")
+    return _lesson_catalog_bulk(db, model, _lesson_names_from_file(content, file.filename))
+
+@app.get("/api/cmyo/lessons/{kind}")
+async def list_lesson_catalog(kind: str, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    model = LESSON_CATALOGS.get(kind)
+    if not model:
+        raise HTTPException(status_code=404, detail="Невідомий список")
+    rows = db.query(model).order_by(model.name).all()
+    return [{"id": r.id, "name": r.name} for r in rows]
+
 def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
     lesson_date = _parse_iso_date(data.lesson_date, "Дата")
     if not lesson_date:
@@ -3855,13 +3996,13 @@ def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
     if data.subject_id is not None:
         if not db.query(DBLessonSubject.id).filter(DBLessonSubject.id == data.subject_id).first():
             raise HTTPException(status_code=400, detail="Предмет не знайдено в списку")
-    # викладач — з довідника (лише читання) або вписаний ім'я
+    # викладач — зі свого списку (lesson_teachers)
     teacher_id, teacher_name = None, _clean(data.teacher_name)
     if data.teacher_id:
-        t = db.query(DBTeacher).filter(DBTeacher.id == data.teacher_id).first()
+        t = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == data.teacher_id).first()
         if not t:
-            raise HTTPException(status_code=404, detail="Викладача не знайдено")
-        teacher_id, teacher_name = t.id, t.full_name
+            raise HTTPException(status_code=404, detail="Викладача не знайдено в списку")
+        teacher_id, teacher_name = t.id, t.name
     if not teacher_name:
         raise HTTPException(status_code=400, detail="Вкажіть викладача")
     # групи
@@ -3877,7 +4018,8 @@ def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
     # тривога
     if data.alarm not in LESSON_ALARM_OPTIONS:
         raise HTTPException(status_code=400, detail="Невірне значення «Чи є тривога?»")
-    obj.subject_id, obj.teacher_id, obj.teacher_name = data.subject_id, teacher_id, teacher_name
+    obj.subject_id, obj.lesson_teacher_id, obj.teacher_name = data.subject_id, teacher_id, teacher_name
+    obj.teacher_id = None
     obj.group_ids, obj.lesson_date = gids, lesson_date
     obj.pairs, obj.pairs_count = pairs, len(pairs)
     if data.minutes is not None:
