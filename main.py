@@ -474,6 +474,45 @@ class DBLoginAttempt(Base):
     key = Column(String, index=True, nullable=False)
     ts  = Column(Float, index=True, nullable=False)
 
+# =========================================================
+# 🧾 ПЕРЕВІРКА ПАР (ЦМЯО) — ОКРЕМІ ТАБЛИЦІ, з іншими базами не пов'язані
+# =========================================================
+LESSON_PAIR_MINUTES = 40                       # одна пара = 40 хв
+LESSON_MAX_PAIR_NO = 10
+LESSON_ALARM_OPTIONS = ("Так", "Ні", "Не відомо")
+
+class DBLessonSubject(Base):
+    """Власний список предметів для перевірки пар (наповнюється поступово)"""
+    __tablename__ = "lesson_subjects"
+    id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name      = Column(String, nullable=False)
+    name_norm = Column(String, nullable=False, unique=True, index=True)
+
+class DBLessonGroup(Base):
+    """Власний список груп/потоків для перевірки пар (наповнюється поступово)"""
+    __tablename__ = "lesson_groups"
+    id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name      = Column(String, nullable=False)
+    name_norm = Column(String, nullable=False, unique=True, index=True)
+
+class DBLessonCheck(Base):
+    """Рядок таблиці перевірки пар. На teachers лише текстове посилання (без FK)."""
+    __tablename__ = "lesson_checks"
+    id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    subject_id   = Column(Integer, nullable=True, index=True)     # lesson_subjects.id
+    teacher_id   = Column(String, nullable=True)                  # teachers.id (без FK)
+    teacher_name = Column(String, nullable=False)                 # ПІБ на момент запису
+    group_ids    = Column(JSON, default=list)                     # [lesson_groups.id, ...]
+    lesson_date  = Column(String, nullable=False, index=True)     # YYYY-MM-DD
+    pairs        = Column(JSON, default=list)                     # номери пар, напр. [1, 2]
+    pairs_count  = Column(Integer, nullable=False, default=0)
+    minutes      = Column(Integer, nullable=False, default=0)     # pairs_count * 40
+    alarm        = Column(String, nullable=False, default="Не відомо")
+    notes        = Column(String, nullable=True)
+    created_by   = Column(String, nullable=True)
+    created_at   = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
+    updated_at   = Column(String, nullable=True)
+
 Base.metadata.create_all(bind=engine)
 
 # =========================================================
@@ -3686,6 +3725,203 @@ async def save_board_state(
         db.add(DBBoardState(state=state))
     db.commit()
     return {"message": "Збережено"}
+
+# =========================================================
+# 🧾 ПЕРЕВІРКА ПАР (ЦМЯО) — API
+# Усе під /api/cmyo/lessons, доступ: ЦМЯО + суперадмін.
+# Викладачі беруться з існуючого довідника (лише читання).
+# =========================================================
+class LessonNameSchema(BaseModel):
+    name: str
+
+class LessonCheckSchema(BaseModel):
+    subject_id: Optional[int] = None
+    teacher_id: Optional[str] = None
+    teacher_name: Optional[str] = None
+    group_ids: List[int] = []
+    lesson_date: str
+    pairs: List[int] = []
+    alarm: str = "Не відомо"
+    notes: Optional[str] = None
+    minutes: Optional[int] = None      # фактично вичитано, хв (якщо не вказано — пари × 40)
+
+def _lesson_check_to_dict(c: "DBLessonCheck", subj_map: dict, grp_map: dict) -> dict:
+    gids = c.group_ids or []
+    return {
+        "id": c.id, "subject_id": c.subject_id, "subject_name": subj_map.get(c.subject_id),
+        "teacher_id": c.teacher_id, "teacher_name": c.teacher_name,
+        "group_ids": gids, "group_names": [grp_map[g] for g in gids if g in grp_map],
+        "lesson_date": c.lesson_date, "pairs": c.pairs or [],
+        "pairs_count": c.pairs_count, "minutes": c.minutes,
+        "alarm": c.alarm, "notes": c.notes,
+        "created_by": c.created_by, "created_at": c.created_at, "updated_at": c.updated_at,
+    }
+
+@app.get("/api/cmyo/lessons")
+async def list_lesson_checks(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    subjects = db.query(DBLessonSubject).order_by(DBLessonSubject.name).all()
+    groups = db.query(DBLessonGroup).order_by(DBLessonGroup.name).all()
+    subj_map = {s.id: s.name for s in subjects}
+    grp_map = {g.id: g.name for g in groups}
+    items = db.query(DBLessonCheck).order_by(DBLessonCheck.lesson_date.desc(), DBLessonCheck.id.desc()).all()
+    return {
+        "pair_minutes": LESSON_PAIR_MINUTES,
+        "max_pair_no": LESSON_MAX_PAIR_NO,
+        "alarm_options": list(LESSON_ALARM_OPTIONS),
+        "subjects": [{"id": s.id, "name": s.name} for s in subjects],
+        "groups": [{"id": g.id, "name": g.name} for g in groups],
+        "items": [_lesson_check_to_dict(c, subj_map, grp_map) for c in items],
+    }
+
+def _lesson_catalog_create(db, model, name: str, label: str):
+    name = _clean(name)
+    if not name:
+        raise HTTPException(status_code=400, detail=f"Вкажіть {label}")
+    if len(name) > 300:
+        raise HTTPException(status_code=400, detail="Занадто довга назва")
+    existing = db.query(model).filter(model.name_norm == _norm(name)).first()
+    if existing:
+        return existing                       # вже є — просто повертаємо (без дублів)
+    obj = model(name=name, name_norm=_norm(name))
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+def _lesson_catalog_rename(db, model, item_id: int, name: str, label: str):
+    obj = db.query(model).filter(model.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    name = _clean(name)
+    if not name:
+        raise HTTPException(status_code=400, detail=f"Вкажіть {label}")
+    n = _norm(name)
+    dup = db.query(model).filter(model.name_norm == n, model.id != item_id).first()
+    if dup:
+        raise HTTPException(status_code=409, detail="Такий елемент уже є в списку")
+    obj.name, obj.name_norm = name, n
+    db.commit()
+    return obj
+
+@app.post("/api/cmyo/lessons/subjects")
+async def create_lesson_subject(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    o = _lesson_catalog_create(db, DBLessonSubject, data.name, "назву предмета")
+    return {"id": o.id, "name": o.name}
+
+@app.put("/api/cmyo/lessons/subjects/{item_id}")
+async def rename_lesson_subject(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    o = _lesson_catalog_rename(db, DBLessonSubject, item_id, data.name, "назву предмета")
+    return {"id": o.id, "name": o.name}
+
+@app.delete("/api/cmyo/lessons/subjects/{item_id}")
+async def delete_lesson_subject(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonSubject).filter(DBLessonSubject.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    used = db.query(func.count(DBLessonCheck.id)).filter(DBLessonCheck.subject_id == item_id).scalar() or 0
+    if used:
+        raise HTTPException(status_code=409, detail=f"Предмет використовується в записах ({used}). Спочатку змініть їх.")
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+@app.post("/api/cmyo/lessons/groups")
+async def create_lesson_group(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    o = _lesson_catalog_create(db, DBLessonGroup, data.name, "назву групи")
+    return {"id": o.id, "name": o.name}
+
+@app.put("/api/cmyo/lessons/groups/{item_id}")
+async def rename_lesson_group(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    o = _lesson_catalog_rename(db, DBLessonGroup, item_id, data.name, "назву групи")
+    return {"id": o.id, "name": o.name}
+
+@app.delete("/api/cmyo/lessons/groups/{item_id}")
+async def delete_lesson_group(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonGroup).filter(DBLessonGroup.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    used = sum(1 for c in db.query(DBLessonCheck.group_ids).all() if item_id in (c[0] or []))
+    if used:
+        raise HTTPException(status_code=409, detail=f"Група використовується в записах ({used}). Спочатку змініть їх.")
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
+
+def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
+    lesson_date = _parse_iso_date(data.lesson_date, "Дата")
+    if not lesson_date:
+        raise HTTPException(status_code=400, detail="Вкажіть дату")
+    # предмет
+    if data.subject_id is not None:
+        if not db.query(DBLessonSubject.id).filter(DBLessonSubject.id == data.subject_id).first():
+            raise HTTPException(status_code=400, detail="Предмет не знайдено в списку")
+    # викладач — з довідника (лише читання) або вписаний ім'я
+    teacher_id, teacher_name = None, _clean(data.teacher_name)
+    if data.teacher_id:
+        t = db.query(DBTeacher).filter(DBTeacher.id == data.teacher_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Викладача не знайдено")
+        teacher_id, teacher_name = t.id, t.full_name
+    if not teacher_name:
+        raise HTTPException(status_code=400, detail="Вкажіть викладача")
+    # групи
+    gids = list(dict.fromkeys(data.group_ids or []))
+    if gids:
+        found = {r[0] for r in db.query(DBLessonGroup.id).filter(DBLessonGroup.id.in_(gids)).all()}
+        if set(gids) - found:
+            raise HTTPException(status_code=400, detail="Групу не знайдено в списку")
+    # пари
+    pairs = sorted(set(data.pairs or []))
+    if any((p < 1 or p > LESSON_MAX_PAIR_NO) for p in pairs):
+        raise HTTPException(status_code=400, detail=f"Номер пари має бути від 1 до {LESSON_MAX_PAIR_NO}")
+    # тривога
+    if data.alarm not in LESSON_ALARM_OPTIONS:
+        raise HTTPException(status_code=400, detail="Невірне значення «Чи є тривога?»")
+    obj.subject_id, obj.teacher_id, obj.teacher_name = data.subject_id, teacher_id, teacher_name
+    obj.group_ids, obj.lesson_date = gids, lesson_date
+    obj.pairs, obj.pairs_count = pairs, len(pairs)
+    if data.minutes is not None:
+        if data.minutes < 0 or data.minutes > 1000:
+            raise HTTPException(status_code=400, detail="Хвилини мають бути від 0 до 1000")
+        obj.minutes = data.minutes
+    else:
+        obj.minutes = len(pairs) * LESSON_PAIR_MINUTES
+    obj.alarm = data.alarm
+    obj.notes = (data.notes or "").strip() or None
+    obj.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+def _lesson_check_response(db, obj):
+    subj_map = {s.id: s.name for s in db.query(DBLessonSubject).all()}
+    grp_map = {g.id: g.name for g in db.query(DBLessonGroup).all()}
+    return _lesson_check_to_dict(obj, subj_map, grp_map)
+
+@app.post("/api/cmyo/lessons")
+async def create_lesson_check(data: LessonCheckSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = DBLessonCheck(created_by=user.get("sub"))
+    _apply_lesson_check(db, obj, data)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return _lesson_check_response(db, obj)
+
+@app.put("/api/cmyo/lessons/{check_id}")
+async def update_lesson_check(check_id: int, data: LessonCheckSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonCheck).filter(DBLessonCheck.id == check_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    _apply_lesson_check(db, obj, data)
+    db.commit()
+    db.refresh(obj)
+    return _lesson_check_response(db, obj)
+
+@app.delete("/api/cmyo/lessons/{check_id}")
+async def delete_lesson_check(check_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonCheck).filter(DBLessonCheck.id == check_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Запис не знайдено")
+    db.delete(obj)
+    db.commit()
+    return {"message": "Видалено"}
 
 # =========================================================
 # 📝 ГЕНЕРАТОР ЗАЯВ ЦСК
