@@ -504,6 +504,8 @@ class DBLessonTeacher(Base):
     id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
     name      = Column(String, nullable=False)
     name_norm = Column(String, nullable=False, unique=True, index=True)
+    note      = Column(String, nullable=True)     # примітка про викладача (Zoom, вичитка пар тощо); порожньо = немає
+    note_at   = Column(String, nullable=True)     # коли примітку востаннє змінено (ISO, київський час)
 
 class DBLessonCheck(Base):
     """Рядок таблиці перевірки пар. Усі довідники — власні (lesson_*), без FK на інші таблиці."""
@@ -655,6 +657,9 @@ def _run_migrations():
         # 🧾 Перевірка пар: власний список викладачів
         "ALTER TABLE lesson_checks ADD COLUMN IF NOT EXISTS lesson_teacher_id INTEGER",
         "CREATE INDEX IF NOT EXISTS ix_lesson_checks_lesson_teacher_id ON lesson_checks (lesson_teacher_id)",
+        # 📝 Примітки до викладачів
+        "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note VARCHAR",
+        "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note_at VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3977,6 +3982,77 @@ async def delete_lesson_teacher(item_id: int, user: dict = Depends(require_cmyo_
     db.commit()
     return {"message": "Видалено"}
 
+# ── Примітки до викладачів (хто не використовує корпоративний Zoom, не вичитує пари тощо) ──
+LESSON_NOTE_MAX = 2000
+
+class LessonTeacherNoteSchema(BaseModel):
+    note: Optional[str] = None
+
+@app.put("/api/cmyo/lessons/teachers/{item_id}/note")
+async def set_lesson_teacher_note(item_id: int, data: LessonTeacherNoteSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    note = re.sub(r"\n{3,}", "\n\n", (data.note or "").replace("\r\n", "\n").strip())
+    if len(note) > LESSON_NOTE_MAX:
+        raise HTTPException(status_code=400, detail=f"Примітка задовга (максимум {LESSON_NOTE_MAX} символів)")
+    obj.note = note or None                      # порожня примітка = її немає
+    obj.note_at = _sched_iso(_sched_now()) if note else None
+    db.commit()
+    return {"id": obj.id, "note": obj.note, "note_at": obj.note_at}
+
+@app.get("/api/cmyo/lessons/teachers/export")
+async def export_lesson_teacher_notes(contains: Optional[str] = Query(default=None), only_notes: bool = Query(default=True),
+                                      user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Таблиця Excel: викладачі, у яких щось написано в примітці (опційно — лише ті, де примітка містить фрагмент тексту)."""
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+    needle = _norm(contains or "")
+    rows = [t for t in db.query(DBLessonTeacher).all()
+            if (not only_notes or (t.note or "").strip()) and (not needle or needle in _norm(t.note or ""))]
+    if not rows:
+        raise HTTPException(status_code=404, detail="Немає викладачів із примітками за цим фільтром")
+    rows.sort(key=lambda t: t.name.lower())
+    today = _sched_now()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Примітки"
+    ws["A1"] = "Викладачі з примітками"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = f"Станом на {today.strftime('%d.%m.%Y')} · записів: {len(rows)}" + (f" · фільтр: «{contains.strip()}»" if needle else "")
+    ws["A2"].font = Font(color="666666", size=10)
+    head = ["№", "Викладач", "Примітка", "Змінено"]
+    thin = Side(style="thin", color="BBBBBB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for j, h in enumerate(head, 1):
+        c = ws.cell(row=4, column=j, value=h)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="1F3A5F")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = border
+    for i, t in enumerate(rows, 1):
+        vals = [i, t.name, t.note or "", _sched_fmt_label(t.note_at) or ""]
+        for j, v in enumerate(vals, 1):
+            c = ws.cell(row=4 + i, column=j, value=v)
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=True, horizontal="center" if j in (1, 4) else "left")
+    for j, w in enumerate([6, 30, 90, 18], 1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = "A5"
+    ws.auto_filter.ref = f"A4:D{4 + len(rows)}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    fname = f"vykladachi_prymitky_{today.strftime('%Y-%m-%d')}.xlsx"
+    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
+
 # ── Масове додавання / імпорт зі списку чи файлу (для предметів, груп, викладачів) ──
 LESSON_CATALOGS = {"subjects": DBLessonSubject, "groups": DBLessonGroup, "teachers": DBLessonTeacher}
 _LESSON_HEADER_WORDS = {"працівник", "піб", "викладач", "викладачі", "прізвище", "назва", "предмет", "предмети", "група", "групи", "потік", "потоки"}
@@ -4061,6 +4137,8 @@ async def list_lesson_catalog(kind: str, user: dict = Depends(require_cmyo_admin
     if not model:
         raise HTTPException(status_code=404, detail="Невідомий список")
     rows = db.query(model).order_by(model.name).all()
+    if kind == "teachers":
+        return [{"id": r.id, "name": r.name, "note": r.note, "note_at": r.note_at} for r in rows]
     return [{"id": r.id, "name": r.name} for r in rows]
 
 def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
@@ -4890,7 +4968,7 @@ async def schedule_overview(date_from: str, date_to: Optional[str] = None,
         overlap = _sched_overlap_minutes(slot_s, slot_e, ivs)
         covered = any(a <= slot_s and slot_e <= b + timedelta(minutes=5) for a, b in cov)
         status = _sched_lesson_status(it, slot_s, slot_e, overlap, bool(acc_by_teacher.get(t.id)), covered, global_until)
-        card = cards.setdefault(t.id, {"id": t.id, "name": t.name, "has_account": bool(acc_by_teacher.get(t.id)),
+        card = cards.setdefault(t.id, {"id": t.id, "name": t.name, "has_account": bool(acc_by_teacher.get(t.id)), "note": t.note,
                                        "counts": defaultdict(int), "planned_min": 0, "conducted_min": 0, "lessons": [], "other_meetings": []})
         card["counts"][status] += 1
         if status in ("ok", "partial", "missed"):
