@@ -16,4 +16,4 @@ shevchenko
 docxtpl
 num2words
 psycopg-binary
-pip install py7zr
+py7zr
