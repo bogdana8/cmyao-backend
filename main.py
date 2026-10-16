@@ -4282,6 +4282,60 @@ def _sched_parse_workbook(content: bytes, fname: str) -> dict:
     return {"owner": owner, "period_from": period_from, "period_to": period_to,
             "lessons": lessons, "skipped_cancelled": skipped_cancelled}
 
+def _sched_read_7z(content: bytes, accept, check):
+    """Розпаковка .7z. Основний шлях — ПОВНІСТЮ В ПАМ'ЯТІ (не залежить від прав файлової системи сервера);
+    старіші версії py7zr та запис у тимчасову папку — лише запасні варіанти."""
+    import py7zr
+    with py7zr.SevenZipFile(io.BytesIO(content)) as z:
+        infos = [i for i in z.list() if not i.is_directory and accept(i.filename)]
+        check([i.uncompressed for i in infos])
+    names = [i.filename for i in infos]
+    if not names:
+        return []
+    errors = []
+    # 1) у пам'яті (py7zr ≥ 0.21 / 1.x)
+    try:
+        from py7zr.io import BytesIOFactory
+        with py7zr.SevenZipFile(io.BytesIO(content)) as z:
+            factory = BytesIOFactory(SCHED_MAX_MEMBER_BYTES + 1)
+            z.extract(targets=names, factory=factory)
+        out = []
+        for name, bio in factory.products.items():
+            bio.seek(0)
+            out.append((name, bio.read()))
+        if out:
+            return out
+    except Exception as e:
+        errors.append(f"memory: {e}")
+    # 2) старіший API py7zr (read / readall)
+    try:
+        with py7zr.SevenZipFile(io.BytesIO(content)) as z:
+            data = z.read(targets=names) if hasattr(z, "read") else z.readall()
+        out = [(n, b.read()) for n, b in data.items() if n in names]
+        if out:
+            return out
+    except Exception as e:
+        errors.append(f"read: {e}")
+    # 3) тимчасова папка: заздалегідь створюємо підпапки з правами на запис
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for n in names:
+                os.makedirs(os.path.join(tmp, os.path.dirname(n)), mode=0o777, exist_ok=True)
+            with py7zr.SevenZipFile(io.BytesIO(content)) as z:
+                z.extract(path=tmp, targets=names)
+            base, out = os.path.realpath(tmp), []
+            for n in names:
+                p = os.path.realpath(os.path.join(tmp, n))
+                if p.startswith(base + os.sep) and os.path.isfile(p):
+                    with open(p, "rb") as fh:
+                        out.append((n, fh.read()))
+            if out:
+                return out
+    except Exception as e:
+        errors.append(f"disk: {e}")
+    raise HTTPException(status_code=400, detail="Не вдалося розпакувати .7z (" + "; ".join(errors) + "). Спробуйте завантажити .zip")
+
 def _sched_extract_members(content: bytes, filename: str):
     """Список (ім'я, байти) xlsx-файлів з архіву. Нічого не пишемо на диск; обмеження від zip-бомб."""
     fn = (filename or "").lower()
@@ -4305,20 +4359,7 @@ def _sched_extract_members(content: bytes, filename: str):
                 import py7zr
             except ImportError:
                 raise HTTPException(status_code=500, detail="На сервері не встановлено py7zr (pip install py7zr). Можна завантажити .zip.")
-            import tempfile
-            with tempfile.TemporaryDirectory() as tmp:           # розпаковуємо лише потрібні .xlsx і одразу видаляємо
-                with py7zr.SevenZipFile(io.BytesIO(content)) as z:
-                    infos = [i for i in z.list() if not i.is_directory and accept(i.filename)]
-                    check([i.uncompressed for i in infos])
-                    if infos:
-                        z.extract(path=tmp, targets=[i.filename for i in infos])
-                base, out = os.path.realpath(tmp), []
-                for i in infos:
-                    p = os.path.realpath(os.path.join(tmp, i.filename))
-                    if p.startswith(base + os.sep) and os.path.isfile(p):       # захист від виходу за межі папки
-                        with open(p, "rb") as fh:
-                            out.append((i.filename, fh.read()))
-                return out
+            return _sched_read_7z(content, accept, check)
     except HTTPException:
         raise
     except Exception as e:
