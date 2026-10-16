@@ -19,6 +19,9 @@ import re
 import os
 import time
 import shutil
+import hashlib
+import zipfile
+import difflib
 from collections import defaultdict
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -520,6 +523,75 @@ class DBLessonCheck(Base):
     created_by   = Column(String, nullable=True)
     created_at   = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
     updated_at   = Column(String, nullable=True)
+
+# =========================================================
+# 📅 РОЗКЛАД ↔ ZOOM (ЦМЯО) — ТАБЛИЦІ
+# Розклад із архіву прив'язується ТІЛЬКИ до викладачів зі списку lesson_teachers
+# (за id), нових викладачів завантаження не створює.
+# =========================================================
+SCHED_SLOT_MINUTES = 80                                   # тривалість одного слота розкладу (пари), хв
+SCHED_SLOT_STARTS = ["09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:30"]   # початки слотів 1..7
+SCHED_OK_RATIO = 0.6                                      # «проведено»: у Zoom ≥ 60% слота
+SCHED_MIN_PARTIAL_MIN = 10                                # менше 10 хв у слоті — не враховуємо (тест зв'язку)
+
+class DBLessonSchedBatch(Base):
+    """Журнал завантажень: що, коли й ким завантажено (розклад або звіт Zoom)"""
+    __tablename__ = "lesson_sched_batches"
+    id          = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    kind        = Column(String, nullable=False, index=True)          # 'schedule' | 'zoom'
+    filename    = Column(String, nullable=True)
+    period_from = Column(String, nullable=True)                       # розклад: YYYY-MM-DD; zoom: YYYY-MM-DDTHH:MM:SS
+    period_to   = Column(String, nullable=True)
+    data_until  = Column(String, nullable=True)                       # zoom: до якого моменту дані вважаються повними
+    stats       = Column(JSON, default=dict)
+    created_by  = Column(String, nullable=True)
+    created_at  = Column(String, nullable=False)                      # ISO, час Києва
+
+class DBLessonSchedItem(Base):
+    """Пара за розкладом: ця пара ПОВИННА відбутися у цього викладача в цей час"""
+    __tablename__ = "lesson_sched_items"
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    fingerprint       = Column(String, nullable=False, unique=True, index=True)   # захист від дублів при повторному завантаженні
+    lesson_teacher_id = Column(Integer, nullable=False, index=True)               # lesson_teachers.id
+    lesson_date       = Column(String, nullable=False, index=True)                # YYYY-MM-DD
+    start_time        = Column(String, nullable=False)                            # HH:MM
+    slot_no           = Column(Integer, nullable=True)
+    subject_name      = Column(String, nullable=False)
+    lesson_type       = Column(String, nullable=True)                             # ЛК / ПР / ЛБ
+    groups_text       = Column(String, nullable=True)
+    place             = Column(String, nullable=True)
+    is_online         = Column(Boolean, nullable=False, default=True)
+    zoom_meeting_id   = Column(String, nullable=True)                             # якщо в розкладі є пряме посилання Zoom
+    note              = Column(String, nullable=True)
+    source_owner      = Column(String, nullable=True)                             # чий файл (може відрізнятися від викладача при заміні)
+    batch_id          = Column(Integer, nullable=True, index=True)
+    created_at        = Column(String, nullable=True)
+    updated_at        = Column(String, nullable=True)
+
+class DBLessonZoomAccount(Base):
+    """Акаунт Zoom (організатор). Зіставляється з викладачем зі списку; зіставлення запам'ятовується."""
+    __tablename__ = "lesson_zoom_accounts"
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    email_key         = Column(String, nullable=False, unique=True, index=True)   # e-mail (нижній регістр) або name:<ім'я>
+    display_name      = Column(String, nullable=True)
+    lesson_teacher_id = Column(Integer, nullable=True, index=True)                # lesson_teachers.id
+    link_status       = Column(String, nullable=False, default="none")           # auto | manual | none | ignored
+    created_at        = Column(String, nullable=True)
+
+class DBLessonZoomMeeting(Base):
+    """Зустріч Zoom зі звіту (хто, коли, скільки)"""
+    __tablename__ = "lesson_zoom_meetings"
+    id              = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    fingerprint     = Column(String, nullable=False, unique=True, index=True)     # id зустрічі + початок + e-mail
+    meeting_id      = Column(String, nullable=True, index=True)                   # лише цифри
+    topic           = Column(String, nullable=True)
+    organizer_name  = Column(String, nullable=True)
+    account_id      = Column(Integer, nullable=True, index=True)                  # lesson_zoom_accounts.id
+    start_dt        = Column(String, nullable=False, index=True)                  # YYYY-MM-DDTHH:MM:SS
+    end_dt          = Column(String, nullable=False)
+    duration_sec    = Column(Integer, nullable=False, default=0)
+    participants    = Column(Integer, nullable=True)
+    batch_id        = Column(Integer, nullable=True, index=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -3898,6 +3970,9 @@ async def delete_lesson_teacher(item_id: int, user: dict = Depends(require_cmyo_
     used = db.query(func.count(DBLessonCheck.id)).filter(DBLessonCheck.lesson_teacher_id == item_id).scalar() or 0
     if used:
         raise HTTPException(status_code=409, detail=f"Викладач використовується в записах ({used}). Спочатку змініть їх.")
+    # похідні дані розкладу: пари цього викладача видаляємо, акаунти Zoom відв'язуємо
+    db.query(DBLessonSchedItem).filter(DBLessonSchedItem.lesson_teacher_id == item_id).delete(synchronize_session=False)
+    db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.lesson_teacher_id == item_id).update({"lesson_teacher_id": None, "link_status": "none"})
     db.delete(obj)
     db.commit()
     return {"message": "Видалено"}
@@ -4064,6 +4139,817 @@ async def delete_lesson_check(check_id: int, user: dict = Depends(require_cmyo_a
     db.delete(obj)
     db.commit()
     return {"message": "Видалено"}
+
+# =========================================================
+# 📅 РОЗКЛАД ↔ ZOOM (ЦМЯО) — API
+# 1) Завантаження архіву розкладу (.7z/.zip/.xlsx): це пари, які викладачі ПОВИННІ провести.
+#    Повторне завантаження дублів не створює (відбиток пари), зміни в розкладі підтягуються.
+# 2) Завантаження звіту Zoom (.csv/.xlsx): хто, коли й скільки проводив.
+# 3) Зіставлення: пара за розкладом ↔ зустрічі Zoom цього викладача в цей день і час.
+# Усе доступно ЦМЯО + суперадміну; викладачі — лише зі списку lesson_teachers.
+# =========================================================
+SCHED_MAX_FILES = 600
+SCHED_MAX_MEMBER_BYTES = 5 * 1024 * 1024
+SCHED_MAX_TOTAL_BYTES = 150 * 1024 * 1024
+SCHED_MAX_UPLOAD_BYTES = 60 * 1024 * 1024
+ZOOM_MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+
+def _sched_now() -> datetime:
+    """Поточний київський час (без tzinfo) — звіти Zoom і розклад у місцевому часі."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(os.environ.get("APP_TIMEZONE", "Europe/Kyiv"))).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
+def _sched_iso(dt_: datetime) -> str:
+    return dt_.strftime("%Y-%m-%dT%H:%M:%S")
+
+def _sched_dt(s: str) -> datetime:
+    return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+
+def _sched_fmt_label(iso: Optional[str]) -> Optional[str]:
+    if not iso:
+        return None
+    try:
+        return _sched_dt(iso).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso
+
+# ── Розбір розкладу ─────────────────────────────────────────────
+_SCHED_HEADERS = {
+    "date": ("дата",), "time": ("час",), "subject": ("назва",), "type": ("тип",),
+    "groups": ("групи", "група"), "teachers": ("викладачі", "викладач"),
+    "place": ("місце проведення", "місце"), "status": ("статус",), "desc": ("опис",), "note": ("примітка",),
+}
+
+def _sched_cell_date(v) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    try:
+        if isinstance(v, datetime):
+            return v.strftime("%Y-%m-%d")
+        if hasattr(v, "strftime") and not hasattr(v, "hour"):
+            return v.strftime("%Y-%m-%d")
+        s = str(v).strip()
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+        if m:
+            datetime.strptime(m.group(0), "%Y-%m-%d")
+            return m.group(0)
+        m = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})", s)
+        if m:
+            iso = f"{int(m.group(3)):04d}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+            datetime.strptime(iso, "%Y-%m-%d")
+            return iso
+    except ValueError:
+        return None
+    return None
+
+def _sched_cell_time(v) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.strftime("%H:%M")
+    if hasattr(v, "hour") and hasattr(v, "minute"):
+        return f"{v.hour:02d}:{v.minute:02d}"
+    if isinstance(v, (int, float)) and 0 <= float(v) < 1:
+        mins = round(float(v) * 24 * 60)
+        return f"{mins // 60:02d}:{mins % 60:02d}"
+    m = re.match(r"^(\d{1,2})[:.](\d{2})", str(v).strip())
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return None
+
+def _sched_short_from_filename(fname: str) -> str:
+    """'Андрущенко_Ганна_Іванівна.xlsx' → 'Андрущенко Г. І.' (запасний варіант, якщо немає заголовка)"""
+    stem = re.sub(r"\.xlsx$", "", (fname or "").replace("\\", "/").split("/")[-1], flags=re.I)
+    parts = [p for p in stem.replace("_", " ").split() if p]
+    if not parts:
+        return ""
+    return " ".join([parts[0]] + [p[0].upper() + "." for p in parts[1:3]])
+
+def _sched_parse_workbook(content: bytes, fname: str) -> dict:
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    try:
+        ws = wb["Розклад"] if "Розклад" in wb.sheetnames else wb.worksheets[0]
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()
+    hdr_i, cols = None, {}
+    for i, r in enumerate(rows[:15]):
+        names = [_norm(str(c)) if c is not None else "" for c in r]
+        if "дата" in names and "час" in names:
+            hdr_i = i
+            for key, variants in _SCHED_HEADERS.items():
+                for j, nm in enumerate(names):
+                    if nm in variants:
+                        cols[key] = j
+                        break
+            break
+    if hdr_i is None or not {"date", "time", "subject"} <= set(cols):
+        raise ValueError("не знайдено таблицю розкладу (колонки «Дата», «Час», «Назва»)")
+    title = str(rows[0][0]).strip() if rows and rows[0] and rows[0][0] else ""
+    owner = re.sub(r"^розклад\s*:\s*", "", title, flags=re.I).strip() or _sched_short_from_filename(fname)
+    period_from = period_to = None
+    for r in rows[:hdr_i]:
+        txt = " ".join(str(c) for c in r if c)
+        m = re.search(r"(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2})\.(\d{2})\.(\d{4})", txt)
+        if m:
+            period_from, period_to = f"{m.group(3)}-{m.group(2)}-{m.group(1)}", f"{m.group(6)}-{m.group(5)}-{m.group(4)}"
+            break
+    get = lambda r, k: (r[cols[k]] if k in cols and cols[k] < len(r) else None)
+    lessons, skipped_cancelled = [], 0
+    for r in rows[hdr_i + 1:]:
+        d, t = _sched_cell_date(get(r, "date")), _sched_cell_time(get(r, "time"))
+        subj = _clean(str(get(r, "subject") or ""))
+        if not d or not t or not subj:
+            continue
+        status = _norm(str(get(r, "status") or ""))
+        if "скас" in status or "відмін" in status:
+            skipped_cancelled += 1
+            continue
+        lessons.append({
+            "date": d, "time": t, "subject": subj,
+            "type": _clean(str(get(r, "type") or "")) or None,
+            "groups": _clean(str(get(r, "groups") or "")) or None,
+            "teachers": _clean(str(get(r, "teachers") or "")),
+            "place": _clean(str(get(r, "place") or "")) or None,
+            "note": _clean(" ".join(str(x) for x in (get(r, "desc"), get(r, "note")) if x)) or None,
+        })
+    if not period_from and lessons:
+        period_from, period_to = min(l["date"] for l in lessons), max(l["date"] for l in lessons)
+    return {"owner": owner, "period_from": period_from, "period_to": period_to,
+            "lessons": lessons, "skipped_cancelled": skipped_cancelled}
+
+def _sched_extract_members(content: bytes, filename: str):
+    """Список (ім'я, байти) xlsx-файлів з архіву. Нічого не пишемо на диск; обмеження від zip-бомб."""
+    fn = (filename or "").lower()
+    accept = lambda n: (n.replace("\\", "/").split("/")[-1].lower().endswith(".xlsx")
+                        and not n.replace("\\", "/").split("/")[-1].startswith("~$") and "__macosx" not in n.lower())
+    def check(sizes):
+        if len(sizes) > SCHED_MAX_FILES:
+            raise HTTPException(status_code=400, detail=f"В архіві забагато файлів (максимум {SCHED_MAX_FILES})")
+        if any(s > SCHED_MAX_MEMBER_BYTES for s in sizes) or sum(sizes) > SCHED_MAX_TOTAL_BYTES:
+            raise HTTPException(status_code=400, detail="Файли в архіві завеликі")
+    try:
+        if fn.endswith(".xlsx"):
+            return [(filename, content)]
+        if fn.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                infos = [i for i in z.infolist() if not i.is_dir() and accept(i.filename)]
+                check([i.file_size for i in infos])
+                return [(i.filename, z.read(i)) for i in infos]
+        if fn.endswith(".7z"):
+            try:
+                import py7zr
+            except ImportError:
+                raise HTTPException(status_code=500, detail="На сервері не встановлено py7zr (pip install py7zr). Можна завантажити .zip.")
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:           # розпаковуємо лише потрібні .xlsx і одразу видаляємо
+                with py7zr.SevenZipFile(io.BytesIO(content)) as z:
+                    infos = [i for i in z.list() if not i.is_directory and accept(i.filename)]
+                    check([i.uncompressed for i in infos])
+                    if infos:
+                        z.extract(path=tmp, targets=[i.filename for i in infos])
+                base, out = os.path.realpath(tmp), []
+                for i in infos:
+                    p = os.path.realpath(os.path.join(tmp, i.filename))
+                    if p.startswith(base + os.sep) and os.path.isfile(p):       # захист від виходу за межі папки
+                        with open(p, "rb") as fh:
+                            out.append((i.filename, fh.read()))
+                return out
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося розпакувати архів: {e}")
+    raise HTTPException(status_code=400, detail="Підтримуються архіви .7z, .zip або окремі файли .xlsx")
+
+def _sched_fingerprint(teacher_id: int, date_: str, time_: str, subject: str, ltype, groups) -> str:
+    g = sorted({_norm(x) for x in re.split(r"[;,]", groups or "") if _norm(x)})
+    raw = "|".join([str(teacher_id), date_, time_, _norm(subject), _norm(ltype or ""), ",".join(g)])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def _sched_is_online(place: Optional[str]) -> bool:
+    p = _norm(place or "")
+    return (not p) or p.startswith("онлайн") or "zoom" in p or "визначено" in p
+
+def _sched_zoom_id(place: Optional[str]) -> Optional[str]:
+    m = re.search(r"zoom\.us/(?:j|wc/join|s)/(\d{9,11})", place or "", flags=re.I)
+    return m.group(1) if m else None
+
+def _sched_split_teachers(raw: str):
+    return [p.strip() for p in re.split(r"\s*[;,]\s*", raw or "") if p.strip()]
+
+def _sched_process_archive(db, content: bytes, filename: str, user_sub, dry_run: bool) -> dict:
+    members = _sched_extract_members(content, filename)
+    if not members:
+        raise HTTPException(status_code=400, detail="В архіві немає файлів .xlsx")
+    teachers = db.query(DBLessonTeacher).all()
+    tmap = {t.name_norm: t for t in teachers}
+
+    failed, found, total_rows, dups = [], {}, 0, 0
+    unknown = defaultdict(int)
+    covered = {}                                   # teacher_id → (період від, до) — для видалення зниклих пар
+    skipped_cancelled = 0
+    for name, data in members:
+        try:
+            p = _sched_parse_workbook(data, name)
+        except Exception as e:
+            failed.append({"file": name.replace("\\", "/").split("/")[-1], "error": str(e)})
+            continue
+        skipped_cancelled += p["skipped_cancelled"]
+        owner_t = tmap.get(_norm(p["owner"]))
+        if owner_t and p["period_from"] and p["period_to"]:
+            old = covered.get(owner_t.id)
+            covered[owner_t.id] = (min(old[0], p["period_from"]), max(old[1], p["period_to"])) if old else (p["period_from"], p["period_to"])
+        for l in p["lessons"]:
+            total_rows += 1
+            names = _sched_split_teachers(l["teachers"]) or [p["owner"]]
+            for tn in names:
+                t = tmap.get(_norm(tn))
+                if not t:
+                    unknown[tn] += 1                 # ТІЛЬКИ викладачі зі списку — інших не створюємо
+                    continue
+                fp = _sched_fingerprint(t.id, l["date"], l["time"], l["subject"], l["type"], l["groups"])
+                if fp in found:
+                    dups += 1                         # той самий урок у файлах двох викладачів (заміна)
+                    # «чий файл» — не залежить від порядку файлів: віддаємо перевагу власнику, відмінному від викладача
+                    if _norm(found[fp]["owner"]) == t.name_norm and _norm(p["owner"]) != t.name_norm:
+                        found[fp]["owner"] = p["owner"]
+                    continue
+                found[fp] = {**l, "teacher_id": t.id, "fingerprint": fp, "owner": p["owner"]}
+
+    dates = [v["date"] for v in found.values()] + [c[0] for c in covered.values()] + [c[1] for c in covered.values()]
+    d_min, d_max = (min(dates), max(dates)) if dates else (None, None)
+    existing = {}
+    if d_min:
+        for it in db.query(DBLessonSchedItem).filter(DBLessonSchedItem.lesson_date >= d_min, DBLessonSchedItem.lesson_date <= d_max).all():
+            existing[it.fingerprint] = it
+
+    added, updated, unchanged, removed = [], [], 0, []
+    for fp, v in found.items():
+        slot = SCHED_SLOT_STARTS.index(v["time"]) + 1 if v["time"] in SCHED_SLOT_STARTS else None
+        fields = dict(slot_no=slot, subject_name=v["subject"], lesson_type=v["type"], groups_text=v["groups"], place=v["place"],
+                      is_online=_sched_is_online(v["place"]), zoom_meeting_id=_sched_zoom_id(v["place"]), note=v["note"], source_owner=v["owner"])
+        cur = existing.get(fp)
+        if cur is None:
+            added.append((v, fields))
+        elif any(getattr(cur, k) != val for k, val in fields.items()):
+            updated.append((cur, fields))
+        else:
+            unchanged += 1
+    for fp, it in existing.items():
+        cov = covered.get(it.lesson_teacher_id)
+        if fp not in found and cov and cov[0] <= it.lesson_date <= cov[1]:
+            removed.append(it)
+
+    period_from = min((c[0] for c in covered.values()), default=d_min)
+    period_to = max((c[1] for c in covered.values()), default=d_max)
+    stats = {
+        "dry_run": dry_run, "files": len(members), "files_failed": failed,
+        "teachers_in_archive": len(covered), "rows_in_files": total_rows, "unique_lessons": len(found),
+        "duplicates_in_files": dups, "added": len(added), "updated": len(updated), "unchanged": unchanged,
+        "removed": len(removed), "skipped_cancelled": skipped_cancelled,
+        "unknown_teachers": sorted(({"name": k, "lessons": v} for k, v in unknown.items()), key=lambda x: -x["lessons"]),
+        "period_from": period_from, "period_to": period_to,
+    }
+    if dry_run:
+        return stats
+    if not found and not covered:
+        raise HTTPException(status_code=400, detail="У файлах немає жодної пари зі списку викладачів")
+    now_iso = _sched_iso(_sched_now())
+    batch = DBLessonSchedBatch(kind="schedule", filename=filename, period_from=period_from, period_to=period_to,
+                               stats={k: v for k, v in stats.items() if k != "unknown_teachers"} | {"unknown_count": len(unknown)},
+                               created_by=user_sub, created_at=now_iso)
+    db.add(batch)
+    db.flush()
+    for v, f in added:
+        db.add(DBLessonSchedItem(fingerprint=v["fingerprint"], lesson_teacher_id=v["teacher_id"], lesson_date=v["date"],
+                                 start_time=v["time"], batch_id=batch.id, created_at=now_iso, **f))
+    for cur, f in updated:
+        for k, val in f.items():
+            setattr(cur, k, val)
+        cur.updated_at, cur.batch_id = now_iso, batch.id
+    for it in removed:
+        db.delete(it)
+    db.commit()
+    stats["batch_id"] = batch.id
+    return stats
+
+# ── Розбір звіту Zoom ───────────────────────────────────────────
+_ZM_COLS = {
+    "meeting_id": ("идентификатор конференции", "идентификатор встречи", "meeting id", "id конференції", "ідентифікатор конференції", "id совещания"),
+    "topic": ("тема", "topic"),
+    "organizer": ("организатор", "організатор", "host", "host name"),
+    "email": ("эл. почта", "ел. пошта", "електронна пошта", "email", "user email", "host email"),
+    "start": ("время начала", "час початку", "start time"),
+    "end": ("время завершения", "час завершення", "end time"),
+    "duration": ("продолжительность", "тривалість", "duration"),
+    "participants": ("участники", "учасники", "participants"),
+}
+_ZM_POS = {"meeting_id": 0, "topic": 1, "organizer": 2, "email": 3, "start": 10, "end": 11, "duration": 12, "participants": 13}
+_ZM_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+              "січ": 1, "лют": 2, "бер": 3, "кві": 4, "тра": 5, "чер": 6, "лип": 7, "сер": 8, "вер": 9, "жов": 10, "лис": 11, "гру": 12,
+              "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
+
+def _zm_parse_dt(v) -> Optional[datetime]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.replace(microsecond=0)
+    s = str(v).strip()
+    m = re.match(r"^(\d{1,2})\s+([A-Za-zА-Яа-яІіЇїЄє]{3})[A-Za-zА-Яа-яІіЇїЄє]*\.?\s+(\d{4})[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?", s)
+    if m:
+        mon = _ZM_MONTHS.get(m.group(2).lower())
+        if mon:
+            return _zm_build(int(m.group(3)), mon, int(m.group(1)), m.group(4), m.group(5), m.group(6), m.group(7))
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?", s)
+    if m:
+        return _zm_build(int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4), m.group(5), m.group(6), m.group(7))
+    m = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])?", s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        day, mon = (a, b) if "." in s[:6] or a > 12 else (b, a) if b > 12 else (a, b)
+        return _zm_build(int(m.group(3)), mon, day, m.group(4), m.group(5), m.group(6), m.group(7))
+    return None
+
+def _zm_build(y, mo, d, h, mi, s, ap) -> Optional[datetime]:
+    try:
+        h = int(h)
+        if ap:
+            h = h % 12 + (12 if ap.lower() == "pm" else 0)
+        return datetime(y, mo, d, h, int(mi), int(s or 0))
+    except ValueError:
+        return None
+
+def _zm_parse_duration(v, minutes_unit: bool) -> Optional[int]:
+    if v is None or v == "":
+        return None
+    if hasattr(v, "hour") and hasattr(v, "minute"):
+        return v.hour * 3600 + v.minute * 60 + getattr(v, "second", 0)
+    s = str(v).strip()
+    m = re.match(r"^(\d+):(\d{2}):(\d{2})$", s)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    m = re.match(r"^(\d+):(\d{2})$", s)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    try:
+        n = float(s.replace(",", "."))
+        return int(round(n * 60)) if minutes_unit else int(round(n))
+    except ValueError:
+        return None
+
+def _zm_read_rows(content: bytes, filename: str):
+    fn = (filename or "").lower()
+    if fn.endswith((".xlsx", ".xls")):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        try:
+            return [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+        finally:
+            wb.close()
+    text_ = None
+    for enc in ("utf-8-sig", "utf-16", "cp1251"):
+        try:
+            text_ = content.decode(enc)
+            break
+        except UnicodeError:
+            continue
+    if text_ is None:
+        raise HTTPException(status_code=400, detail="Невідоме кодування файлу")
+    first = text_.split("\n", 1)[0]
+    delim = max((",", ";", "\t"), key=lambda d: first.count(d))
+    import csv as _csv
+    return [r for r in _csv.reader(io.StringIO(text_), delimiter=delim)]
+
+def _zm_email_key(email: str, organizer: str) -> str:
+    e = (email or "").strip().strip("'\"` ").lower()
+    if "@" in e:
+        return e
+    return "name:" + _norm(organizer)[:120]
+
+# ── Зіставлення акаунтів Zoom з викладачами ─────────────────────
+_ZM_CYR = {'а':'a','б':'b','в':'v','г':'h','ґ':'g','д':'d','е':'e','є':'e','ж':'zh','з':'z','и':'y','і':'i','ї':'i','й':'i',
+           'к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch',
+           'ш':'sh','щ':'sch','ю':'iu','я':'ia','ь':'','ъ':'','ы':'y','э':'e','ё':'io'}
+
+def _zm_fold(s: str) -> str:
+    """Фонетичний ключ: укр/рос/лат написання одного прізвища дають однаковий (або дуже схожий) рядок."""
+    s = (s or "").lower()
+    for ch in ("’", "ʼ", "`", "´", "'", "-"):
+        s = s.replace(ch, "")
+    t = "".join(_ZM_CYR.get(ch, ch) for ch in s)
+    t = t.replace("sch", "sh").replace("tch", "ch").replace("tsy", "tsi")
+    t = re.sub(r"ii|iy|yi|yy", "i", t)
+    t = t.replace("y", "i").replace("j", "i").replace("w", "v").replace("x", "ks").replace("q", "k")
+    t = t.replace("kh", "h").replace("ck", "k").replace("c", "k").replace("g", "h")
+    t = t.replace("ia", "a").replace("iu", "u").replace("ie", "e").replace("io", "o")
+    t = re.sub(r"(.)\1+", r"\1", t)
+    return re.sub(r"[^a-z]", "", t)
+
+def _zm_sim(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if min(len(a), len(b)) < 5:
+        return 1.0 if a == b else 0.0          # короткі прізвища — лише точний збіг
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+def _zm_clean_display(n: str) -> str:
+    n = re.sub(r"\(.*?\)", " ", n or "")
+    n = re.sub(r"\s[-–—]\s.*$", "", n)
+    n = re.sub(r"[-–—](suet|duet)\b", "", n, flags=re.I)
+    return re.sub(r"\s+", " ", n).strip()
+
+def _zm_teacher_index(teachers):
+    out = []
+    for t in teachers:
+        parts = t.name.replace(".", " ").split()
+        if parts:
+            out.append((t, _zm_fold(parts[0]), [_zm_fold(p[0])[:1] for p in parts[1:3]]))
+    return out
+
+def _zm_guess(email: str, display: str, index) -> dict:
+    """Повертає {'level': 'auto'|'review'|'none', 'teacher_id', 'suggestions': [ids]}.
+    auto  — прізвище збігається і підтверджено ініціал (e-mail виду prizvysche_ab@ або ім'я); одна явна відповідь.
+    review — лише прізвище (без підтвердження ініціалу) — потрібне підтвердження людиною."""
+    local = (email or "").split("@")[0].lower() if "@" in (email or "") else ""
+    em = re.match(r"^([a-z'\-]{3,}?)(?:[_.]([a-z]{1,3}))?\d*$", local)
+    email_sur, email_ini = (em.group(1), em.group(2) or "") if em else ("", "")
+    tokens = [t for t in _zm_clean_display(display).split(" ") if t]
+    tfold = [_zm_fold(t) for t in tokens]
+    cands = []
+    for t, sk, inits in index:
+        best_sim, best_i = 0.0, -1
+        if email_sur:
+            best_sim = _zm_sim(_zm_fold(email_sur), sk)
+        for i, tf in enumerate(tfold):
+            s_ = _zm_sim(tf, sk)
+            if s_ > best_sim:
+                best_sim, best_i = s_, i
+        if best_sim < 0.85:
+            continue
+        given = [tfold[i] for i in range(len(tfold)) if i != best_i]
+        i1 = bool(inits) and (any(g[:1] == inits[0] for g in given[:1]) or (email_ini and _zm_fold(email_ini[0])[:1] == inits[0]))
+        if inits and not i1 and len(given) > 1:
+            i1 = any(g[:1] == inits[0] for g in given)
+        i2 = len(inits) > 1 and ((len(email_ini) > 1 and _zm_fold(email_ini[1])[:1] == inits[1]) or (len(given) > 1 and given[1][:1] == inits[1]))
+        cands.append((best_sim + 0.6 * bool(i1) + 0.4 * bool(i2), best_sim, bool(i1), t))
+    cands.sort(key=lambda c: -c[0])
+    sugg = [c[3].id for c in cands[:3]]
+    if not cands:
+        return {"level": "none", "teacher_id": None, "suggestions": []}
+    top = cands[0]
+    margin_ok = len(cands) == 1 or top[0] - cands[1][0] >= 0.25
+    if margin_ok and top[2]:
+        return {"level": "auto", "teacher_id": top[3].id, "suggestions": sugg}
+    return {"level": "review", "teacher_id": None, "suggestions": sugg}
+
+def _zm_autolink(db, accounts, teachers) -> int:
+    """Пробує прив'язати ще не прив'язані акаунти (ручні та ігноровані не чіпає). Повертає кількість нових прив'язок."""
+    index = _zm_teacher_index(teachers)
+    n = 0
+    for a in accounts:
+        if a.link_status in ("manual", "ignored") or a.lesson_teacher_id:
+            continue
+        g = _zm_guess(a.email_key if "@" in a.email_key else "", a.display_name or "", index)
+        if g["level"] == "auto":
+            a.lesson_teacher_id, a.link_status = g["teacher_id"], "auto"
+            n += 1
+    return n
+
+def _zm_process_report(db, content: bytes, filename: str, user_sub, dry_run: bool, data_until_override: Optional[str] = None) -> dict:
+    rows = _zm_read_rows(content, filename)
+    if len(rows) < 2:
+        raise HTTPException(status_code=400, detail="Файл порожній")
+    hdr = [_norm(str(c)) for c in rows[0]]
+    cols = {}
+    for key, variants in _ZM_COLS.items():
+        for j, h in enumerate(hdr):
+            if any(h == v or h.startswith(v) for v in variants):
+                cols[key] = j
+                break
+    if not {"start", "organizer"} <= set(cols):
+        if len(rows[0]) >= 14:
+            cols = dict(_ZM_POS)           # типовий експорт «Звіт про конференції» без впізнаваних заголовків
+        else:
+            raise HTTPException(status_code=400, detail="Не вдалося розпізнати колонки звіту Zoom (потрібні: організатор, час початку, тривалість)")
+    dur_hdr = hdr[cols["duration"]] if "duration" in cols and cols["duration"] < len(hdr) else ""
+    minutes_unit = any(w in dur_hdr for w in ("minute", "хвилин", "минут"))
+    get = lambda r, k: (r[cols[k]] if k in cols and cols[k] < len(r) else None)
+
+    meetings, bad_rows, dups = {}, 0, 0
+    acct_names = {}
+    for r in rows[1:]:
+        if not any(str(c).strip() for c in r if c is not None):
+            continue
+        start = _zm_parse_dt(get(r, "start"))
+        if not start:
+            bad_rows += 1
+            continue
+        dur = _zm_parse_duration(get(r, "duration"), minutes_unit)
+        if dur is None:
+            end_t = _zm_parse_dt(f"{start:%Y-%m-%d} {get(r, 'end')}") if get(r, "end") else None
+            dur = int((end_t - start).total_seconds()) % 86400 if end_t else 0
+        organizer = _clean(str(get(r, "organizer") or ""))
+        email = str(get(r, "email") or "")
+        ek = _zm_email_key(email, organizer)
+        mid = re.sub(r"\D", "", str(get(r, "meeting_id") or "")) or None
+        fp = hashlib.sha1(f"{mid}|{_sched_iso(start)}|{ek}".encode("utf-8")).hexdigest()
+        if fp in meetings:
+            dups += 1
+            continue
+        try:
+            part = int(float(str(get(r, "participants") or 0)))
+        except ValueError:
+            part = None
+        meetings[fp] = {"fp": fp, "mid": mid, "topic": _clean(str(get(r, "topic") or ""))[:500] or None, "organizer": organizer or None,
+                        "ek": ek, "start": start, "end": start + timedelta(seconds=dur), "dur": dur, "part": part}
+        acct_names.setdefault(ek, organizer)
+    if not meetings:
+        raise HTTPException(status_code=400, detail="У файлі не знайдено жодної зустрічі")
+
+    starts, ends = [m["start"] for m in meetings.values()], [m["end"] for m in meetings.values()]
+    existing_fp = {fp for (fp,) in db.query(DBLessonZoomMeeting.fingerprint).filter(
+        DBLessonZoomMeeting.start_dt >= _sched_iso(min(starts) - timedelta(days=1)),
+        DBLessonZoomMeeting.start_dt <= _sched_iso(max(starts) + timedelta(days=1))).all()}
+    new_meetings = [m for fp, m in meetings.items() if fp not in existing_fp]
+    accounts = {a.email_key: a for a in db.query(DBLessonZoomAccount).all()}
+    new_keys = [k for k in acct_names if k not in accounts]
+    teachers = db.query(DBLessonTeacher).all()
+    index = _zm_teacher_index(teachers)
+
+    # період звіту: з назви файлу (meetings2026_10_11_00_00_00_2026_10_15_23_59_00.csv) або за самими даними
+    pf, pt = min(starts).replace(hour=0, minute=0, second=0), max(ends)
+    fm = re.search(r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})", filename or "")
+    if fm:
+        try:
+            g = [int(x) for x in fm.groups()]
+            pf, pt = datetime(*g[0:6]), datetime(*g[6:12])
+        except ValueError:
+            pass
+    now = _sched_now()
+    # звіт, зроблений «наживо» (період ще не закінчився), має дані лише до останньої зустрічі
+    data_until = pt if pt <= now else min(pt, max(ends))
+    if data_until_override:                      # користувач вказав, до якого часу звіт справді повний
+        try:
+            data_until = datetime.strptime(data_until_override[:16].replace(" ", "T"), "%Y-%m-%dT%H:%M")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Невірний формат «Дані повні до» (потрібно РРРР-ММ-ДДTГГ:ХХ)")
+        data_until = max(data_until, pf)
+
+    auto_new, review_new = 0, 0
+    for k in new_keys:
+        g = _zm_guess(k if "@" in k else "", acct_names[k], index)
+        auto_new += g["level"] == "auto"
+        review_new += g["level"] == "review"
+    stats = {
+        "dry_run": dry_run, "rows": len(rows) - 1, "bad_rows": bad_rows, "duplicates_in_file": dups,
+        "meetings_new": len(new_meetings), "meetings_existing": len(meetings) - len(new_meetings),
+        "accounts_total": len(acct_names), "accounts_new": len(new_keys),
+        "accounts_auto_linked": auto_new, "accounts_need_review": review_new,
+        "date_from": min(starts).strftime("%Y-%m-%d"), "date_to": max(starts).strftime("%Y-%m-%d"),
+        "data_until": _sched_iso(data_until),
+    }
+    if dry_run:
+        return stats
+    batch = DBLessonSchedBatch(kind="zoom", filename=filename, period_from=_sched_iso(pf), period_to=_sched_iso(pt),
+                               data_until=_sched_iso(data_until), stats={k: v for k, v in stats.items()},
+                               created_by=user_sub, created_at=_sched_iso(now))
+    db.add(batch)
+    db.flush()
+    for k in new_keys:
+        a = DBLessonZoomAccount(email_key=k, display_name=acct_names[k] or None, link_status="none", created_at=_sched_iso(now))
+        db.add(a)
+        accounts[k] = a
+    db.flush()
+    _zm_autolink(db, list(accounts.values()), teachers)
+    for m in new_meetings:
+        db.add(DBLessonZoomMeeting(fingerprint=m["fp"], meeting_id=m["mid"], topic=m["topic"], organizer_name=m["organizer"],
+                                   account_id=accounts[m["ek"]].id, start_dt=_sched_iso(m["start"]), end_dt=_sched_iso(m["end"]),
+                                   duration_sec=m["dur"], participants=m["part"], batch_id=batch.id))
+    db.commit()
+    stats["batch_id"] = batch.id
+    return stats
+
+# ── Ендпоїнти завантаження ──────────────────────────────────────
+@app.post("/api/cmyo/schedule/upload")
+async def upload_schedule_archive(file: UploadFile = File(...), dry_run: bool = Query(default=True),
+                                  user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    content = await file.read()
+    if len(content) > SCHED_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Файл завеликий")
+    return _sched_process_archive(db, content, file.filename or "", user.get("sub"), dry_run)
+
+@app.post("/api/cmyo/schedule/zoom/upload")
+async def upload_zoom_report(file: UploadFile = File(...), dry_run: bool = Query(default=True),
+                             data_until: Optional[str] = Query(default=None),
+                             user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    content = await file.read()
+    if len(content) > ZOOM_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Файл завеликий")
+    return _zm_process_report(db, content, file.filename or "", user.get("sub"), dry_run, data_until)
+
+@app.get("/api/cmyo/schedule/batches")
+async def list_schedule_batches(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    rows = db.query(DBLessonSchedBatch).order_by(DBLessonSchedBatch.id.desc()).limit(20).all()
+    return [{"id": b.id, "kind": b.kind, "filename": b.filename, "created_at": _sched_fmt_label(b.created_at),
+             "created_by": b.created_by, "stats": b.stats or {}} for b in rows]
+
+# ── Зіставлення розкладу з Zoom ─────────────────────────────────
+def _sched_overlap_minutes(win_s: datetime, win_e: datetime, intervals) -> float:
+    clipped = sorted((max(s, win_s), min(e, win_e)) for s, e in intervals if min(e, win_e) > max(s, win_s))
+    total, cur_s, cur_e = 0.0, None, None
+    for s, e in clipped:
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                total += (cur_e - cur_s).total_seconds()
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        total += (cur_e - cur_s).total_seconds()
+    return total / 60.0
+
+def _sched_zoom_coverage(db):
+    """Інтервали, за які є звіт Zoom: [(від, до)]. Повертає (інтервали, найпізніше 'до')."""
+    out = []
+    for b in db.query(DBLessonSchedBatch).filter(DBLessonSchedBatch.kind == "zoom").all():
+        if b.period_from and b.data_until:
+            out.append((_sched_dt(b.period_from), _sched_dt(b.data_until)))
+    return out, (max((c[1] for c in out), default=None))
+
+def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, global_until):
+    if not it.is_online:
+        return "offline"
+    ok_thr = SCHED_SLOT_MINUTES * SCHED_OK_RATIO
+    if overlap_min >= ok_thr:
+        return "ok"
+    if not has_account and not it.zoom_meeting_id:
+        return "no_account"
+    if not covered:
+        # дані Zoom ще неповні (пара йде або попереду) → «очікується»; прогалина між звітами / немає звіту → «немає даних»
+        return "pending" if (global_until is not None and slot_e > global_until) else "no_data"
+    return "partial" if overlap_min >= SCHED_MIN_PARTIAL_MIN else "missed"
+
+@app.get("/api/cmyo/schedule/overview")
+async def schedule_overview(date_from: str, date_to: Optional[str] = None,
+                            user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    d_from = _parse_iso_date(date_from, "Від")
+    d_to = _parse_iso_date(date_to, "До") or d_from
+    if d_to < d_from:
+        d_from, d_to = d_to, d_from
+    if (datetime.strptime(d_to, "%Y-%m-%d") - datetime.strptime(d_from, "%Y-%m-%d")).days > 62:
+        raise HTTPException(status_code=400, detail="Максимальний період — 62 дні")
+
+    teachers = {t.id: t for t in db.query(DBLessonTeacher).all()}
+    items = db.query(DBLessonSchedItem).filter(DBLessonSchedItem.lesson_date >= d_from, DBLessonSchedItem.lesson_date <= d_to)\
+        .order_by(DBLessonSchedItem.lesson_date, DBLessonSchedItem.start_time).all()
+
+    accounts = db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.lesson_teacher_id.isnot(None),
+                                                    DBLessonZoomAccount.link_status.in_(("auto", "manual"))).all()
+    acc_by_teacher = defaultdict(set)
+    for a in accounts:
+        acc_by_teacher[a.lesson_teacher_id].add(a.id)
+    range_s = _sched_iso(datetime.strptime(d_from, "%Y-%m-%d") - timedelta(hours=6))
+    range_e = _sched_iso(datetime.strptime(d_to, "%Y-%m-%d") + timedelta(days=1, hours=6))
+    meetings = db.query(DBLessonZoomMeeting).filter(DBLessonZoomMeeting.start_dt >= range_s, DBLessonZoomMeeting.start_dt <= range_e).all()
+    m_by_acc = defaultdict(list)
+    m_by_mid = defaultdict(list)
+    for m in meetings:
+        m_by_acc[m.account_id].append(m)
+        if m.meeting_id:
+            m_by_mid[m.meeting_id].append(m)
+    cov, global_until = _sched_zoom_coverage(db)
+
+    cards = {}
+    used_meeting_ids = defaultdict(set)
+    for it in items:
+        t = teachers.get(it.lesson_teacher_id)
+        if not t:
+            continue
+        slot_s = datetime.strptime(f"{it.lesson_date} {it.start_time}", "%Y-%m-%d %H:%M")
+        slot_e = slot_s + timedelta(minutes=SCHED_SLOT_MINUTES)
+        cand = []
+        for aid in acc_by_teacher.get(t.id, ()):
+            cand.extend(m_by_acc.get(aid, ()))
+        if it.zoom_meeting_id:
+            cand.extend(m_by_mid.get(it.zoom_meeting_id, ()))
+        seen, ivs, hit = set(), [], []
+        for m in cand:
+            if m.id in seen:
+                continue
+            seen.add(m.id)
+            ms, me = _sched_dt(m.start_dt), _sched_dt(m.end_dt)
+            if min(me, slot_e) > max(ms, slot_s):
+                ivs.append((ms, me))
+                hit.append(m)
+                used_meeting_ids[t.id].add(m.id)
+        overlap = _sched_overlap_minutes(slot_s, slot_e, ivs)
+        covered = any(a <= slot_s and slot_e <= b + timedelta(minutes=5) for a, b in cov)
+        status = _sched_lesson_status(it, slot_s, slot_e, overlap, bool(acc_by_teacher.get(t.id)), covered, global_until)
+        card = cards.setdefault(t.id, {"id": t.id, "name": t.name, "has_account": bool(acc_by_teacher.get(t.id)),
+                                       "counts": defaultdict(int), "planned_min": 0, "conducted_min": 0, "lessons": [], "other_meetings": []})
+        card["counts"][status] += 1
+        if status in ("ok", "partial", "missed"):
+            card["planned_min"] += SCHED_SLOT_MINUTES
+            card["conducted_min"] += int(round(min(overlap, SCHED_SLOT_MINUTES)))
+        card["lessons"].append({
+            "id": it.id, "date": it.lesson_date, "start": it.start_time, "end": slot_e.strftime("%H:%M"), "slot_no": it.slot_no,
+            "subject": it.subject_name, "type": it.lesson_type, "groups": it.groups_text, "place": it.place, "online": bool(it.is_online),
+            "note": it.note, "substitute_for": (it.source_owner if it.source_owner and _norm(it.source_owner) != t.name_norm else None),
+            "status": status, "overlap_min": int(round(overlap)),
+            # у зустрічах під час пари був лише ведучий — студентів не було
+            "alone": bool(hit) and max((m.participants or 0) for m in hit) <= 1,
+            "meetings": [{"topic": m.topic, "start": _sched_dt(m.start_dt).strftime("%H:%M"), "end": _sched_dt(m.end_dt).strftime("%H:%M"),
+                          "duration_min": int(round(m.duration_sec / 60)), "participants": m.participants, "organizer": m.organizer_name}
+                         for m in sorted(hit, key=lambda x: x.start_dt)],
+        })
+    # зустрічі викладача в ці дні, що не потрапили в жоден слот розкладу
+    for tid, card in cards.items():
+        for aid in acc_by_teacher.get(tid, ()):
+            for m in m_by_acc.get(aid, ()):
+                ds = m.start_dt[:10]
+                if m.id in used_meeting_ids[tid] or ds < d_from or ds > d_to or m.duration_sec < 300:
+                    continue
+                card["other_meetings"].append({"date": ds, "start": _sched_dt(m.start_dt).strftime("%H:%M"), "end": _sched_dt(m.end_dt).strftime("%H:%M"),
+                                               "duration_min": int(round(m.duration_sec / 60)), "topic": m.topic, "participants": m.participants})
+        card["other_meetings"].sort(key=lambda x: (x["date"], x["start"]))
+        card["other_meetings"] = card["other_meetings"][:12]
+        card["counts"] = dict(card["counts"])
+
+    summary = defaultdict(int)
+    for c in cards.values():
+        for k, v in c["counts"].items():
+            summary[k] += v
+    rng = db.query(func.min(DBLessonSchedItem.lesson_date), func.max(DBLessonSchedItem.lesson_date)).first()
+    last_sched = db.query(DBLessonSchedBatch).filter(DBLessonSchedBatch.kind == "schedule").order_by(DBLessonSchedBatch.id.desc()).first()
+    last_zoom = db.query(DBLessonSchedBatch).filter(DBLessonSchedBatch.kind == "zoom").order_by(DBLessonSchedBatch.id.desc()).first()
+    return {
+        "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES,
+        "coverage": {
+            "schedule_from": rng[0], "schedule_to": rng[1],
+            "schedule_uploaded": _sched_fmt_label(last_sched.created_at) if last_sched else None,
+            "zoom_from": _sched_iso(min(c[0] for c in cov)) if cov else None,
+            "zoom_until": _sched_iso(global_until) if global_until else None,
+            "zoom_uploaded": _sched_fmt_label(last_zoom.created_at) if last_zoom else None,
+        },
+        "summary": {"teachers": len(cards), "lessons": sum(summary.values()), **dict(summary)},
+        "teachers": sorted(cards.values(), key=lambda c: c["name"]),
+    }
+
+# ── Акаунти Zoom ↔ викладачі ────────────────────────────────────
+class ZoomAccountLinkSchema(BaseModel):
+    teacher_id: Optional[int] = None
+    ignore: bool = False
+
+@app.get("/api/cmyo/schedule/zoom-accounts")
+async def list_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    teachers = db.query(DBLessonTeacher).order_by(DBLessonTeacher.name).all()
+    tname = {t.id: t.name for t in teachers}
+    index = _zm_teacher_index(teachers)
+    counts = dict(db.query(DBLessonZoomMeeting.account_id, func.count(DBLessonZoomMeeting.id)).group_by(DBLessonZoomMeeting.account_id).all())
+    out, linked_teachers = [], set()
+    for a in db.query(DBLessonZoomAccount).order_by(DBLessonZoomAccount.display_name).all():
+        sugg = []
+        if not a.lesson_teacher_id and a.link_status != "ignored":
+            g = _zm_guess(a.email_key if "@" in a.email_key else "", a.display_name or "", index)
+            sugg = [{"id": i, "name": tname[i]} for i in g["suggestions"] if i in tname]
+        if a.lesson_teacher_id:
+            linked_teachers.add(a.lesson_teacher_id)
+        out.append({"id": a.id, "email": a.email_key if "@" in a.email_key else None, "name": a.display_name,
+                    "meetings": counts.get(a.id, 0), "teacher_id": a.lesson_teacher_id, "teacher_name": tname.get(a.lesson_teacher_id),
+                    "status": a.link_status if a.lesson_teacher_id or a.link_status == "ignored" else "none", "suggestions": sugg})
+    sched_counts = dict(db.query(DBLessonSchedItem.lesson_teacher_id, func.count(DBLessonSchedItem.id))
+                        .filter(DBLessonSchedItem.is_online.is_(True)).group_by(DBLessonSchedItem.lesson_teacher_id).all())
+    without = [{"id": tid, "name": tname[tid], "lessons": n} for tid, n in sched_counts.items() if tid in tname and tid not in linked_teachers]
+    return {"accounts": out, "teachers": [{"id": t.id, "name": t.name} for t in teachers],
+            "teachers_without_account": sorted(without, key=lambda x: x["name"])}
+
+@app.put("/api/cmyo/schedule/zoom-accounts/{account_id}")
+async def link_zoom_account(account_id: int, data: ZoomAccountLinkSchema,
+                            user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    a = db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.id == account_id).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Акаунт не знайдено")
+    if data.teacher_id:
+        if not db.query(DBLessonTeacher.id).filter(DBLessonTeacher.id == data.teacher_id).first():
+            raise HTTPException(status_code=404, detail="Викладача не знайдено в списку")
+        a.lesson_teacher_id, a.link_status = data.teacher_id, "manual"
+    elif data.ignore:
+        a.lesson_teacher_id, a.link_status = None, "ignored"
+    else:
+        a.lesson_teacher_id, a.link_status = None, "none"
+    db.commit()
+    return {"id": a.id, "teacher_id": a.lesson_teacher_id, "status": a.link_status}
+
+@app.post("/api/cmyo/schedule/zoom-accounts/relink")
+async def relink_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Повторно шукає викладачів для ще не прив'язаних акаунтів (наприклад, після поповнення списку викладачів)."""
+    n = _zm_autolink(db, db.query(DBLessonZoomAccount).all(), db.query(DBLessonTeacher).all())
+    db.commit()
+    return {"linked": n}
 
 # =========================================================
 # 📝 ГЕНЕРАТОР ЗАЯВ ЦСК
