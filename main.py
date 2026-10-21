@@ -605,7 +605,8 @@ class DBLessonAlertConfig(Base):
     """Налаштування: за якими регіонами враховувати тривоги (один рядок)"""
     __tablename__ = "lesson_alert_config"
     id         = Column(Integer, primary_key=True, autoincrement=True)
-    regions    = Column(JSON, default=list)          # [{"id": "...", "name": "...", "type": "..."}]
+    source     = Column(String, nullable=True)       # ukrainealarm | alertsinua (порожньо = ukrainealarm)
+    regions    = Column(JSON, default=list)          # [{"id", "name", "type", "scan_uid"?}] — для активного джерела
     updated_at = Column(String, nullable=True)
     updated_by = Column(String, nullable=True)
 
@@ -630,6 +631,7 @@ class DBLessonAlert(Base):
     start_dt    = Column(String, nullable=False)
     end_dt      = Column(String, nullable=False)
     is_continue = Column(Boolean, nullable=False, default=False)   # тривога ще триває
+    scan_uid    = Column(String, nullable=True, index=True)        # alerts.in.ua: за яким запитом (uid області/району) отримано
 
 Base.metadata.create_all(bind=engine)
 
@@ -696,6 +698,9 @@ def _run_migrations():
         # 📝 Примітки до викладачів
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note VARCHAR",
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note_at VARCHAR",
+        # 🚨 Тривоги: друге джерело (alerts.in.ua)
+        "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS source VARCHAR",
+        "ALTER TABLE lesson_alerts ADD COLUMN IF NOT EXISTS scan_uid VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -4949,51 +4954,97 @@ def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, 
     return "partial" if overlap_min >= SCHED_MIN_PARTIAL_MIN else "missed"
 
 # =========================================================
-# 🚨 ТРИВОГИ (ukrainealarm.com) — API
-# Ключ: змінна середовища UKRAINE_ALARM_API_KEY (видається через форму на api.ukrainealarm.com).
-# Необов'язково: UKRAINE_ALARM_BASE_URL (за замовчуванням https://api.ukrainealarm.com),
-#                UKRAINE_ALARM_TYPES (типи, що рахуються; за замовчуванням лише AIR).
+# 🚨 ТРИВОГИ — офіційна підстава не проводити пару
+# Два джерела (обирається у вікні «Тривоги»):
+#   • ukrainealarm  — api.ukrainealarm.com, ключ у UKRAINE_ALARM_API_KEY; історія за днями (/api/v3/alerts/dateHistory);
+#   • alertsinua    — api.alerts.in.ua,     токен у ALERTS_IN_UA_TOKEN;   історія за місяць одним запитом (ліміт 2 запити/хв).
+# Запити до API робляться ОБЕРЕЖНО: по одному, з паузою, лише за дні з парами, з урахуванням Retry-After;
+# після ліміту (HTTP 429) — пауза без жодних запитів, решта днів дозавантажується поступово.
 # Правило поважної причини: якщо Zoom і тривога РАЗОМ покривають ≥ 60% пари, а самого Zoom замало — статус «Тривога».
 # =========================================================
 ALERT_EXCUSE_MIN = 10            # тривога коротша за 10 хв у межах пари не береться до уваги як причина
-ALERT_CACHE_TTL_SEC = 180        # поточний день перезавантажуємо не частіше, ніж раз на 3 хв
-ALERT_RETRY_SEC = 60             # після помилки API наступна спроба не раніше ніж за хвилину
-ALERT_HTTP_TIMEOUT = 10
-ALERT_MAX_PARALLEL = 3
+ALERT_CACHE_TTL_SEC = 180        # поточний день (ukrainealarm) перезавантажуємо не частіше, ніж раз на 3 хв
+ALERT_INUA_TTL_SEC = 300         # місячну історію alerts.in.ua — не частіше, ніж раз на 5 хв
+ALERT_RETRY_SEC = 60             # після помилки (не ліміт) наступна спроба не раніше ніж за хвилину
+ALERT_HTTP_TIMEOUT = 12
+ALERT_MAX_PER_CALL = 2           # скільки днів докачуємо за один запит розкладу (решта — пізніше)
+ALERT_MAX_SLEEP = 3.0            # довше за це в запиті не чекаємо — позначаємо «пізніше»
 ALERT_REGIONS_TTL_SEC = 6 * 3600
+ALERT_PROVIDERS = {
+    "ukrainealarm": {"label": "ukrainealarm.com", "key_env": "UKRAINE_ALARM_API_KEY", "base_env": "UKRAINE_ALARM_BASE_URL",
+                     "base": "https://api.ukrainealarm.com", "gap": 1.5, "retry": 65, "max_gap": 30.0},
+    "alertsinua":   {"label": "alerts.in.ua", "key_env": "ALERTS_IN_UA_TOKEN", "base_env": "ALERTS_IN_UA_BASE_URL",
+                     "base": "https://api.alerts.in.ua", "gap": 31.0, "retry": 40, "max_gap": 120.0},
+}
 ALERT_TYPE_LABELS = {"AIR": "Повітряна тривога", "ARTILLERY": "Артилерійський обстріл", "URBAN_FIGHTS": "Вуличні бої",
                      "CHEMICAL": "Хімічна загроза", "NUCLEAR": "Радіаційна загроза", "INFO": "Інформація", "UNKNOWN": "Невідомо"}
+_INUA_TYPES = {"AIR_RAID": "AIR", "ARTILLERY_SHELLING": "ARTILLERY", "URBAN_FIGHTS": "URBAN_FIGHTS", "CHEMICAL": "CHEMICAL", "NUCLEAR": "NUCLEAR"}
 _alert_regions_cache = {"at": 0.0, "items": []}
+_alert_scan_cache = {}           # alerts.in.ua: uid → (час, відповідь сканування)
+_alert_rt = {p: {"until": 0.0, "gap": v["gap"], "last": 0.0, "ok": 0} for p, v in ALERT_PROVIDERS.items()}
 
 class AlertsApiError(Exception):
-    pass
+    def __init__(self, msg, retry_after=None, kind="limit"):
+        super().__init__(msg)
+        self.retry_after = retry_after            # секунди до наступної спроби, інакше None
+        self.kind = kind                          # limit — API сказало «забагато запитів»; wait — наша власна пауза між запитами
 
-def _alerts_key() -> str:
-    return os.environ.get("UKRAINE_ALARM_API_KEY", "").strip()
+def _alerts_key(provider: str = "ukrainealarm") -> str:
+    return os.environ.get(ALERT_PROVIDERS[provider]["key_env"], "").strip()
 
 def _alerts_types() -> set:
     return {x.strip().upper() for x in os.environ.get("UKRAINE_ALARM_TYPES", "AIR").split(",") if x.strip()}
 
-def _alerts_get(path: str, params: Optional[dict] = None):
-    """Блокуючий GET до API тривог (викликається в потоці). Ключ у повідомлення про помилку не потрапляє."""
-    key = _alerts_key()
+def _alerts_get(provider: str, path: str, params: Optional[dict] = None):
+    """Блокуючий GET (викликається в потоці). Ключ у повідомлення про помилку не потрапляє."""
+    pv = ALERT_PROVIDERS[provider]
+    key = _alerts_key(provider)
     if not key:
-        raise AlertsApiError("Не задано змінну UKRAINE_ALARM_API_KEY")
-    base = os.environ.get("UKRAINE_ALARM_BASE_URL", "https://api.ukrainealarm.com").rstrip("/")
+        raise AlertsApiError(f"Не задано змінну {pv['key_env']}")
+    base = os.environ.get(pv["base_env"], pv["base"]).rstrip("/")
+    headers = {"Accept": "application/json", "Authorization": (f"Bearer {key}" if provider == "alertsinua" else key)}
     try:
-        r = requests.get(base + path, params=params, headers={"Authorization": key, "Accept": "application/json"}, timeout=ALERT_HTTP_TIMEOUT)
+        r = requests.get(base + path, params=params, headers=headers, timeout=ALERT_HTTP_TIMEOUT)
     except requests.RequestException as e:
-        raise AlertsApiError(f"Немає зв'язку з API тривог ({e.__class__.__name__})")
+        raise AlertsApiError(f"Немає зв'язку з {pv['label']} ({e.__class__.__name__})")
     if r.status_code in (401, 403):
-        raise AlertsApiError(f"API тривог не прийняло ключ (HTTP {r.status_code}). Перевірте UKRAINE_ALARM_API_KEY")
+        raise AlertsApiError(f"{pv['label']} не прийняло ключ (HTTP {r.status_code}). Перевірте {pv['key_env']}")
     if r.status_code == 429:
-        raise AlertsApiError("Перевищено ліміт запитів до API тривог (HTTP 429). Спробуйте за хвилину")
+        try:
+            ra = float(r.headers.get("Retry-After", ""))
+        except ValueError:
+            ra = pv["retry"]
+        raise AlertsApiError(f"Ліміт запитів до {pv['label']} (HTTP 429)", retry_after=max(5.0, min(ra, 600.0)))
     if r.status_code >= 400:
-        raise AlertsApiError(f"API тривог повернуло помилку HTTP {r.status_code}")
+        raise AlertsApiError(f"{pv['label']} повернуло помилку HTTP {r.status_code}")
     try:
         return r.json()
     except ValueError:
-        raise AlertsApiError("API тривог повернуло відповідь не у форматі JSON")
+        raise AlertsApiError(f"{pv['label']} повернуло відповідь не у форматі JSON")
+
+async def _alerts_call(provider: str, path: str, params: Optional[dict] = None):
+    """Один запит з дотриманням паузи між запитами і режиму очікування після 429."""
+    rt, pv = _alert_rt[provider], ALERT_PROVIDERS[provider]
+    now = time.time()
+    if now < rt["until"]:
+        raise AlertsApiError(f"Ліміт запитів до {pv['label']}: чекаємо", retry_after=rt["until"] - now)
+    wait = rt["last"] + rt["gap"] - now
+    if wait > ALERT_MAX_SLEEP:
+        raise AlertsApiError(f"Пауза між запитами до {pv['label']}", retry_after=wait, kind="wait")
+    if wait > 0:
+        await asyncio.sleep(wait)
+    rt["last"] = time.time()
+    try:
+        data = await run_in_threadpool(_alerts_get, provider, path, params)
+        rt["ok"] += 1
+        if rt["ok"] >= 5:                                          # довго без проблем — повертаємо звичайну паузу
+            rt["gap"], rt["ok"] = max(pv["gap"], rt["gap"] / 2), 0
+        return data
+    except AlertsApiError as e:
+        if e.retry_after is not None:                              # ліміт: чекаємо і збільшуємо паузу між запитами
+            rt["until"] = time.time() + e.retry_after
+            rt["gap"], rt["ok"] = min(rt["gap"] * 2, pv["max_gap"]), 0
+        raise
 
 def _eu_dst_range_utc(year: int):
     def last_sunday(month):
@@ -5029,41 +5080,38 @@ def _alerts_to_kyiv(s) -> Optional[datetime]:
     return _utc_to_kyiv(dt)
 
 def _alerts_flatten_regions(payload) -> list:
-    """Дерево /api/v3/regions → плаский список {id, name, type, path}."""
+    """Дерево /api/v3/regions → плаский список {id, name, type, path, ancestors}."""
     out = []
-    def walk(node, path):
+    def walk(node, path, anc):
         if not isinstance(node, dict):
             return
         rid, name = node.get("regionId"), node.get("regionName")
         if rid is not None and name:
-            out.append({"id": str(rid), "name": str(name), "type": str(node.get("regionType") or ""), "path": " › ".join(path + [str(name)])})
-            path = path + [str(name)]
+            out.append({"id": str(rid), "name": str(name), "type": str(node.get("regionType") or ""), "path": " › ".join(path + [str(name)]), "ancestors": list(anc)})
+            path, anc = path + [str(name)], anc + [str(rid)]
         for k in ("regionChildIds", "children", "states"):
             for ch in node.get(k) or []:
-                walk(ch, path)
+                walk(ch, path, anc)
     for n in (payload if isinstance(payload, list) else [payload]):
-        walk(n, [])
+        walk(n, [], [])
     return out
 
 def _alerts_regions_cached(force: bool = False) -> list:
     if not force and _alert_regions_cache["items"] and time.time() - _alert_regions_cache["at"] < ALERT_REGIONS_TTL_SEC:
         return _alert_regions_cache["items"]
-    items = _alerts_flatten_regions(_alerts_get("/api/v3/regions"))
+    items = _alerts_flatten_regions(_alerts_get("ukrainealarm", "/api/v3/regions"))
     if not items:
-        raise AlertsApiError("API тривог повернуло порожній список регіонів")
+        raise AlertsApiError("ukrainealarm.com повернуло порожній список регіонів")
     _alert_regions_cache.update(at=time.time(), items=items)
     return items
 
 def _alerts_suggest(items: list) -> list:
-    """Розумний початковий вибір для Дніпра: область + Дніпровський район. Користувач підтверджує вручну."""
-    pick = []
-    for r in items:
-        n = r["name"].lower()
-        if (r["type"].lower() == "state" and "дніпропетров" in n) or (r["type"].lower() == "district" and n.startswith("дніпровськ")):
-            pick.append({"id": r["id"], "name": r["name"], "type": r["type"]})
-    return pick
+    """Початковий вибір для Дніпропетровщини: область + Криворізький/Дніпровський район. Користувач підтверджує вручну."""
+    return [{"id": r["id"], "name": r["name"], "type": r["type"]} for r in items
+            if r["type"].lower() == "state" and "дніпропетров" in r["name"].lower()]
 
 def _alerts_parse_day(payload, region_ids: set, types: set, now: datetime) -> list:
+    """ukrainealarm: відповідь dateHistory → тривоги обраних регіонів"""
     items = payload if isinstance(payload, list) else ((payload.get("alerts") or payload.get("items") or []) if isinstance(payload, dict) else [])
     rows, seen = [], set()
     for a in items:
@@ -5087,8 +5135,33 @@ def _alerts_parse_day(payload, region_ids: set, types: set, now: datetime) -> li
         rows.append({"region_id": rid, "region_name": str(a.get("regionName") or ""), "alert_type": typ, "start": st, "end": en, "cont": cont})
     return rows
 
-def _alerts_cfg_hash(ids, types) -> str:
-    return hashlib.sha1((",".join(sorted(ids)) + "|" + ",".join(sorted(types))).encode("utf-8")).hexdigest()[:16]
+def _alerts_parse_inua(payload, location_ids: set, types: set, now: datetime) -> list:
+    """alerts.in.ua: відповідь month_ago → тривоги обраних локацій (за location_uid)"""
+    items = payload if isinstance(payload, list) else ((payload.get("alerts") or []) if isinstance(payload, dict) else [])
+    rows, seen = [], set()
+    for a in items:
+        if not isinstance(a, dict):
+            continue
+        uid = str(a.get("location_uid") or "")
+        typ = _INUA_TYPES.get(str(a.get("alert_type") or "").upper(), "UNKNOWN")
+        if uid not in location_ids or (types and typ not in types):
+            continue
+        st, en = _alerts_to_kyiv(a.get("started_at")), _alerts_to_kyiv(a.get("finished_at"))
+        if not st:
+            continue
+        cont = en is None                          # finished_at = null — тривога триває
+        if cont:
+            en = max(st, now)
+        elif en <= st:
+            continue
+        if (uid, typ, st) in seen:
+            continue
+        seen.add((uid, typ, st))
+        rows.append({"region_id": uid, "region_name": str(a.get("location_title") or ""), "alert_type": typ, "start": st, "end": en, "cont": cont})
+    return rows
+
+def _alerts_cfg_hash(source, ids, types) -> str:
+    return hashlib.sha1((source + "|" + ",".join(sorted(ids)) + "|" + ",".join(sorted(types))).encode("utf-8")).hexdigest()[:16]
 
 def _alerts_merge(intervals: list) -> list:
     """Об'єднує тривоги, що перетинаються (різні регіони/типи), для показу: [{start, end, types, regions}]"""
@@ -5102,38 +5175,18 @@ def _alerts_merge(intervals: list) -> list:
             out.append({"start": s, "end": e, "types": {typ}, "regions": {reg}})
     return out
 
-async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
-    """Готує тривоги для періоду: перевіряє кеш, за потреби довантажує з API. Ніколи не кидає виняток —
-    помилка API лише відображається в ctx['error'], а статуси рахуються без тривог."""
-    types = _alerts_types()
-    ctx = {"enabled": bool(_alerts_key()), "configured": False, "ok": True, "error": None, "regions": [], "types": sorted(types),
-           "failed_days": [], "excuse_min": ALERT_EXCUSE_MIN, "intervals": [], "public": {}}
-    ctx["public"] = {k: ctx[k] for k in ("enabled", "configured", "ok", "error", "regions", "types", "failed_days", "excuse_min")} | {"days": {}}
-    if not ctx["enabled"]:
-        return ctx
-    cfg = db.query(DBLessonAlertConfig).first()
-    regions = (cfg.regions if cfg and cfg.regions else [])
-    ctx["regions"] = ctx["public"]["regions"] = [r["name"] for r in regions]
-    if not regions:
-        return ctx
-    ctx["configured"] = ctx["public"]["configured"] = True
-    ids = {str(r["id"]) for r in regions}
-    cfg_hash = _alerts_cfg_hash(ids, types)
-    now = _sched_now()
-    today = now.strftime("%Y-%m-%d")
-    day = datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)     # тривога з ночі могла тривати й вранці
-    last = min(d_to, today)
-    days = []
-    while day.strftime("%Y-%m-%d") <= last:
-        days.append(day.strftime("%Y-%m-%d"))
-        day += timedelta(days=1)
-    if not days:
-        return ctx
+def _alerts_store_rows(db, rows: list, day_of, scan_uid: Optional[str] = None):
+    for r in rows:
+        db.add(DBLessonAlert(day=day_of(r), region_id=r["region_id"], region_name=r["region_name"], alert_type=r["alert_type"],
+                             start_dt=_sched_iso(r["start"]), end_dt=_sched_iso(r["end"]), is_continue=r["cont"], scan_uid=scan_uid))
 
-    rows_by_day = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.in_(days)).all()}
-    with_cont = {d for (d,) in db.query(DBLessonAlert.day).filter(DBLessonAlert.day.in_(days), DBLessonAlert.is_continue.is_(True)).distinct().all()}
+async def _alerts_fetch_ukrainealarm(db, ctx, ids, types, cfg_hash, days_all, now):
+    """Докачує історію за днями ПО ОДНОМУ з паузою. Дні, що вже завантажені остаточно, повторно не запитуємо."""
+    today = now.strftime("%Y-%m-%d")
+    rows_by_day = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.in_(days_all)).all()} if days_all else {}
+    with_cont = {d for (d,) in db.query(DBLessonAlert.day).filter(DBLessonAlert.day.in_(days_all), DBLessonAlert.is_continue.is_(True)).distinct().all()} if days_all else set()
     need = []
-    for d in days:
+    for d in days_all:
         r = rows_by_day.get(d)
         if r and r.cfg_hash == cfg_hash:
             age = (now - _sched_dt(r.fetched_at)).total_seconds()
@@ -5142,43 +5195,123 @@ async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
             if age < (ALERT_CACHE_TTL_SEC if r.status == "ok" else ALERT_RETRY_SEC):
                 continue
         need.append(d)
+    ctx["days_total"] = len(days_all)
+    limited, processed = None, set()
+    for d in need[:ALERT_MAX_PER_CALL]:
+        try:
+            payload = await _alerts_call("ukrainealarm", "/api/v3/alerts/dateHistory", {"date": d.replace("-", "")})
+            err = None
+        except AlertsApiError as e:
+            payload, err = None, e
+        except Exception as e:
+            payload, err = None, AlertsApiError(f"Помилка під час запиту до ukrainealarm.com ({e.__class__.__name__})")
+        if err is not None and err.retry_after is not None:               # ліміт — зупиняємось, цей день лишається в черзі
+            limited = err
+            break
+        stamp = _sched_iso(_sched_now())
+        rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == d).first() or DBLessonAlertDay(day=d, fetched_at=stamp)
+        if err is None:
+            rows = _alerts_parse_day(payload, ids, types, _sched_now())
+            db.query(DBLessonAlert).filter(DBLessonAlert.day == d).delete(synchronize_session=False)
+            _alerts_store_rows(db, rows, lambda r, d=d: d)
+            rec.status, rec.error, rec.count = "ok", None, len(rows)
+        else:
+            rec.status, rec.error = "error", str(err)
+        processed.add(d)
+        rec.fetched_at, rec.cfg_hash = stamp, cfg_hash
+        db.add(rec)
+    db.commit()
+    rows_by_day = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.in_(days_all)).all()} if days_all else {}
+    failed = [d for d in days_all if d in rows_by_day and rows_by_day[d].status == "error"]
+    if failed:
+        ctx["ok"], ctx["error"], ctx["failed_days"] = False, rows_by_day[failed[0]].error, failed
+    left = [d for d in need if d not in processed]
+    ctx["pending_days"] = len(left)
+    if limited is not None:
+        ctx["rate_limited"], ctx["retry_in"] = limited.kind == "limit", int(limited.retry_after) + 1
+    elif left:
+        ctx["retry_in"] = int(_alert_rt["ukrainealarm"]["gap"]) + 2
 
-    if need:
-        sem = asyncio.Semaphore(ALERT_MAX_PARALLEL)
-        async def one(d):
-            async with sem:
-                try:
-                    return d, await run_in_threadpool(_alerts_get, "/api/v3/alerts/dateHistory", {"date": d.replace("-", "")}), None
-                except AlertsApiError as e:
-                    return d, None, str(e)
-                except Exception as e:
-                    return d, None, f"Помилка під час запиту до API тривог ({e.__class__.__name__})"
-        for d, payload, err in await asyncio.gather(*[one(x) for x in need]):
-            stamp = _sched_iso(_sched_now())
-            rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == d).first() or DBLessonAlertDay(day=d, fetched_at=stamp)
-            if err is None:
-                rows = _alerts_parse_day(payload, ids, types, _sched_now())
-                db.query(DBLessonAlert).filter(DBLessonAlert.day == d).delete(synchronize_session=False)
-                for r in rows:
-                    db.add(DBLessonAlert(day=d, region_id=r["region_id"], region_name=r["region_name"], alert_type=r["alert_type"],
-                                         start_dt=_sched_iso(r["start"]), end_dt=_sched_iso(r["end"]), is_continue=r["cont"]))
-                rec.status, rec.error, rec.count = "ok", None, len(rows)
-            else:                                                         # старі рядки лишаємо, пробуємо знову через хвилину
-                rec.status, rec.error = "error", err
+async def _alerts_fetch_inua(db, ctx, ids, types, cfg_hash, scan_uids, d_from, now):
+    """alerts.in.ua: один запит = місяць історії одного uid. Ліміт 2/хв, тому — не більше одного запиту за раз."""
+    ctx["days_total"] = len(scan_uids)
+    stale = []
+    for uid in scan_uids:
+        rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == f"uid:{uid}").first()
+        fresh = rec and rec.cfg_hash == cfg_hash and rec.status == "ok" and (now - _sched_dt(rec.fetched_at)).total_seconds() < ALERT_INUA_TTL_SEC
+        if not fresh:
+            stale.append(uid)
+    limited = None
+    if stale:
+        uid = stale[0]
+        stamp = _sched_iso(_sched_now())
+        rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == f"uid:{uid}").first() or DBLessonAlertDay(day=f"uid:{uid}", fetched_at=stamp)
+        try:
+            payload = await _alerts_call("alertsinua", f"/v1/regions/{uid}/alerts/month_ago.json")
+            rows = _alerts_parse_inua(payload, ids, types, _sched_now())
+            db.query(DBLessonAlert).filter(DBLessonAlert.scan_uid == uid).delete(synchronize_session=False)
+            _alerts_store_rows(db, rows, lambda r: r["start"].strftime("%Y-%m-%d"), scan_uid=uid)
+            rec.status, rec.error, rec.count = "ok", None, len(rows)
             rec.fetched_at, rec.cfg_hash = stamp, cfg_hash
             db.add(rec)
+            stale = stale[1:]
+        except AlertsApiError as e:
+            if e.retry_after is not None:
+                limited = e
+            else:
+                rec.status, rec.error, rec.fetched_at, rec.cfg_hash = "error", str(e), stamp, cfg_hash
+                db.add(rec)
+                ctx["ok"], ctx["error"] = False, str(e)
+                stale = stale[1:]
         db.commit()
-        rows_by_day = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.in_(days)).all()}
+    ctx["pending_days"] = len(stale)
+    if limited is not None:
+        ctx["rate_limited"], ctx["retry_in"] = limited.kind == "limit", int(limited.retry_after) + 1
+    elif stale:
+        ctx["retry_in"] = int(_alert_rt["alertsinua"]["gap"]) + 2
+    if d_from < (now - timedelta(days=30)).strftime("%Y-%m-%d"):
+        ctx["history_limited"] = True                 # alerts.in.ua віддає лише останній місяць
 
-    failed = [d for d in days if d in rows_by_day and rows_by_day[d].status == "error" and d >= d_from]
-    if failed:
-        ctx["ok"] = ctx["public"]["ok"] = False
-        ctx["error"] = ctx["public"]["error"] = rows_by_day[failed[0]].error
-        ctx["failed_days"] = ctx["public"]["failed_days"] = failed
-    ivs = []
-    for a in db.query(DBLessonAlert).filter(DBLessonAlert.day.in_(days)).all():
-        ivs.append((_sched_dt(a.start_dt), _sched_dt(a.end_dt), a.alert_type or "UNKNOWN", a.region_name or ""))
-    ivs = sorted(set(ivs))
+async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
+    """Готує тривоги для періоду: кеш → за потреби поступово докачує з API. Не кидає винятків:
+    помилка/ліміт лише відображаються в ctx, а статуси рахуються з тим, що вже є."""
+    types = _alerts_types()
+    cfg = db.query(DBLessonAlertConfig).first()
+    source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
+    regions = (cfg.regions if cfg and cfg.regions else [])
+    ctx = {"source": source, "source_label": ALERT_PROVIDERS[source]["label"], "enabled": bool(_alerts_key(source)), "configured": bool(regions),
+           "ok": True, "error": None, "regions": [r["name"] for r in regions], "types": sorted(types), "failed_days": [], "excuse_min": ALERT_EXCUSE_MIN,
+           "pending_days": 0, "days_total": 0, "rate_limited": False, "retry_in": 0, "history_limited": False, "intervals": []}
+    public_keys = ("source", "source_label", "enabled", "configured", "ok", "error", "regions", "types", "failed_days", "excuse_min",
+                   "pending_days", "days_total", "rate_limited", "retry_in", "history_limited")
+    def finish():
+        ctx["public"] = {k: ctx[k] for k in public_keys} | {"days": ctx.get("pub_days", {})}
+        return ctx
+    if not ctx["enabled"] or not regions:
+        return finish()
+    ids = {str(r["id"]) for r in regions}
+    if source == "ukrainealarm":                       # вибраний регіон + його предки (тривога області/району діє й на громаду)
+        for r in regions:
+            ids.update(str(x) for x in (r.get("ancestors") or []))
+    cfg_hash = _alerts_cfg_hash(source, ids, types)
+    now = _sched_now()
+    today = now.strftime("%Y-%m-%d")
+
+    if source == "alertsinua":
+        scan = sorted({str(r["scan_uid"]) for r in regions if r.get("scan_uid")})
+        await _alerts_fetch_inua(db, ctx, ids, types, cfg_hash, scan, d_from, now)
+    else:
+        sched_days = [d for (d,) in db.query(DBLessonSchedItem.lesson_date)
+                      .filter(DBLessonSchedItem.lesson_date >= d_from, DBLessonSchedItem.lesson_date <= min(d_to, today)).distinct().all()]
+        if sched_days:                                  # + попередня доба: нічна тривога могла тривати й вранці (один раз, далі з кешу)
+            sched_days.append((datetime.strptime(min(sched_days), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"))
+        await _alerts_fetch_ukrainealarm(db, ctx, ids, types, cfg_hash, sorted(set(sched_days)), now)
+
+    lo = (datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    hi = d_to + "T23:59:59"
+    ivs = sorted({(_sched_dt(a.start_dt), _sched_dt(a.end_dt), a.alert_type or "UNKNOWN", a.region_name or "")
+                  for a in db.query(DBLessonAlert).filter(DBLessonAlert.start_dt <= hi, DBLessonAlert.end_dt >= lo).all()
+                  if (source == "alertsinua") == bool(a.scan_uid)})
     ctx["intervals"] = ivs
     pub_days = {}
     for m in _alerts_merge(ivs):                       # тривога показується в кожному дні, якого торкається
@@ -5194,29 +5327,36 @@ async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
                     "types": sorted(m["types"]), "regions": sorted(m["regions"]),
                     "from_prev_day": m["start"] < day_s, "continues_next_day": m["end"] > day_e})
             d += timedelta(days=1)
-    ctx["public"]["days"] = {d: sorted(v, key=lambda x: x["start"]) for d, v in pub_days.items()}
-    return ctx
+    ctx["pub_days"] = {d: sorted(v, key=lambda x: x["start"]) for d, v in pub_days.items()}
+    return finish()
 
 # ── Налаштування й службові ендпоїнти ───────────────────────────
 class AlertRegionSchema(BaseModel):
     id: str
     name: str
     type: Optional[str] = None
+    scan_uid: Optional[str] = None
+    ancestors: Optional[List[str]] = None
 
 class AlertConfigSchema(BaseModel):
+    source: str = "ukrainealarm"
     regions: List[AlertRegionSchema]
 
 def _alerts_err_http(e: AlertsApiError):
-    return HTTPException(status_code=502, detail=str(e))
+    return HTTPException(status_code=429 if e.retry_after is not None else 502,
+                         detail=str(e) + (f". Спробуйте за {int(e.retry_after) + 1} с" if e.retry_after is not None else ""))
 
 @app.get("/api/cmyo/schedule/alerts/config")
 async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     cfg = db.query(DBLessonAlertConfig).first()
+    source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
     saved = (cfg.regions if cfg and cfg.regions else [])
-    out = {"enabled": bool(_alerts_key()), "regions": saved, "suggested": [], "excuse_min": ALERT_EXCUSE_MIN, "ok_ratio": SCHED_OK_RATIO,
+    out = {"source": source, "saved": bool(saved), "regions": saved, "suggested": [], "excuse_min": ALERT_EXCUSE_MIN, "ok_ratio": SCHED_OK_RATIO,
+           "providers": {p: {"label": v["label"], "key_env": v["key_env"], "enabled": bool(_alerts_key(p))} for p, v in ALERT_PROVIDERS.items()},
            "types": [{"code": t, "label": ALERT_TYPE_LABELS.get(t, t)} for t in sorted(_alerts_types())],
            "updated_at": _sched_fmt_label(cfg.updated_at) if cfg else None}
-    if out["enabled"] and not saved:
+    out["enabled"] = out["providers"][source]["enabled"]
+    if not saved and out["providers"]["ukrainealarm"]["enabled"]:
         try:
             out["suggested"] = _alerts_suggest(await run_in_threadpool(_alerts_regions_cached))
         except AlertsApiError as e:
@@ -5225,19 +5365,48 @@ async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Sessio
 
 @app.get("/api/cmyo/schedule/alerts/regions")
 async def search_alert_regions(q: str = Query(default=""), user: dict = Depends(require_cmyo_admin)):
+    """Пошук регіонів у довіднику ukrainealarm.com"""
     try:
         items = await run_in_threadpool(_alerts_regions_cached)
     except AlertsApiError as e:
         raise _alerts_err_http(e)
     needle = (q or "").strip().lower()
-    if not needle:
-        items = [r for r in items if r["type"].lower() == "state"]
-    else:
-        items = [r for r in items if needle in r["name"].lower() or needle in r["path"].lower()]
+    items = [r for r in items if r["type"].lower() == "state"] if not needle else [r for r in items if needle in r["name"].lower() or needle in r["path"].lower()]
     return items[:40]
+
+@app.get("/api/cmyo/schedule/alerts/scan")
+async def scan_alerts_locations(uid: str = Query(..., min_length=1, max_length=12), user: dict = Depends(require_cmyo_admin)):
+    """alerts.in.ua: які локації (область/район/громада/місто) трапляються в місячній історії цього uid. Звідси користувач обирає свою."""
+    uid = re.sub(r"\D", "", uid)
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID має бути числом (наприклад, 9 — Дніпропетровська область)")
+    hit = _alert_scan_cache.get(uid)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    try:
+        payload = await _alerts_call("alertsinua", f"/v1/regions/{uid}/alerts/month_ago.json")
+    except AlertsApiError as e:
+        raise _alerts_err_http(e)
+    items = payload if isinstance(payload, list) else ((payload.get("alerts") or []) if isinstance(payload, dict) else [])
+    locs = {}
+    for a in items:
+        if not isinstance(a, dict) or a.get("location_uid") is None:
+            continue
+        k = str(a["location_uid"])
+        d = locs.setdefault(k, {"uid": k, "title": str(a.get("location_title") or k), "type": str(a.get("location_type") or ""),
+                                "raion": a.get("location_raion"), "count": 0, "last": None})
+        d["count"] += 1
+        st = _alerts_to_kyiv(a.get("started_at"))
+        if st and (d["last"] is None or _sched_iso(st) > d["last"]):
+            d["last"] = _sched_iso(st)
+    res = {"scan_uid": uid, "alerts": len(items), "locations": sorted(locs.values(), key=lambda x: (-x["count"], x["title"]))}
+    _alert_scan_cache[uid] = (time.time(), res)
+    return res
 
 @app.put("/api/cmyo/schedule/alerts/config")
 async def put_alerts_config(data: AlertConfigSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    if data.source not in ALERT_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Невідоме джерело тривог")
     if not data.regions:
         raise HTTPException(status_code=400, detail="Оберіть хоча б один регіон")
     if len(data.regions) > 30:
@@ -5247,26 +5416,41 @@ async def put_alerts_config(data: AlertConfigSchema, user: dict = Depends(requir
         rid = r.id.strip()
         if not rid or rid in seen:
             continue
+        if data.source == "alertsinua" and not (r.scan_uid or "").strip():
+            raise HTTPException(status_code=400, detail="Для alerts.in.ua кожну локацію потрібно обрати зі списку «Знайти локації»")
         seen.add(rid)
-        regions.append({"id": rid, "name": _clean(r.name)[:200], "type": (r.type or "")[:30]})
+        item = {"id": rid, "name": _clean(r.name)[:200], "type": (r.type or "")[:30]}
+        if r.scan_uid:
+            item["scan_uid"] = re.sub(r"\D", "", r.scan_uid)[:12]
+        if r.ancestors:
+            item["ancestors"] = [str(x)[:40] for x in r.ancestors[:6]]
+        regions.append(item)
     cfg = db.query(DBLessonAlertConfig).first()
     if not cfg:
         cfg = DBLessonAlertConfig()
         db.add(cfg)
-    cfg.regions, cfg.updated_at, cfg.updated_by = regions, _sched_iso(_sched_now()), user.get("sub")
+    cfg.source, cfg.regions, cfg.updated_at, cfg.updated_by = data.source, regions, _sched_iso(_sched_now()), user.get("sub")
+    # інше джерело чи регіони — стару історію не змішуємо: скидаємо кеш, він завантажиться заново
+    db.query(DBLessonAlert).delete(synchronize_session=False)
+    db.query(DBLessonAlertDay).delete(synchronize_session=False)
     db.commit()
-    return {"regions": regions}
+    return {"source": data.source, "regions": regions}
 
 @app.post("/api/cmyo/schedule/alerts/check")
-async def check_alerts_api(user: dict = Depends(require_cmyo_admin)):
-    """Перевірка ключа і зв'язку з API тривог"""
-    if not _alerts_key():
-        return {"ok": False, "error": "Не задано змінну UKRAINE_ALARM_API_KEY на сервері"}
+async def check_alerts_api(source: str = Query(default="ukrainealarm"), user: dict = Depends(require_cmyo_admin)):
+    """Перевірка ключа і зв'язку з обраним джерелом тривог"""
+    if source not in ALERT_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Невідоме джерело тривог")
+    pv = ALERT_PROVIDERS[source]
+    if not _alerts_key(source):
+        return {"ok": False, "error": f"Не задано змінну {pv['key_env']} на сервері"}
     try:
-        n = len(await run_in_threadpool(_alerts_regions_cached, True))
-        return {"ok": True, "regions_count": n}
+        if source == "ukrainealarm":
+            return {"ok": True, "info": f"Зв'язок є, регіонів у довіднику: {len(await run_in_threadpool(_alerts_regions_cached, True))}"}
+        await _alerts_call("alertsinua", "/v1/alerts/active.json")
+        return {"ok": True, "info": "Зв'язок із alerts.in.ua є, токен прийнято"}
     except AlertsApiError as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "retry_in": int(e.retry_after) + 1 if e.retry_after is not None else None}
 
 class AlertsRefreshSchema(BaseModel):
     date_from: str
@@ -5274,11 +5458,11 @@ class AlertsRefreshSchema(BaseModel):
 
 @app.post("/api/cmyo/schedule/alerts/refresh")
 async def refresh_alerts(data: AlertsRefreshSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    """Скидає кеш тривог за період — наступний запит розкладу завантажить історію заново"""
+    """Скидає кеш тривог за період — наступний запит розкладу завантажить історію заново (з урахуванням лімітів)"""
     d_from = _parse_iso_date(data.date_from, "Від")
     d_to = _parse_iso_date(data.date_to, "До") or d_from
     start = (datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    n = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day >= start, DBLessonAlertDay.day <= d_to).delete(synchronize_session=False)
+    n = db.query(DBLessonAlertDay).filter((DBLessonAlertDay.day >= start) & (DBLessonAlertDay.day <= d_to) | DBLessonAlertDay.day.like("uid:%")).delete(synchronize_session=False)
     db.commit()
     return {"reset_days": n}
 
