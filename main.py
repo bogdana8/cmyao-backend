@@ -607,6 +607,9 @@ class DBLessonAlertConfig(Base):
     id         = Column(Integer, primary_key=True, autoincrement=True)
     source     = Column(String, nullable=True)       # ukrainealarm | alertsinua (порожньо = ukrainealarm)
     regions    = Column(JSON, default=list)          # [{"id", "name", "type", "scan_uid"?}] — для активного джерела
+    history_from   = Column(String, nullable=True)   # з якої дати зберігати історію (YYYY-MM-DD), за замовчуванням 2026-09-01
+    lease_until    = Column(String, nullable=True)   # «слот» запиту до API: до цього часу новий запит не робимо (спільне для всіх процесів)
+    cooldown_until = Column(String, nullable=True)   # після HTTP 429: до цього часу запитів немає
     updated_at = Column(String, nullable=True)
     updated_by = Column(String, nullable=True)
 
@@ -698,8 +701,11 @@ def _run_migrations():
         # 📝 Примітки до викладачів
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note VARCHAR",
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note_at VARCHAR",
-        # 🚨 Тривоги: друге джерело (alerts.in.ua)
+        # 🚨 Тривоги: друге джерело, історія від дати, спільний «слот» запитів
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS source VARCHAR",
+        "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS history_from VARCHAR",
+        "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS lease_until VARCHAR",
+        "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS cooldown_until VARCHAR",
         "ALTER TABLE lesson_alerts ADD COLUMN IF NOT EXISTS scan_uid VARCHAR",
     ]
     with engine.connect() as conn:
@@ -5180,57 +5186,155 @@ def _alerts_store_rows(db, rows: list, day_of, scan_uid: Optional[str] = None):
         db.add(DBLessonAlert(day=day_of(r), region_id=r["region_id"], region_name=r["region_name"], alert_type=r["alert_type"],
                              start_dt=_sched_iso(r["start"]), end_dt=_sched_iso(r["end"]), is_continue=r["cont"], scan_uid=scan_uid))
 
-async def _alerts_fetch_ukrainealarm(db, ctx, ids, types, cfg_hash, days_all, now):
-    """Докачує історію за днями ПО ОДНОМУ з паузою. Дні, що вже завантажені остаточно, повторно не запитуємо."""
-    today = now.strftime("%Y-%m-%d")
-    rows_by_day = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.in_(days_all)).all()} if days_all else {}
-    with_cont = {d for (d,) in db.query(DBLessonAlert.day).filter(DBLessonAlert.day.in_(days_all), DBLessonAlert.is_continue.is_(True)).distinct().all()} if days_all else set()
-    need = []
-    for d in days_all:
-        r = rows_by_day.get(d)
-        if r and r.cfg_hash == cfg_hash:
-            age = (now - _sched_dt(r.fetched_at)).total_seconds()
-            if r.status == "ok" and r.fetched_at[:10] > d and d not in with_cont:
-                continue                                                  # день завершено — історія вже остаточна
-            if age < (ALERT_CACHE_TTL_SEC if r.status == "ok" else ALERT_RETRY_SEC):
-                continue
-        need.append(d)
-    ctx["days_total"] = len(days_all)
-    limited, processed = None, set()
-    for d in need[:ALERT_MAX_PER_CALL]:
-        try:
-            payload = await _alerts_call("ukrainealarm", "/api/v3/alerts/dateHistory", {"date": d.replace("-", "")})
-            err = None
-        except AlertsApiError as e:
-            payload, err = None, e
-        except Exception as e:
-            payload, err = None, AlertsApiError(f"Помилка під час запиту до ukrainealarm.com ({e.__class__.__name__})")
-        if err is not None and err.retry_after is not None:               # ліміт — зупиняємось, цей день лишається в черзі
-            limited = err
-            break
-        stamp = _sched_iso(_sched_now())
-        rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == d).first() or DBLessonAlertDay(day=d, fetched_at=stamp)
-        if err is None:
-            rows = _alerts_parse_day(payload, ids, types, _sched_now())
-            db.query(DBLessonAlert).filter(DBLessonAlert.day == d).delete(synchronize_session=False)
-            _alerts_store_rows(db, rows, lambda r, d=d: d)
-            rec.status, rec.error, rec.count = "ok", None, len(rows)
-        else:
-            rec.status, rec.error = "error", str(err)
-        processed.add(d)
-        rec.fetched_at, rec.cfg_hash = stamp, cfg_hash
-        db.add(rec)
+ALERT_BACKFILL_GAP = 20.0            # стартова пауза між запитами у фоні, с (сама підлаштовується до ліміту, не більше 65 с)
+ALERT_BACKFILL_MAX_GAP = 65.0
+ALERT_TODAY_REFRESH_SEC = 600        # поточну добу оновлюємо раз на 10 хв
+ALERT_ERROR_RETRY_SEC = 300          # день із помилкою (не ліміт) пробуємо ще раз через 5 хв
+ALERT_HISTORY_FROM_DEFAULT = "2026-09-01"
+_alert_worker = {"task": None, "pace": ALERT_BACKFILL_GAP, "ok": 0}
+
+def _alerts_history_from(cfg) -> str:
+    v = (cfg.history_from if cfg is not None and cfg.history_from else os.environ.get("ALERTS_HISTORY_FROM", "")) or ALERT_HISTORY_FROM_DEFAULT
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+        return v
+    except ValueError:
+        return ALERT_HISTORY_FROM_DEFAULT
+
+def _alerts_ids(regions, source) -> set:
+    """Обрані регіони + їхні предки (тривога області чи району діє й на громаду)"""
+    ids = {str(r["id"]) for r in regions}
+    if source == "ukrainealarm":
+        for r in regions:
+            ids.update(str(x) for x in (r.get("ancestors") or []))
+    return ids
+
+def _alerts_backfill_state(db, cfg, now: datetime) -> dict:
+    """Що з історії вже збережено остаточно, а що ще треба завантажити (у порядку важливості)."""
+    regions = cfg.regions or []
+    ids, types = _alerts_ids(regions, "ukrainealarm"), _alerts_types()
+    cfg_hash = _alerts_cfg_hash("ukrainealarm", ids, types)
+    start, today = _alerts_history_from(cfg), now.strftime("%Y-%m-%d")
+    if start > today:
+        start = today
+    days, d = [], datetime.strptime(start, "%Y-%m-%d")
+    while d.strftime("%Y-%m-%d") <= today and len(days) < 900:
+        days.append(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+    recs = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day >= start, DBLessonAlertDay.day <= today).all()}
+    with_cont = {x for (x,) in db.query(DBLessonAlert.day).filter(DBLessonAlert.day >= start, DBLessonAlert.is_continue.is_(True)).distinct().all()}
+    lesson_days = {x for (x,) in db.query(DBLessonSchedItem.lesson_date).filter(DBLessonSchedItem.lesson_date >= start).distinct().all()}
+    missing, stale = [], []
+    for d in days:
+        r = recs.get(d)
+        if not r or r.cfg_hash != cfg_hash:
+            missing.append(d)
+            continue
+        age = (now - _sched_dt(r.fetched_at)).total_seconds()
+        if r.status == "error":
+            if age >= ALERT_ERROR_RETRY_SEC:
+                missing.append(d)
+        elif r.fetched_at[:10] <= d or d in with_cont:           # доба ще тривала на момент завантаження → потрібне перезавантаження
+            if d == today and age < ALERT_TODAY_REFRESH_SEC:
+                stale.append(d)                                    # поточну добу оновлюємо не частіше, ніж раз на 10 хв
+            else:
+                missing.append(d)
+    # порядок: поточна доба → дні з парами (свіжіші першими) → решта (свіжіші першими)
+    order = sorted(missing, key=lambda x: (x != today, x not in lesson_days, -int(x.replace("-", ""))))
+    return {"ids": ids, "types": types, "cfg_hash": cfg_hash, "start": start, "today": today, "days": days, "recs": recs,
+            "need": order, "need_set": set(order), "done": len(days) - len(order)}
+
+def _alerts_store_day(db, d: str, payload, ids, types, cfg_hash):
+    stamp = _sched_iso(_sched_now())
+    rows = _alerts_parse_day(payload, ids, types, _sched_now())
+    db.query(DBLessonAlert).filter(DBLessonAlert.day == d).delete(synchronize_session=False)
+    _alerts_store_rows(db, rows, lambda r, d=d: d)
+    rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == d).first() or DBLessonAlertDay(day=d, fetched_at=stamp)
+    rec.status, rec.error, rec.count, rec.fetched_at, rec.cfg_hash = "ok", None, len(rows), stamp, cfg_hash
+    db.add(rec)
     db.commit()
-    rows_by_day = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.in_(days_all)).all()} if days_all else {}
-    failed = [d for d in days_all if d in rows_by_day and rows_by_day[d].status == "error"]
-    if failed:
-        ctx["ok"], ctx["error"], ctx["failed_days"] = False, rows_by_day[failed[0]].error, failed
-    left = [d for d in need if d not in processed]
-    ctx["pending_days"] = len(left)
-    if limited is not None:
-        ctx["rate_limited"], ctx["retry_in"] = limited.kind == "limit", int(limited.retry_after) + 1
-    elif left:
-        ctx["retry_in"] = int(_alert_rt["ukrainealarm"]["gap"]) + 2
+
+def _alerts_mark_error(db, d: str, err: str, cfg_hash):
+    stamp = _sched_iso(_sched_now())
+    rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == d).first() or DBLessonAlertDay(day=d, fetched_at=stamp)
+    rec.status, rec.error, rec.fetched_at, rec.cfg_hash = "error", err[:300], stamp, cfg_hash
+    db.add(rec)
+    db.commit()
+
+async def _alerts_worker_step() -> float:
+    """Один крок фонового завантаження історії: НЕ БІЛЬШЕ ОДНОГО запиту. Повертає, скільки секунд чекати до наступного кроку."""
+    db = SessionLocal()
+    try:
+        cfg = db.query(DBLessonAlertConfig).first()
+        if not cfg or not cfg.regions or (cfg.source or "ukrainealarm") != "ukrainealarm" or not _alerts_key("ukrainealarm"):
+            return 60.0
+        now = _sched_now()
+        now_iso = _sched_iso(now)
+        until = max(cfg.lease_until or "", cfg.cooldown_until or "")
+        if until > now_iso:                                           # ще не час (пауза між запитами або ліміт API)
+            return max(2.0, (_sched_dt(until) - now).total_seconds() + 0.5)
+        st = _alerts_backfill_state(db, cfg, now)
+        if not st["need"]:
+            return 120.0
+        d, pace = st["need"][0], _alert_worker["pace"]
+        # резервуємо «слот» запиту в базі: так кілька процесів сервера не змагаються за один ліміт
+        got = db.query(DBLessonAlertConfig).filter(DBLessonAlertConfig.id == cfg.id,
+                                                    (DBLessonAlertConfig.lease_until.is_(None)) | (DBLessonAlertConfig.lease_until <= now_iso)
+                                                    ).update({"lease_until": _sched_iso(now + timedelta(seconds=pace))}, synchronize_session=False)
+        db.commit()
+        if not got:
+            return 5.0
+        try:
+            payload = await run_in_threadpool(_alerts_get, "ukrainealarm", "/api/v3/alerts/dateHistory", {"date": d.replace("-", "")})
+        except AlertsApiError as e:
+            if e.retry_after is not None:                             # ліміт: чекаємо, скільки просить API, і сповільнюємось
+                wait = e.retry_after + 2
+                cool = _sched_iso(_sched_now() + timedelta(seconds=wait))
+                db.query(DBLessonAlertConfig).filter(DBLessonAlertConfig.id == cfg.id).update({"cooldown_until": cool, "lease_until": cool}, synchronize_session=False)
+                db.commit()
+                _alert_worker["pace"], _alert_worker["ok"] = min(ALERT_BACKFILL_MAX_GAP, pace * 1.5), 0
+                return wait + 0.5
+            _alerts_mark_error(db, d, str(e), st["cfg_hash"])         # інша помилка: позначили день, йдемо далі
+            return pace
+        except Exception as e:
+            _alerts_mark_error(db, d, f"Помилка запиту ({e.__class__.__name__})", st["cfg_hash"])
+            return pace
+        _alerts_store_day(db, d, payload, st["ids"], st["types"], st["cfg_hash"])
+        _alert_worker["ok"] += 1
+        if _alert_worker["ok"] >= 5:                                  # довго без проблем — можна трохи швидше
+            _alert_worker["pace"], _alert_worker["ok"] = max(ALERT_BACKFILL_GAP, pace * 0.8), 0
+        return pace
+    finally:
+        db.close()
+
+async def _alerts_worker_loop():
+    while True:
+        try:
+            delay = await _alerts_worker_step()
+        except Exception as e:                                        # ніколи не даємо працівнику впасти
+            print(f"[alerts-worker] {e.__class__.__name__}: {e}")
+            delay = 120.0
+        await asyncio.sleep(max(1.0, delay))
+
+def _alerts_worker_ensure():
+    """Запускає фонового працівника, якщо його ще немає (на старті сервера і при відкритті екрана)."""
+    t = _alert_worker["task"]
+    if t is None or t.done():
+        try:
+            _alert_worker["task"] = asyncio.get_running_loop().create_task(_alerts_worker_loop())
+        except RuntimeError:
+            pass
+
+@app.on_event("startup")
+async def _alerts_worker_startup():
+    _alerts_worker_ensure()
+
+def _alerts_progress(db, cfg, now: datetime) -> dict:
+    st = _alerts_backfill_state(db, cfg, now)
+    until = max(cfg.lease_until or "", cfg.cooldown_until or "")
+    wait = max(0, int((_sched_dt(until) - now).total_seconds()) + 1) if until > _sched_iso(now) else 0
+    return {"from": st["start"], "total": len(st["days"]), "done": st["done"], "complete": not st["need"],
+            "next_in": wait if st["need"] else 0, "rate_limited": bool(cfg.cooldown_until and cfg.cooldown_until > _sched_iso(now))}
 
 async def _alerts_fetch_inua(db, ctx, ids, types, cfg_hash, scan_uids, d_from, now):
     """alerts.in.ua: один запит = місяць історії одного uid. Ліміт 2/хв, тому — не більше одного запиту за раз."""
@@ -5281,31 +5385,38 @@ async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
     regions = (cfg.regions if cfg and cfg.regions else [])
     ctx = {"source": source, "source_label": ALERT_PROVIDERS[source]["label"], "enabled": bool(_alerts_key(source)), "configured": bool(regions),
            "ok": True, "error": None, "regions": [r["name"] for r in regions], "types": sorted(types), "failed_days": [], "excuse_min": ALERT_EXCUSE_MIN,
-           "pending_days": 0, "days_total": 0, "rate_limited": False, "retry_in": 0, "history_limited": False, "intervals": []}
+           "pending_days": 0, "days_total": 0, "rate_limited": False, "retry_in": 0, "history_limited": False, "history_before_start": False,
+           "backfill": None, "intervals": []}
     public_keys = ("source", "source_label", "enabled", "configured", "ok", "error", "regions", "types", "failed_days", "excuse_min",
-                   "pending_days", "days_total", "rate_limited", "retry_in", "history_limited")
+                   "pending_days", "days_total", "rate_limited", "retry_in", "history_limited", "history_before_start", "backfill")
     def finish():
         ctx["public"] = {k: ctx[k] for k in public_keys} | {"days": ctx.get("pub_days", {})}
         return ctx
     if not ctx["enabled"] or not regions:
         return finish()
-    ids = {str(r["id"]) for r in regions}
-    if source == "ukrainealarm":                       # вибраний регіон + його предки (тривога області/району діє й на громаду)
-        for r in regions:
-            ids.update(str(x) for x in (r.get("ancestors") or []))
-    cfg_hash = _alerts_cfg_hash(source, ids, types)
+    ids = _alerts_ids(regions, source)
     now = _sched_now()
-    today = now.strftime("%Y-%m-%d")
-
     if source == "alertsinua":
+        cfg_hash = _alerts_cfg_hash(source, ids, types)
         scan = sorted({str(r["scan_uid"]) for r in regions if r.get("scan_uid")})
         await _alerts_fetch_inua(db, ctx, ids, types, cfg_hash, scan, d_from, now)
     else:
-        sched_days = [d for (d,) in db.query(DBLessonSchedItem.lesson_date)
-                      .filter(DBLessonSchedItem.lesson_date >= d_from, DBLessonSchedItem.lesson_date <= min(d_to, today)).distinct().all()]
-        if sched_days:                                  # + попередня доба: нічна тривога могла тривати й вранці (один раз, далі з кешу)
-            sched_days.append((datetime.strptime(min(sched_days), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"))
-        await _alerts_fetch_ukrainealarm(db, ctx, ids, types, cfg_hash, sorted(set(sched_days)), now)
+        # ukrainealarm: екран НЕ ходить в API — історію у фоні збирає працівник (повільно, у межах ліміту) і зберігає назавжди
+        _alerts_worker_ensure()
+        st = _alerts_backfill_state(db, cfg, now)
+        lo_day = (datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        in_range = [d for d in st["days"] if lo_day <= d <= d_to]
+        pending = [d for d in in_range if d in st["need_set"] and not (d == st["today"] and d in st["recs"])]
+        ctx["days_total"], ctx["pending_days"] = len(in_range), len(pending)
+        ctx["backfill"] = _alerts_progress(db, cfg, now)
+        if pending or not ctx["backfill"]["complete"]:
+            ctx["retry_in"] = max(ctx["backfill"]["next_in"], int(_alert_worker["pace"]))
+            ctx["rate_limited"] = ctx["backfill"]["rate_limited"]
+        if d_from < st["start"]:
+            ctx["history_before_start"] = True                        # історію до обраної дати не збираємо
+        failed = [d for d in in_range if d in st["recs"] and st["recs"][d].status == "error" and d >= d_from]
+        if failed:
+            ctx["ok"], ctx["error"], ctx["failed_days"] = False, st["recs"][failed[0]].error, failed
 
     lo = (datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
     hi = d_to + "T23:59:59"
@@ -5341,6 +5452,7 @@ class AlertRegionSchema(BaseModel):
 class AlertConfigSchema(BaseModel):
     source: str = "ukrainealarm"
     regions: List[AlertRegionSchema]
+    history_from: Optional[str] = None          # з якої дати зберігати історію (YYYY-MM-DD)
 
 def _alerts_err_http(e: AlertsApiError):
     return HTTPException(status_code=429 if e.retry_after is not None else 502,
@@ -5356,6 +5468,10 @@ async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Sessio
            "types": [{"code": t, "label": ALERT_TYPE_LABELS.get(t, t)} for t in sorted(_alerts_types())],
            "updated_at": _sched_fmt_label(cfg.updated_at) if cfg else None}
     out["enabled"] = out["providers"][source]["enabled"]
+    out["history_from"] = _alerts_history_from(cfg)
+    out["history_from_default"] = ALERT_HISTORY_FROM_DEFAULT
+    if saved and source == "ukrainealarm" and out["enabled"]:
+        out["progress"] = _alerts_progress(db, cfg, _sched_now())
     if not saved and out["providers"]["ukrainealarm"]["enabled"]:
         try:
             out["suggested"] = _alerts_suggest(await run_in_threadpool(_alerts_regions_cached))
@@ -5425,16 +5541,30 @@ async def put_alerts_config(data: AlertConfigSchema, user: dict = Depends(requir
         if r.ancestors:
             item["ancestors"] = [str(x)[:40] for x in r.ancestors[:6]]
         regions.append(item)
+    hist = None
+    if data.history_from:
+        try:
+            hist = datetime.strptime(data.history_from.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Невірна дата початку історії (потрібно РРРР-ММ-ДД)")
+        if hist < "2022-02-24" or hist > _sched_now().strftime("%Y-%m-%d"):
+            raise HTTPException(status_code=400, detail="Дата початку історії має бути між 24.02.2022 і сьогодні")
     cfg = db.query(DBLessonAlertConfig).first()
     if not cfg:
         cfg = DBLessonAlertConfig()
         db.add(cfg)
+    types = _alerts_types()
+    old_sig = (_alerts_cfg_hash(cfg.source or "ukrainealarm", _alerts_ids(cfg.regions or [], cfg.source or "ukrainealarm"), types) if cfg.regions else None)
+    new_sig = _alerts_cfg_hash(data.source, _alerts_ids(regions, data.source), types)
     cfg.source, cfg.regions, cfg.updated_at, cfg.updated_by = data.source, regions, _sched_iso(_sched_now()), user.get("sub")
-    # інше джерело чи регіони — стару історію не змішуємо: скидаємо кеш, він завантажиться заново
-    db.query(DBLessonAlert).delete(synchronize_session=False)
-    db.query(DBLessonAlertDay).delete(synchronize_session=False)
+    if hist:
+        cfg.history_from = hist
+    if old_sig != new_sig:       # інше джерело чи регіони — стару історію не змішуємо: скидаємо збережене (якщо змінилась лише дата початку — нічого не втрачаємо)
+        db.query(DBLessonAlert).delete(synchronize_session=False)
+        db.query(DBLessonAlertDay).delete(synchronize_session=False)
     db.commit()
-    return {"source": data.source, "regions": regions}
+    _alerts_worker_ensure()
+    return {"source": data.source, "regions": regions, "history_from": _alerts_history_from(cfg)}
 
 @app.post("/api/cmyo/schedule/alerts/check")
 async def check_alerts_api(source: str = Query(default="ukrainealarm"), user: dict = Depends(require_cmyo_admin)):
@@ -5458,12 +5588,19 @@ class AlertsRefreshSchema(BaseModel):
 
 @app.post("/api/cmyo/schedule/alerts/refresh")
 async def refresh_alerts(data: AlertsRefreshSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    """Скидає кеш тривог за період — наступний запит розкладу завантажить історію заново (з урахуванням лімітів)"""
+    """Перезавантажує свіжі дані. Збережена історія минулих днів не змінюється, тому для ukrainealarm скидаємо лише вчора й сьогодні
+    (щоб не витрачати ліміт API на те, що вже є); для alerts.in.ua — місячну історію."""
     d_from = _parse_iso_date(data.date_from, "Від")
     d_to = _parse_iso_date(data.date_to, "До") or d_from
-    start = (datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    n = db.query(DBLessonAlertDay).filter((DBLessonAlertDay.day >= start) & (DBLessonAlertDay.day <= d_to) | DBLessonAlertDay.day.like("uid:%")).delete(synchronize_session=False)
+    cfg = db.query(DBLessonAlertConfig).first()
+    if cfg and cfg.source == "alertsinua":
+        n = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day.like("uid:%")).delete(synchronize_session=False)
+    else:
+        recent = (_sched_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        n = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day >= max(recent, d_from), DBLessonAlertDay.day <= d_to,
+                                              ~DBLessonAlertDay.day.like("uid:%")).delete(synchronize_session=False)
     db.commit()
+    _alerts_worker_ensure()
     return {"reset_days": n}
 
 
