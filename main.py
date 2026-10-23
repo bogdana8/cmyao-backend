@@ -4999,7 +4999,28 @@ def _alerts_key(provider: str = "ukrainealarm") -> str:
     return os.environ.get(ALERT_PROVIDERS[provider]["key_env"], "").strip()
 
 def _alerts_types() -> set:
-    return {x.strip().upper() for x in os.environ.get("UKRAINE_ALARM_TYPES", "AIR").split(",") if x.strip()}
+    """Які типи тривог рахуються. За замовчуванням — УСІ (повітряна, артилерійська тощо). Обмежити: UKRAINE_ALARM_TYPES=AIR"""
+    return {x.strip().upper() for x in os.environ.get("UKRAINE_ALARM_TYPES", "").split(",") if x.strip()}
+
+ALERT_DEFAULT_REGIONS = [{"id": "46", "name": "Криворізький район", "type": "District"}]   # regionId з api.ukrainealarm.com
+
+def _alerts_default_config(db):
+    """Налаштування тривог. Якщо їх ще немає, а ключ задано — одразу створюємо типові (Криворізький район, історія від 01.09.2026)."""
+    cfg = db.query(DBLessonAlertConfig).first()
+    if cfg is None and _alerts_key("ukrainealarm"):
+        cfg = DBLessonAlertConfig(source="ukrainealarm", regions=[dict(r) for r in ALERT_DEFAULT_REGIONS],
+                                  updated_at=_sched_iso(_sched_now()), updated_by="auto")
+        db.add(cfg)
+        db.commit()
+    return cfg
+
+def _alerts_utc_today() -> str:
+    from datetime import timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _alerts_day_final(fetched_at: str, d: str) -> bool:
+    """Доба API (вона за UTC!) уже завершилась на момент завантаження (з запасом 5 хв), тож історія за неї остаточна."""
+    return fetched_at >= _sched_iso(_utc_to_kyiv(datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)) + timedelta(minutes=5))
 
 def _alerts_get(provider: str, path: str, params: Optional[dict] = None):
     """Блокуючий GET (викликається в потоці). Ключ у повідомлення про помилку не потрапляє."""
@@ -5111,11 +5132,6 @@ def _alerts_regions_cached(force: bool = False) -> list:
     _alert_regions_cache.update(at=time.time(), items=items)
     return items
 
-def _alerts_suggest(items: list) -> list:
-    """Початковий вибір для Дніпропетровщини: область + Криворізький/Дніпровський район. Користувач підтверджує вручну."""
-    return [{"id": r["id"], "name": r["name"], "type": r["type"]} for r in items
-            if r["type"].lower() == "state" and "дніпропетров" in r["name"].lower()]
-
 def _alerts_parse_day(payload, region_ids: set, types: set, now: datetime) -> list:
     """ukrainealarm: відповідь dateHistory → тривоги обраних регіонів"""
     items = payload if isinstance(payload, list) else ((payload.get("alerts") or payload.get("items") or []) if isinstance(payload, dict) else [])
@@ -5214,9 +5230,10 @@ def _alerts_backfill_state(db, cfg, now: datetime) -> dict:
     regions = cfg.regions or []
     ids, types = _alerts_ids(regions, "ukrainealarm"), _alerts_types()
     cfg_hash = _alerts_cfg_hash("ukrainealarm", ids, types)
-    start, today = _alerts_history_from(cfg), now.strftime("%Y-%m-%d")
-    if start > today:
-        start = today
+    hist_from, today = _alerts_history_from(cfg), _alerts_utc_today()       # доба API — за UTC
+    if hist_from > today:
+        hist_from = today
+    start = (datetime.strptime(hist_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")   # ніч на першу дату по Києву починається в UTC попереднього дня
     days, d = [], datetime.strptime(start, "%Y-%m-%d")
     while d.strftime("%Y-%m-%d") <= today and len(days) < 900:
         days.append(d.strftime("%Y-%m-%d"))
@@ -5234,21 +5251,32 @@ def _alerts_backfill_state(db, cfg, now: datetime) -> dict:
         if r.status == "error":
             if age >= ALERT_ERROR_RETRY_SEC:
                 missing.append(d)
-        elif r.fetched_at[:10] <= d or d in with_cont:           # доба ще тривала на момент завантаження → потрібне перезавантаження
+        elif (not _alerts_day_final(r.fetched_at, d)) or d in with_cont:   # доба ще тривала на момент завантаження → потрібне перезавантаження
             if d == today and age < ALERT_TODAY_REFRESH_SEC:
                 stale.append(d)                                    # поточну добу оновлюємо не частіше, ніж раз на 10 хв
             else:
                 missing.append(d)
     # порядок: поточна доба → дні з парами (свіжіші першими) → решта (свіжіші першими)
     order = sorted(missing, key=lambda x: (x != today, x not in lesson_days, -int(x.replace("-", ""))))
-    return {"ids": ids, "types": types, "cfg_hash": cfg_hash, "start": start, "today": today, "days": days, "recs": recs,
+    return {"ids": ids, "types": types, "cfg_hash": cfg_hash, "start": start, "hist_from": hist_from, "today": today, "days": days, "recs": recs,
             "need": order, "need_set": set(order), "done": len(days) - len(order)}
 
 def _alerts_store_day(db, d: str, payload, ids, types, cfg_hash):
+    """Зберігає тривоги доби. Одна й та сама тривога приходить у відповідях кількох діб (вона перетинає межу UTC-доби) —
+    тому записуємо без дублів: ключ = регіон + тип + час початку; для вже відомої оновлюємо кінець і ознаку «триває»."""
     stamp = _sched_iso(_sched_now())
     rows = _alerts_parse_day(payload, ids, types, _sched_now())
-    db.query(DBLessonAlert).filter(DBLessonAlert.day == d).delete(synchronize_session=False)
-    _alerts_store_rows(db, rows, lambda r, d=d: d)
+    if rows:
+        lo = _sched_iso(min(r["start"] for r in rows) - timedelta(minutes=1))
+        hi = _sched_iso(max(r["start"] for r in rows) + timedelta(minutes=1))
+        known = {(a.region_id, a.alert_type, a.start_dt): a for a in
+                 db.query(DBLessonAlert).filter(DBLessonAlert.start_dt >= lo, DBLessonAlert.start_dt <= hi, DBLessonAlert.scan_uid.is_(None)).all()}
+        for r in rows:
+            a = known.get((r["region_id"], r["alert_type"], _sched_iso(r["start"])))
+            if a is not None:
+                a.end_dt, a.is_continue, a.region_name = _sched_iso(r["end"]), r["cont"], r["region_name"]
+            else:
+                _alerts_store_rows(db, [r], lambda x, d=d: d)
     rec = db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day == d).first() or DBLessonAlertDay(day=d, fetched_at=stamp)
     rec.status, rec.error, rec.count, rec.fetched_at, rec.cfg_hash = "ok", None, len(rows), stamp, cfg_hash
     db.add(rec)
@@ -5265,7 +5293,7 @@ async def _alerts_worker_step() -> float:
     """Один крок фонового завантаження історії: НЕ БІЛЬШЕ ОДНОГО запиту. Повертає, скільки секунд чекати до наступного кроку."""
     db = SessionLocal()
     try:
-        cfg = db.query(DBLessonAlertConfig).first()
+        cfg = _alerts_default_config(db)
         if not cfg or not cfg.regions or (cfg.source or "ukrainealarm") != "ukrainealarm" or not _alerts_key("ukrainealarm"):
             return 60.0
         now = _sched_now()
@@ -5333,7 +5361,7 @@ def _alerts_progress(db, cfg, now: datetime) -> dict:
     st = _alerts_backfill_state(db, cfg, now)
     until = max(cfg.lease_until or "", cfg.cooldown_until or "")
     wait = max(0, int((_sched_dt(until) - now).total_seconds()) + 1) if until > _sched_iso(now) else 0
-    return {"from": st["start"], "total": len(st["days"]), "done": st["done"], "complete": not st["need"],
+    return {"from": st["hist_from"], "total": len(st["days"]), "done": st["done"], "complete": not st["need"],
             "next_in": wait if st["need"] else 0, "rate_limited": bool(cfg.cooldown_until and cfg.cooldown_until > _sched_iso(now))}
 
 async def _alerts_fetch_inua(db, ctx, ids, types, cfg_hash, scan_uids, d_from, now):
@@ -5380,7 +5408,7 @@ async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
     """Готує тривоги для періоду: кеш → за потреби поступово докачує з API. Не кидає винятків:
     помилка/ліміт лише відображаються в ctx, а статуси рахуються з тим, що вже є."""
     types = _alerts_types()
-    cfg = db.query(DBLessonAlertConfig).first()
+    cfg = _alerts_default_config(db)
     source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
     regions = (cfg.regions if cfg and cfg.regions else [])
     ctx = {"source": source, "source_label": ALERT_PROVIDERS[source]["label"], "enabled": bool(_alerts_key(source)), "configured": bool(regions),
@@ -5412,7 +5440,7 @@ async def _alerts_prepare(db, d_from: str, d_to: str) -> dict:
         if pending or not ctx["backfill"]["complete"]:
             ctx["retry_in"] = max(ctx["backfill"]["next_in"], int(_alert_worker["pace"]))
             ctx["rate_limited"] = ctx["backfill"]["rate_limited"]
-        if d_from < st["start"]:
+        if d_from < st["hist_from"]:
             ctx["history_before_start"] = True                        # історію до обраної дати не збираємо
         failed = [d for d in in_range if d in st["recs"] and st["recs"][d].status == "error" and d >= d_from]
         if failed:
@@ -5460,7 +5488,7 @@ def _alerts_err_http(e: AlertsApiError):
 
 @app.get("/api/cmyo/schedule/alerts/config")
 async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    cfg = db.query(DBLessonAlertConfig).first()
+    cfg = _alerts_default_config(db)
     source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
     saved = (cfg.regions if cfg and cfg.regions else [])
     out = {"source": source, "saved": bool(saved), "regions": saved, "suggested": [], "excuse_min": ALERT_EXCUSE_MIN, "ok_ratio": SCHED_OK_RATIO,
@@ -5472,11 +5500,7 @@ async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Sessio
     out["history_from_default"] = ALERT_HISTORY_FROM_DEFAULT
     if saved and source == "ukrainealarm" and out["enabled"]:
         out["progress"] = _alerts_progress(db, cfg, _sched_now())
-    if not saved and out["providers"]["ukrainealarm"]["enabled"]:
-        try:
-            out["suggested"] = _alerts_suggest(await run_in_threadpool(_alerts_regions_cached))
-        except AlertsApiError as e:
-            out["suggest_error"] = str(e)
+    out["suggested"] = [dict(r) for r in ALERT_DEFAULT_REGIONS]          # швидке додавання Криворізького району (без запиту до API)
     return out
 
 @app.get("/api/cmyo/schedule/alerts/regions")
@@ -5603,6 +5627,97 @@ async def refresh_alerts(data: AlertsRefreshSchema, user: dict = Depends(require
     _alerts_worker_ensure()
     return {"reset_days": n}
 
+
+# ── Історія тривог для вкладки «Тривоги» ─────────────────────────
+@app.get("/api/cmyo/schedule/alerts/history")
+async def alerts_history(date_from: Optional[str] = None, date_to: Optional[str] = None,
+                         user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Усі збережені тривоги за період по днях (за київським часом): тривалість, перетин зі слотами пар, повнота даних."""
+    cfg = _alerts_default_config(db)
+    now = _sched_now()
+    today = now.strftime("%Y-%m-%d")
+    source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
+    regions = (cfg.regions if cfg and cfg.regions else [])
+    hist_from = _alerts_history_from(cfg)
+    d_to = _parse_iso_date(date_to, "До") or today
+    d_from = _parse_iso_date(date_from, "Від") or hist_from
+    if d_from > d_to:
+        d_from, d_to = d_to, d_from
+    d_to = min(d_to, today)
+    if (datetime.strptime(d_to, "%Y-%m-%d") - datetime.strptime(d_from, "%Y-%m-%d")).days > 400:
+        raise HTTPException(status_code=400, detail="Максимальний період — 400 днів")
+    out = {"configured": bool(regions), "enabled": bool(_alerts_key(source)), "source": source, "source_label": ALERT_PROVIDERS[source]["label"],
+           "regions": [r["name"] for r in regions], "history_from": hist_from, "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES,
+           "slots": [{"no": i + 1, "start": t, "end": (datetime.strptime(t, "%H:%M") + timedelta(minutes=SCHED_SLOT_MINUTES)).strftime("%H:%M")}
+                     for i, t in enumerate(SCHED_SLOT_STARTS)],
+           "days": [], "summary": {}, "types": {}, "progress": None}
+    if not out["enabled"] or not regions:
+        return out
+    if source == "ukrainealarm":
+        out["progress"] = _alerts_progress(db, cfg, now)
+    lo, hi = d_from + "T00:00:00", d_to + "T23:59:59"
+    uniq = {}
+    for a in db.query(DBLessonAlert).filter(DBLessonAlert.start_dt <= hi, DBLessonAlert.end_dt >= lo).all():
+        if (source == "alertsinua") != bool(a.scan_uid):
+            continue
+        k = (a.region_id, a.alert_type or "UNKNOWN", a.start_dt)
+        if k not in uniq or a.end_dt > uniq[k].end_dt:
+            uniq[k] = a
+    alerts = sorted(((_sched_dt(a.start_dt), _sched_dt(a.end_dt), a.alert_type or "UNKNOWN", a.region_name or "", bool(a.is_continue)) for a in uniq.values()),
+                    key=lambda x: x[0])
+    recs = {r.day: r for r in db.query(DBLessonAlertDay).filter(DBLessonAlertDay.day >= (datetime.strptime(d_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"),
+                                                                DBLessonAlertDay.day <= d_to).all()}
+    types_c, days, tot_min, pair_min, pair_total, with_alerts, complete_days = defaultdict(int), [], 0.0, 0.0, 0.0, 0, 0
+    day = datetime.strptime(d_from, "%Y-%m-%d")
+    while day.strftime("%Y-%m-%d") <= d_to:
+        ds = day.strftime("%Y-%m-%d")
+        d0, d1 = day, day + timedelta(days=1)
+        prev = (day - timedelta(days=1)).strftime("%Y-%m-%d")
+        if source == "ukrainealarm":                         # доба повна, якщо завантажено UTC-доби ds і попередню
+            complete = all(p in recs and recs[p].status == "ok" for p in (prev, ds))
+        else:
+            complete = True
+        day_alerts = [a for a in alerts if a[0] < d1 and a[1] > d0]
+        clipped = [(max(a[0], d0), min(a[1], d1)) for a in day_alerts]
+        union = _sched_overlap_minutes(d0, d1, clipped) if clipped else 0.0
+        slots = []
+        for i, t in enumerate(SCHED_SLOT_STARTS):
+            ws = datetime.strptime(f"{ds} {t}", "%Y-%m-%d %H:%M")
+            we = ws + timedelta(minutes=SCHED_SLOT_MINUTES)
+            slots.append({"no": i + 1, "min": int(round(_sched_overlap_minutes(ws, we, clipped))) if clipped else 0})
+        items = []
+        for a in day_alerts:
+            s_, e_ = max(a[0], d0), min(a[1], d1)
+            a_slots = []
+            for i, t in enumerate(SCHED_SLOT_STARTS):
+                ws = datetime.strptime(f"{ds} {t}", "%Y-%m-%d %H:%M")
+                m_ = _sched_overlap_minutes(ws, ws + timedelta(minutes=SCHED_SLOT_MINUTES), [(s_, e_)])
+                if m_ >= 1:
+                    a_slots.append({"no": i + 1, "min": int(round(m_))})
+            items.append({"start": s_.strftime("%H:%M"), "end": "24:00" if e_ >= d1 else e_.strftime("%H:%M"),
+                          "start_at": _sched_iso(a[0]), "end_at": _sched_iso(a[1]), "type": a[2], "region": a[3],
+                          "duration_min": int(round((a[1] - a[0]).total_seconds() / 60)), "minutes_in_day": int(round((e_ - s_).total_seconds() / 60)),
+                          "from_prev_day": a[0] < d0, "continues_next_day": a[1] > d1, "ongoing": a[4], "slots": a_slots})
+            if a[0] >= d0:
+                types_c[a[2]] += 1                           # тип рахуємо один раз — у день початку
+        days.append({"date": ds, "complete": complete, "count": sum(1 for i in items if not i["from_prev_day"]), "total_min": int(round(union)),
+                     "pair_min": sum(s["min"] for s in slots), "slots": slots, "alerts": items})
+        tot_min += union
+        if union:
+            with_alerts += 1
+        if complete:
+            complete_days += 1
+            pair_min += sum(s["min"] for s in slots)
+            pair_total += len(SCHED_SLOT_STARTS) * SCHED_SLOT_MINUTES
+        day += timedelta(days=1)
+    started = [a for a in alerts if lo <= _sched_iso(a[0]) <= hi]
+    durs = [(a[1] - a[0]).total_seconds() / 60 for a in started]
+    out["days"] = list(reversed(days))
+    out["types"] = dict(types_c)
+    out["summary"] = {"alerts": len(started), "total_min": int(round(tot_min)), "avg_min": int(round(sum(durs) / len(durs))) if durs else 0,
+                      "max_min": int(round(max(durs))) if durs else 0, "days": len(days), "days_complete": complete_days, "days_with_alerts": with_alerts,
+                      "pair_min": int(round(pair_min)), "pair_pct": round(pair_min / pair_total * 100, 1) if pair_total else 0.0}
+    return out
 
 @app.get("/api/cmyo/schedule/overview")
 async def schedule_overview(date_from: str, date_to: Optional[str] = None,
