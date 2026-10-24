@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -23,6 +23,7 @@ import hashlib
 import zipfile
 import difflib
 import asyncio
+import hmac
 from starlette.concurrency import run_in_threadpool
 from collections import defaultdict
 from fastapi.staticfiles import StaticFiles
@@ -595,6 +596,8 @@ class DBLessonZoomMeeting(Base):
     end_dt          = Column(String, nullable=False)
     duration_sec    = Column(Integer, nullable=False, default=0)
     participants    = Column(Integer, nullable=True)
+    source          = Column(String, nullable=True)                               # csv | api | webhook (порожньо = csv)
+    meeting_uuid    = Column(String, nullable=True, index=True)                   # uuid зустрічі в Zoom
     batch_id        = Column(Integer, nullable=True, index=True)
 
 # =========================================================
@@ -635,6 +638,45 @@ class DBLessonAlert(Base):
     end_dt      = Column(String, nullable=False)
     is_continue = Column(Boolean, nullable=False, default=False)   # тривога ще триває
     scan_uid    = Column(String, nullable=True, index=True)        # alerts.in.ua: за яким запитом (uid області/району) отримано
+
+# =========================================================
+# 🎥 ZOOM API (Server-to-Server OAuth + вебхуки) — ТАБЛИЦІ
+# Зустрічі з API/вебхуків потрапляють у ту саму lesson_zoom_meetings, що й завантажений CSV (без дублів).
+# =========================================================
+class DBZoomSync(Base):
+    """Стан автоматичної синхронізації з Zoom (один рядок)"""
+    __tablename__ = "lesson_zoom_sync"
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    history_from    = Column(String, nullable=True)       # з якої дати збирати зустрічі (YYYY-MM-DD)
+    synced_to       = Column(String, nullable=True)       # ISO (київський час): дані з API повні до цього моменту
+    last_run_at     = Column(String, nullable=True)
+    last_ok_at      = Column(String, nullable=True)
+    last_error      = Column(String, nullable=True)
+    last_webhook_at = Column(String, nullable=True)       # коли востаннє прийшло сповіщення від Zoom
+    lease_until     = Column(String, nullable=True)       # спільний «слот» запитів для всіх процесів
+    cooldown_until  = Column(String, nullable=True)       # пауза після ліміту/помилки
+    last_stats      = Column(JSON, default=dict)
+
+class DBZoomEvent(Base):
+    """Сповіщення від Zoom (meeting.started / meeting.ended) — для моніторингу «зараз проходять»"""
+    __tablename__ = "lesson_zoom_events"
+    id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    event        = Column(String, nullable=False)
+    meeting_uuid = Column(String, nullable=True, index=True)
+    meeting_id   = Column(String, nullable=True)
+    host_id      = Column(String, nullable=True)
+    topic        = Column(String, nullable=True)
+    start_dt     = Column(String, nullable=True)
+    end_dt       = Column(String, nullable=True)
+    received_at  = Column(String, nullable=False, index=True)
+
+class DBZoomUser(Base):
+    """Кеш: Zoom host_id → e-mail та ім'я (щоб не запитувати щоразу)"""
+    __tablename__ = "lesson_zoom_users"
+    host_id    = Column(String, primary_key=True)
+    email      = Column(String, nullable=True)
+    name       = Column(String, nullable=True)
+    fetched_at = Column(String, nullable=False)
 
 Base.metadata.create_all(bind=engine)
 
@@ -707,6 +749,8 @@ def _run_migrations():
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS lease_until VARCHAR",
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS cooldown_until VARCHAR",
         "ALTER TABLE lesson_alerts ADD COLUMN IF NOT EXISTS scan_uid VARCHAR",
+        "ALTER TABLE lesson_zoom_meetings ADD COLUMN IF NOT EXISTS source VARCHAR",
+        "ALTER TABLE lesson_zoom_meetings ADD COLUMN IF NOT EXISTS meeting_uuid VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -5718,6 +5762,560 @@ async def alerts_history(date_from: Optional[str] = None, date_to: Optional[str]
                       "max_min": int(round(max(durs))) if durs else 0, "days": len(days), "days_complete": complete_days, "days_with_alerts": with_alerts,
                       "pair_min": int(round(pair_min)), "pair_pct": round(pair_min / pair_total * 100, 1) if pair_total else 0.0}
     return out
+
+# =========================================================
+# 🎥 ZOOM API — підключення, синхронізація, вебхуки, моніторинг
+# Змінні середовища (значення беруться з Zoom Marketplace → ваш додаток → App Credentials):
+#   ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET   — Server-to-Server OAuth (минулі конференції);
+#   ZOOM_WEBHOOK_SECRET_TOKEN                              — Secret Token з Features → Event Subscriptions (вебхуки);
+#   PUBLIC_BASE_URL (необов'язково)                        — публічна адреса бекенду для підказки URL вебхука.
+# Права (scopes) додатка: dashboard_meetings:read:admin (список конференцій), user:read:admin (e-mail організатора).
+# Минулі конференції беруться з Dashboard API (GET /v2/metrics/meetings) — це той самий звіт, що ви раніше завантажували в CSV.
+# =========================================================
+ZOOM_HISTORY_FROM_DEFAULT = "2026-09-01"
+ZOOM_SYNC_INTERVAL_SEC = 600         # у режимі «наздогнали» оновлюємося раз на 10 хв
+ZOOM_CHUNK_DAYS = 7                  # за один крок — не більше тижня історії
+ZOOM_STEP_GAP_SEC = 15               # пауза між кроками, поки наздоганяємо історію
+ZOOM_ERROR_RETRY_SEC = 300           # після помилки (не ліміт) наступна спроба через 5 хв
+ZOOM_PAGE_SIZE = 300
+ZOOM_MAX_PAGES = 120
+ZOOM_LIVE_TTL_SEC = 30
+_zoom_tok = {"value": None, "exp": 0.0, "scope": ""}
+_zoom_worker = {"task": None}
+_zoom_live_cache = {"at": 0.0, "items": []}
+
+class ZoomApiError(Exception):
+    def __init__(self, msg, retry_after=None, code=None):
+        super().__init__(msg)
+        self.retry_after, self.code = retry_after, code
+
+def _zoom_creds():
+    return (os.environ.get("ZOOM_ACCOUNT_ID", "").strip(), os.environ.get("ZOOM_CLIENT_ID", "").strip(), os.environ.get("ZOOM_CLIENT_SECRET", "").strip())
+
+def _zoom_configured() -> bool:
+    return all(_zoom_creds())
+
+def _zoom_webhook_secret() -> str:
+    return os.environ.get("ZOOM_WEBHOOK_SECRET_TOKEN", "").strip()
+
+def _zoom_token(force: bool = False) -> str:
+    """Токен Server-to-Server OAuth (діє 1 годину; кешуємо)"""
+    if not force and _zoom_tok["value"] and time.time() < _zoom_tok["exp"] - 120:
+        return _zoom_tok["value"]
+    acc, cid, sec = _zoom_creds()
+    if not (acc and cid and sec):
+        raise ZoomApiError("Не задано ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID та ZOOM_CLIENT_SECRET")
+    url = os.environ.get("ZOOM_OAUTH_URL", "https://zoom.us/oauth/token")
+    try:
+        r = requests.post(url, params={"grant_type": "account_credentials", "account_id": acc}, auth=(cid, sec), timeout=15)
+    except requests.RequestException as e:
+        raise ZoomApiError(f"Немає зв'язку із zoom.us ({e.__class__.__name__})")
+    if r.status_code != 200:
+        try:
+            j = r.json()
+        except ValueError:
+            j = {}
+        reason = str(j.get("reason") or j.get("error_description") or j.get("error") or "")
+        if "client" in reason.lower() or j.get("error") == "invalid_client":
+            raise ZoomApiError("Zoom не прийняв Client ID / Client Secret. Перевірте ZOOM_CLIENT_ID і ZOOM_CLIENT_SECRET")
+        if "account" in reason.lower() or r.status_code == 400:
+            raise ZoomApiError(f"Zoom відхилив запит токена: {reason or 'перевірте ZOOM_ACCOUNT_ID і що додаток типу Server-to-Server OAuth активовано'}")
+        raise ZoomApiError(f"Не вдалося отримати токен Zoom (HTTP {r.status_code})")
+    d = r.json()
+    _zoom_tok.update(value=d["access_token"], exp=time.time() + int(d.get("expires_in", 3600)), scope=str(d.get("scope") or ""))
+    return _zoom_tok["value"]
+
+def _zoom_get(path: str, params: Optional[dict] = None, _retry: bool = True):
+    token = _zoom_token()
+    base = os.environ.get("ZOOM_API_BASE_URL", "https://api.zoom.us/v2").rstrip("/")
+    try:
+        r = requests.get(base + path, params=params, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=25)
+    except requests.RequestException as e:
+        raise ZoomApiError(f"Немає зв'язку із Zoom ({e.__class__.__name__})")
+    if r.status_code == 401 and _retry:
+        _zoom_token(force=True)
+        return _zoom_get(path, params, False)
+    if r.status_code == 429:
+        try:
+            ra = float(r.headers.get("Retry-After", ""))
+        except ValueError:
+            ra = 60.0
+        raise ZoomApiError("Ліміт запитів Zoom (HTTP 429)", retry_after=max(5.0, min(ra, 900.0)))
+    if r.status_code >= 400:
+        try:
+            j = r.json()
+        except ValueError:
+            j = {}
+        msg, code = str(j.get("message") or ""), j.get("code")
+        m = re.search(r"scopes?:\s*\[([^\]]+)\]", msg)
+        if m or code == 4700:
+            raise ZoomApiError(f"У додатку Zoom немає потрібних прав: {m.group(1) if m else msg}. Додайте їх у Marketplace → Scopes і збережіть додаток", code=code)
+        if "paid" in msg.lower() or "dashboard" in msg.lower() or "business" in msg.lower():
+            raise ZoomApiError("Dashboard недоступний на цьому тарифі Zoom (потрібен платний акаунт з увімкненим Dashboard). " + msg, code=code)
+        raise ZoomApiError(f"Zoom повернув помилку HTTP {r.status_code}" + (f": {msg}" if msg else ""), code=code)
+    try:
+        return r.json()
+    except ValueError:
+        raise ZoomApiError("Zoom повернув відповідь не у форматі JSON")
+
+def _zoom_fetch_meetings(d_from: str, d_to: str, mtype: str = "past") -> list:
+    """Усі конференції акаунта за період (Dashboard API), з пагінацією. Блокуюча — викликати в потоці."""
+    out, token, pages = [], None, 0
+    while pages < ZOOM_MAX_PAGES:
+        params = {"type": mtype, "page_size": ZOOM_PAGE_SIZE}
+        if token:
+            params["next_page_token"] = token                    # токен сторінки живе недовго — беремо сторінки одразу
+        else:
+            params.update({"from": d_from, "to": d_to})
+        data = _zoom_get("/metrics/meetings", params)
+        out.extend(data.get("meetings") or [])
+        token, pages = data.get("next_page_token"), pages + 1
+        if not token:
+            break
+        time.sleep(0.3)
+    return out
+
+def _zoom_state(db):
+    st = db.query(DBZoomSync).first()
+    if st is None:
+        st = DBZoomSync(history_from=ZOOM_HISTORY_FROM_DEFAULT)
+        db.add(st)
+        db.commit()
+    return st
+
+def _zoom_history_from(st) -> str:
+    v = (st.history_from if st and st.history_from else ZOOM_HISTORY_FROM_DEFAULT)
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+        return v
+    except ValueError:
+        return ZOOM_HISTORY_FROM_DEFAULT
+
+_ZOOM_SRC_RANK = {"webhook": 1, "csv": 2, None: 2, "api": 3}
+
+def _zoom_upsert(db, accounts: dict, index, teachers, *, mid, uuid, host_name, host_email, topic, start, end, participants, source) -> str:
+    """Додає або доповнює зустріч. Повертає new | updated | same. Одна й та сама зустріч із CSV, API та вебхука не дублюється."""
+    ek = _zm_email_key(host_email, host_name)
+    acc = accounts.get(ek)
+    if acc is None:
+        acc = DBLessonZoomAccount(email_key=ek, display_name=host_name or None, link_status="none", created_at=_sched_iso(_sched_now()))
+        db.add(acc)
+        db.flush()
+        accounts[ek] = acc
+        _zm_autolink(db, [acc], teachers)
+    fp = hashlib.sha1(f"{mid}|{_sched_iso(start)}|{ek}".encode("utf-8")).hexdigest()
+    ex = db.query(DBLessonZoomMeeting).filter(DBLessonZoomMeeting.fingerprint == fp).first()
+    if ex is None and mid:                                       # той самий дзвінок, але час відрізняється на секунди / інший спосіб отримання
+        ex = db.query(DBLessonZoomMeeting).filter(DBLessonZoomMeeting.meeting_id == mid,
+                                                   DBLessonZoomMeeting.start_dt >= _sched_iso(start - timedelta(seconds=90)),
+                                                   DBLessonZoomMeeting.start_dt <= _sched_iso(start + timedelta(seconds=90))).first()
+    dur = max(0, int((end - start).total_seconds()))
+    if ex is None:
+        db.add(DBLessonZoomMeeting(fingerprint=fp, meeting_id=mid, topic=topic, organizer_name=host_name or None, account_id=acc.id,
+                                   start_dt=_sched_iso(start), end_dt=_sched_iso(end), duration_sec=dur, participants=participants,
+                                   source=source, meeting_uuid=uuid))
+        return "new"
+    changed = False
+    if ex.account_id != acc.id and not ek.startswith("name:"):  # раніше організатора не знали (вебхук) — тепер знаємо e-mail
+        old = db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.id == ex.account_id).first()
+        if old is None or old.email_key.startswith("name:"):
+            ex.account_id, changed = acc.id, True
+    if _ZOOM_SRC_RANK.get(source, 1) >= _ZOOM_SRC_RANK.get(ex.source, 2) and ex.end_dt != _sched_iso(end):
+        ex.end_dt, ex.duration_sec, changed = _sched_iso(end), dur, True
+    if participants is not None and ex.participants != participants:
+        ex.participants, changed = participants, True
+    if not ex.topic and topic:
+        ex.topic, changed = topic, True
+    if not ex.meeting_uuid and uuid:
+        ex.meeting_uuid, changed = uuid, True
+    if not ex.organizer_name and host_name:
+        ex.organizer_name, changed = host_name, True
+    if _ZOOM_SRC_RANK.get(source, 1) > _ZOOM_SRC_RANK.get(ex.source, 2):
+        ex.source, changed = source, True
+    return "updated" if changed else "same"
+
+def _zoom_ingest_many(db, items: list, source: str) -> dict:
+    teachers = db.query(DBLessonTeacher).all()
+    index = _zm_teacher_index(teachers)
+    accounts = {a.email_key: a for a in db.query(DBLessonZoomAccount).all()}
+    n_acc = len(accounts)
+    stats = {"fetched": len(items), "new": 0, "updated": 0, "same": 0, "skipped": 0}
+    for it in items:
+        start, end = _alerts_to_kyiv(it.get("start_time")), _alerts_to_kyiv(it.get("end_time"))
+        if not start or not end or end < start:
+            stats["skipped"] += 1
+            continue
+        mid = re.sub(r"\D", "", str(it.get("id") or "")) or None
+        res = _zoom_upsert(db, accounts, index, teachers, mid=mid, uuid=it.get("uuid"), host_name=_clean(str(it.get("host") or "")),
+                           host_email=str(it.get("email") or ""), topic=(_clean(str(it.get("topic") or ""))[:500] or None),
+                           start=start, end=end, participants=(int(it["participants"]) if str(it.get("participants") or "").isdigit() else None), source=source)
+        stats[res] += 1
+    stats["accounts_new"] = len(accounts) - n_acc
+    db.commit()
+    return stats
+
+def _zoom_touch_coverage(db, st):
+    """Реєструє «за який період є дані Zoom» — на цьому тримається розрахунок статусів пар (проведено / не знайдено / очікується)"""
+    if not st.synced_to:
+        return
+    b = db.query(DBLessonSchedBatch).filter(DBLessonSchedBatch.kind == "zoom", DBLessonSchedBatch.filename == "Zoom API").first()
+    if b is None:
+        b = DBLessonSchedBatch(kind="zoom", filename="Zoom API", created_by="zoom-api", created_at=_sched_iso(_sched_now()))
+        db.add(b)
+    b.period_from, b.period_to, b.data_until = _zoom_history_from(st) + "T00:00:00", st.synced_to, st.synced_to
+    b.created_at, b.stats = _sched_iso(_sched_now()), dict(st.last_stats or {})
+
+async def _zoom_sync_window(db, st, now: datetime, force_from=None, force_to=None) -> dict:
+    """Один крок синхронізації: вікно до ZOOM_CHUNK_DAYS. Повертає {'ok', 'stats', 'error', 'wait'}."""
+    hist = datetime.strptime(_zoom_history_from(st), "%Y-%m-%d")
+    if force_from:
+        wf, wt = force_from, force_to
+    else:
+        wf = hist if not st.synced_to else max(hist, _sched_dt(st.synced_to) - timedelta(days=1))   # перекриття на добу — щоб не втратити зустрічі, що закінчились пізно
+        wt = min(wf + timedelta(days=ZOOM_CHUNK_DAYS), now)
+    d_from = (wf - timedelta(days=1)).strftime("%Y-%m-%d")                                           # запас на різницю UTC і Києва
+    d_to = (wt + timedelta(days=1)).strftime("%Y-%m-%d")
+    st.last_run_at = _sched_iso(now)
+    st.lease_until = _sched_iso(now + timedelta(seconds=ZOOM_STEP_GAP_SEC))
+    db.commit()
+    try:
+        items = await run_in_threadpool(_zoom_fetch_meetings, d_from, d_to)
+    except ZoomApiError as e:
+        wait = (e.retry_after + 2) if e.retry_after is not None else ZOOM_ERROR_RETRY_SEC
+        st.last_error = str(e)
+        st.cooldown_until = _sched_iso(_sched_now() + timedelta(seconds=wait))
+        db.commit()
+        return {"ok": False, "error": str(e), "wait": wait, "rate_limited": e.retry_after is not None}
+    stats = _zoom_ingest_many(db, items, "api")
+    stats.update(date_from=d_from, date_to=d_to)
+    if not force_from:
+        st.synced_to = _sched_iso(wt if wt < now - timedelta(minutes=5) else now - timedelta(minutes=5))
+    st.last_ok_at, st.last_error, st.cooldown_until, st.last_stats = _sched_iso(_sched_now()), None, None, stats
+    _zoom_touch_coverage(db, st)
+    db.commit()
+    return {"ok": True, "stats": stats, "wait": ZOOM_STEP_GAP_SEC}
+
+async def _zoom_worker_step() -> float:
+    """Крок фонового працівника: не більше одного вікна запитів. Повертає, скільки секунд чекати до наступного."""
+    if not _zoom_configured():
+        return 120.0
+    db = SessionLocal()
+    try:
+        st = _zoom_state(db)
+        now = _sched_now()
+        now_iso = _sched_iso(now)
+        until = max(st.lease_until or "", st.cooldown_until or "")
+        if until > now_iso:
+            return max(2.0, (_sched_dt(until) - now).total_seconds() + 0.5)
+        if st.synced_to and st.synced_to >= _sched_iso(now - timedelta(seconds=ZOOM_SYNC_INTERVAL_SEC)):
+            return max(15.0, (_sched_dt(st.synced_to) + timedelta(seconds=ZOOM_SYNC_INTERVAL_SEC) - now).total_seconds() + 1)
+        got = db.query(DBZoomSync).filter(DBZoomSync.id == st.id, (DBZoomSync.lease_until.is_(None)) | (DBZoomSync.lease_until <= now_iso)
+                                          ).update({"lease_until": _sched_iso(now + timedelta(seconds=ZOOM_STEP_GAP_SEC))}, synchronize_session=False)
+        db.commit()
+        if not got:
+            return 5.0
+        db.refresh(st)
+        res = await _zoom_sync_window(db, st, now)
+        return float(res["wait"])
+    finally:
+        db.close()
+
+async def _zoom_worker_loop():
+    while True:
+        try:
+            delay = await _zoom_worker_step()
+        except Exception as e:
+            print(f"[zoom-worker] {e.__class__.__name__}: {e}")
+            delay = 120.0
+        await asyncio.sleep(max(1.0, delay))
+
+def _zoom_worker_ensure():
+    t = _zoom_worker["task"]
+    if t is None or t.done():
+        try:
+            _zoom_worker["task"] = asyncio.get_running_loop().create_task(_zoom_worker_loop())
+        except RuntimeError:
+            pass
+
+@app.on_event("startup")
+async def _zoom_worker_startup():
+    _zoom_worker_ensure()
+
+# ── Вебхуки Zoom ───────────────────────────────────────────────
+def _zoom_lookup_user(db, host_id: Optional[str]) -> dict:
+    """host_id → {email, name}: спершу кеш, потім GET /users/{id}. Помилки не фатальні."""
+    if not host_id:
+        return {"email": None, "name": None}
+    u = db.query(DBZoomUser).filter(DBZoomUser.host_id == host_id).first()
+    if u is not None:
+        return {"email": u.email, "name": u.name}
+    if not _zoom_configured():
+        return {"email": None, "name": None}
+    try:
+        j = _zoom_get(f"/users/{host_id}")
+    except ZoomApiError:
+        return {"email": None, "name": None}
+    name = _clean(str(j.get("display_name") or f"{j.get('first_name') or ''} {j.get('last_name') or ''}"))
+    db.add(DBZoomUser(host_id=host_id, email=(j.get("email") or None), name=name or None, fetched_at=_sched_iso(_sched_now())))
+    db.commit()
+    return {"email": j.get("email"), "name": name or None}
+
+def _zoom_handle_event(payload: dict):
+    """Обробка сповіщення (у фоні, після відповіді Zoom): журнал подій + збереження завершеної конференції."""
+    db = SessionLocal()
+    try:
+        ev = payload.get("event")
+        obj = (payload.get("payload") or {}).get("object") or {}
+        if ev not in ("meeting.started", "meeting.ended"):
+            return
+        uuid, mid = obj.get("uuid"), re.sub(r"\D", "", str(obj.get("id") or "")) or None
+        start, end = _alerts_to_kyiv(obj.get("start_time")), _alerts_to_kyiv(obj.get("end_time"))
+        stamp = _sched_iso(_sched_now())
+        st = _zoom_state(db)
+        st.last_webhook_at = stamp
+        if uuid and db.query(DBZoomEvent.id).filter(DBZoomEvent.event == ev, DBZoomEvent.meeting_uuid == uuid).first():
+            db.commit()
+            return                                               # повторне сповіщення (Zoom може надсилати двічі)
+        db.add(DBZoomEvent(event=ev, meeting_uuid=uuid, meeting_id=mid, host_id=str(obj.get("host_id") or "") or None, topic=_clean(str(obj.get("topic") or ""))[:500] or None,
+                           start_dt=_sched_iso(start) if start else None, end_dt=_sched_iso(end) if end else None, received_at=stamp))
+        db.commit()
+        host = _zoom_lookup_user(db, str(obj.get("host_id") or "") or None)
+        if ev == "meeting.ended" and start and end and end >= start:
+            teachers = db.query(DBLessonTeacher).all()
+            _zoom_upsert(db, {a.email_key: a for a in db.query(DBLessonZoomAccount).all()}, _zm_teacher_index(teachers), teachers, mid=mid, uuid=uuid,
+                         host_name=host["name"] or (f"zoomhost {obj.get('host_id')}" if not host["email"] else ""), host_email=host["email"] or "",
+                         topic=_clean(str(obj.get("topic") or ""))[:500] or None, start=start, end=end, participants=None, source="webhook")
+            db.commit()
+    except Exception as e:
+        print(f"[zoom-webhook] {e.__class__.__name__}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+@app.post("/api/zoom/webhook")
+async def zoom_webhook(request: Request, background: BackgroundTasks):
+    """Публічна адреса для Event Subscriptions у Zoom. Кожен запит перевіряється за підписом (HMAC-SHA256, Secret Token)."""
+    secret = _zoom_webhook_secret()
+    raw = await request.body()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Невірний JSON")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Не задано ZOOM_WEBHOOK_SECRET_TOKEN на сервері")
+    if payload.get("event") == "endpoint.url_validation":        # перевірка адреси при натисканні «Validate» у Zoom
+        plain = str((payload.get("payload") or {}).get("plainToken") or "")
+        return {"plainToken": plain, "encryptedToken": hmac.new(secret.encode(), plain.encode(), hashlib.sha256).hexdigest()}
+    ts, sig = request.headers.get("x-zm-request-timestamp", ""), request.headers.get("x-zm-signature", "")
+    expected = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{raw.decode('utf-8')}".encode(), hashlib.sha256).hexdigest()
+    if not sig or not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="Невірний підпис")
+    try:
+        if abs(time.time() - float(ts)) > 300:                   # захист від повторного надсилання старих запитів
+            raise HTTPException(status_code=401, detail="Запит застарів")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Невірна мітка часу")
+    background.add_task(_zoom_handle_event, payload)             # Zoom чекає відповідь ~3 с, тож усе важке — після відповіді
+    return {"status": "ok"}
+
+# ── Ендпоїнти кабінету ──────────────────────────────────────────
+def _zoom_public_url(request: Request) -> str:
+    base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+        base = f"{proto}://{host}"
+    return base + "/api/zoom/webhook"
+
+@app.get("/api/cmyo/zoom/status")
+async def zoom_status(request: Request, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    st = _zoom_state(db)
+    _zoom_worker_ensure()
+    acc, cid, sec = _zoom_creds()
+    now = _sched_now()
+    until = max(st.lease_until or "", st.cooldown_until or "")
+    cnt = dict(db.query(DBLessonZoomMeeting.source, func.count(DBLessonZoomMeeting.id)).group_by(DBLessonZoomMeeting.source).all())
+    linked = db.query(DBLessonZoomAccount.id).filter(DBLessonZoomAccount.lesson_teacher_id.isnot(None)).count()
+    total_acc = db.query(DBLessonZoomAccount.id).filter(DBLessonZoomAccount.link_status != "ignored").count()
+    return {
+        "configured": _zoom_configured(),
+        "creds": {"ZOOM_ACCOUNT_ID": bool(acc), "ZOOM_CLIENT_ID": bool(cid), "ZOOM_CLIENT_SECRET": bool(sec), "ZOOM_WEBHOOK_SECRET_TOKEN": bool(_zoom_webhook_secret())},
+        "webhook_url": _zoom_public_url(request), "webhook_ready": bool(_zoom_webhook_secret()), "last_webhook_at": _sched_fmt_label(st.last_webhook_at),
+        "sync": {"history_from": _zoom_history_from(st), "synced_to": _sched_fmt_label(st.synced_to), "last_ok_at": _sched_fmt_label(st.last_ok_at),
+                 "last_error": st.last_error, "rate_limited": bool(st.cooldown_until and st.cooldown_until > _sched_iso(now)),
+                 "next_in": max(0, int((_sched_dt(until) - now).total_seconds()) + 1) if until > _sched_iso(now) else 0,
+                 "caught_up": bool(st.synced_to and st.synced_to >= _sched_iso(now - timedelta(seconds=ZOOM_SYNC_INTERVAL_SEC * 2))), "stats": st.last_stats or {}},
+        "counts": {"total": sum(cnt.values()), "api": cnt.get("api", 0), "webhook": cnt.get("webhook", 0), "csv": cnt.get(None, 0) + cnt.get("csv", 0),
+                   "accounts": total_acc, "accounts_linked": linked},
+    }
+
+@app.post("/api/cmyo/zoom/check")
+async def zoom_check(user: dict = Depends(require_cmyo_admin)):
+    """Перевірка підключення: токен, доступ до користувачів і до Dashboard (з поясненням, якщо чогось бракує)"""
+    out = {"token": {"ok": False, "error": None}, "users": {"ok": False, "error": None}, "dashboard": {"ok": False, "error": None},
+           "webhook_secret": bool(_zoom_webhook_secret())}
+    try:
+        await run_in_threadpool(_zoom_token, True)
+        out["token"]["ok"] = True
+    except ZoomApiError as e:
+        out["token"]["error"] = str(e)
+        return out
+    out["token"]["scope"] = _zoom_tok.get("scope") or None
+    for key, path, params in (("users", "/users", {"page_size": 1}),
+                              ("dashboard", "/metrics/meetings", {"type": "past", "from": _sched_now().strftime("%Y-%m-%d"), "to": _sched_now().strftime("%Y-%m-%d"), "page_size": 1})):
+        try:
+            await run_in_threadpool(_zoom_get, path, params)
+            out[key]["ok"] = True
+        except ZoomApiError as e:
+            out[key]["error"] = str(e) + (f" (повторіть за {int(e.retry_after) + 1} с)" if e.retry_after is not None else "")
+    return out
+
+class ZoomSyncSchema(BaseModel):
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+
+@app.post("/api/cmyo/zoom/sync")
+async def zoom_sync_now(data: ZoomSyncSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Синхронізація зараз: за вказаний період (до 31 дня) або за останні 3 доби"""
+    if not _zoom_configured():
+        raise HTTPException(status_code=400, detail="Zoom не підключено: задайте ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET")
+    st = _zoom_state(db)
+    now = _sched_now()
+    if st.cooldown_until and st.cooldown_until > _sched_iso(now):
+        raise HTTPException(status_code=429, detail=f"Zoom просить зачекати: наступна спроба о {_sched_fmt_label(st.cooldown_until)}")
+    if data.date_from:
+        wf = datetime.strptime(_parse_iso_date(data.date_from, "Від"), "%Y-%m-%d")
+        wt = min(datetime.strptime(_parse_iso_date(data.date_to, "До") or data.date_from, "%Y-%m-%d") + timedelta(days=1), now)
+    else:
+        wf, wt = now - timedelta(days=3), now
+    if (wt - wf).days > 31:
+        raise HTTPException(status_code=400, detail="Максимальний період синхронізації — 31 день")
+    res = await _zoom_sync_window(db, st, now, force_from=wf, force_to=wt)
+    if not res["ok"]:
+        raise HTTPException(status_code=429 if res.get("rate_limited") else 502, detail=res["error"])
+    return res["stats"]
+
+class ZoomSettingsSchema(BaseModel):
+    history_from: str
+
+@app.put("/api/cmyo/zoom/settings")
+async def zoom_settings(data: ZoomSettingsSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    try:
+        v = datetime.strptime(data.history_from.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Невірна дата (потрібно РРРР-ММ-ДД)")
+    if v < "2022-02-24" or v > _sched_now().strftime("%Y-%m-%d"):
+        raise HTTPException(status_code=400, detail="Дата має бути між 24.02.2022 і сьогодні")
+    st = _zoom_state(db)
+    if v < _zoom_history_from(st):
+        st.synced_to = None                                      # почати з нової дати: старі дані лишаються, дозавантажимо раніші
+    st.history_from = v
+    db.commit()
+    _zoom_worker_ensure()
+    return {"history_from": v}
+
+def _zoom_live(db, st) -> list:
+    """Конференції, що йдуть зараз: за вебхуками (meeting.started без meeting.ended); якщо вебхуків ще немає — з Dashboard API"""
+    now = _sched_now()
+    since = _sched_iso(now - timedelta(hours=8))
+    ended = {u for (u,) in db.query(DBZoomEvent.meeting_uuid).filter(DBZoomEvent.event == "meeting.ended", DBZoomEvent.received_at >= since).all() if u}
+    teachers = {t.id: t.name for t in db.query(DBLessonTeacher).all()}
+    acc_by_email = {a.email_key: a for a in db.query(DBLessonZoomAccount).all()}
+    out = []
+    for e in db.query(DBZoomEvent).filter(DBZoomEvent.event == "meeting.started", DBZoomEvent.received_at >= since).order_by(DBZoomEvent.received_at.desc()).all():
+        if e.meeting_uuid in ended:
+            continue
+        u = db.query(DBZoomUser).filter(DBZoomUser.host_id == e.host_id).first() if e.host_id else None
+        a = acc_by_email.get((u.email or "").lower()) if u and u.email else None
+        start = _sched_dt(e.start_dt or e.received_at)
+        out.append({"meeting_id": e.meeting_id, "topic": e.topic, "host": (u.name if u else None) or (u.email if u else None) or "—", "email": u.email if u else None,
+                    "teacher": teachers.get(a.lesson_teacher_id) if a else None, "start": start.strftime("%H:%M"), "running_min": max(0, int((now - start).total_seconds() // 60)), "source": "webhook"})
+    if not out and not st.last_webhook_at and _zoom_configured():            # запасний варіант: «наживо» з Dashboard (з кешем)
+        if time.time() - _zoom_live_cache["at"] > ZOOM_LIVE_TTL_SEC:
+            try:
+                today = now.strftime("%Y-%m-%d")
+                _zoom_live_cache.update(at=time.time(), items=_zoom_fetch_meetings(today, today, "live"))
+            except ZoomApiError:
+                _zoom_live_cache.update(at=time.time(), items=[])
+        for it in _zoom_live_cache["items"]:
+            start = _alerts_to_kyiv(it.get("start_time")) or now
+            a = acc_by_email.get(_zm_email_key(str(it.get("email") or ""), str(it.get("host") or "")))
+            out.append({"meeting_id": str(it.get("id") or ""), "topic": it.get("topic"), "host": it.get("host") or "—", "email": it.get("email"),
+                        "teacher": teachers.get(a.lesson_teacher_id) if a else None, "start": start.strftime("%H:%M"),
+                        "running_min": max(0, int((now - start).total_seconds() // 60)), "source": "api"})
+    return out
+
+@app.get("/api/cmyo/zoom/meetings")
+async def zoom_meetings(date_from: str, date_to: Optional[str] = None, q: Optional[str] = None, only: Optional[str] = None,
+                        user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Минулі конференції за період: хто провів, коли, скільки, скільки учасників і до якої пари за розкладом це належить."""
+    d_from = _parse_iso_date(date_from, "Від")
+    d_to = _parse_iso_date(date_to, "До") or d_from
+    if d_to < d_from:
+        d_from, d_to = d_to, d_from
+    if (datetime.strptime(d_to, "%Y-%m-%d") - datetime.strptime(d_from, "%Y-%m-%d")).days > 62:
+        raise HTTPException(status_code=400, detail="Максимальний період — 62 дні")
+    st = _zoom_state(db)
+    teachers = {t.id: t.name for t in db.query(DBLessonTeacher).all()}
+    accounts = {a.id: a for a in db.query(DBLessonZoomAccount).all()}
+    rows = db.query(DBLessonZoomMeeting).filter(DBLessonZoomMeeting.start_dt >= d_from + "T00:00:00", DBLessonZoomMeeting.start_dt <= d_to + "T23:59:59") \
+        .order_by(DBLessonZoomMeeting.start_dt.desc()).limit(4000).all()
+    tids = {accounts[r.account_id].lesson_teacher_id for r in rows if r.account_id in accounts and accounts[r.account_id].lesson_teacher_id}
+    sched = defaultdict(list)
+    if tids:
+        for it in db.query(DBLessonSchedItem).filter(DBLessonSchedItem.lesson_teacher_id.in_(tids), DBLessonSchedItem.lesson_date >= d_from, DBLessonSchedItem.lesson_date <= d_to).all():
+            sched[(it.lesson_teacher_id, it.lesson_date)].append(it)
+    needle = _norm(q or "")
+    out, by_t, unlinked_hosts = [], {}, defaultdict(int)
+    for r in rows:
+        a = accounts.get(r.account_id)
+        tid = a.lesson_teacher_id if a else None
+        tname = teachers.get(tid) if tid else None
+        host = (a.display_name if a else None) or r.organizer_name or "—"
+        email = a.email_key if a and "@" in a.email_key else None
+        if needle and needle not in _norm(" ".join([r.topic or "", host, email or "", tname or ""])):
+            continue
+        if only == "teachers" and not tid:
+            continue
+        if only == "unlinked" and tid:
+            continue
+        s, e = _sched_dt(r.start_dt), _sched_dt(r.end_dt)
+        lessons = []
+        if tid:
+            for it in sched.get((tid, r.start_dt[:10]), []):
+                ls = datetime.strptime(f"{it.lesson_date} {it.start_time}", "%Y-%m-%d %H:%M")
+                ov = _sched_overlap_minutes(ls, ls + timedelta(minutes=SCHED_SLOT_MINUTES), [(s, e)])
+                if ov >= 10:
+                    lessons.append({"slot_no": it.slot_no, "start": it.start_time, "subject": it.subject_name, "groups": it.groups_text, "overlap_min": int(round(ov))})
+            lessons.sort(key=lambda x: x["start"])
+        dur = int(round(r.duration_sec / 60))
+        out.append({"id": r.id, "meeting_id": r.meeting_id, "topic": r.topic, "host": host, "email": email, "teacher_id": tid, "teacher_name": tname,
+                    "date": r.start_dt[:10], "start": s.strftime("%H:%M"), "end": e.strftime("%H:%M"), "duration_min": dur, "participants": r.participants,
+                    "source": r.source or "csv", "lessons": lessons})
+        if tid:
+            t = by_t.setdefault(tid, {"teacher_id": tid, "name": tname, "meetings": 0, "minutes": 0, "part_sum": 0, "part_n": 0, "scheduled": 0, "last": r.start_dt})
+            t["meetings"] += 1
+            t["minutes"] += dur
+            t["scheduled"] += 1 if lessons else 0
+            if r.participants is not None:
+                t["part_sum"] += r.participants
+                t["part_n"] += 1
+        else:
+            unlinked_hosts[(host, email)] += 1
+    teachers_list = sorted(({"teacher_id": t["teacher_id"], "name": t["name"], "meetings": t["meetings"], "minutes": t["minutes"], "scheduled": t["scheduled"],
+                             "avg_participants": round(t["part_sum"] / t["part_n"], 1) if t["part_n"] else None, "last": t["last"][:16].replace("T", " ")} for t in by_t.values()),
+                           key=lambda x: (-x["minutes"], x["name"]))
+    linked = [m for m in out if m["teacher_id"]]
+    return {"date_from": d_from, "date_to": d_to, "meetings": out, "teachers": teachers_list,
+            "summary": {"meetings": len(out), "teachers": len(by_t), "minutes": sum(m["duration_min"] for m in linked),
+                        "on_schedule": sum(1 for m in linked if m["lessons"]), "off_schedule": sum(1 for m in linked if not m["lessons"]),
+                        "unlinked": sum(unlinked_hosts.values()), "truncated": len(rows) >= 4000},
+            "unlinked_hosts": sorted(({"host": h, "email": em, "meetings": n} for (h, em), n in unlinked_hosts.items()), key=lambda x: -x["meetings"])[:15],
+            "live": _zoom_live(db, st),
+            "sync": {"configured": _zoom_configured(), "caught_up": bool(st.synced_to and st.synced_to >= _sched_iso(_sched_now() - timedelta(seconds=ZOOM_SYNC_INTERVAL_SEC * 2))),
+                     "synced_to": _sched_fmt_label(st.synced_to), "last_error": st.last_error, "history_from": _zoom_history_from(st), "webhook_ready": bool(_zoom_webhook_secret()),
+                     "last_webhook_at": _sched_fmt_label(st.last_webhook_at)}}
+
 
 @app.get("/api/cmyo/schedule/overview")
 async def schedule_overview(date_from: str, date_to: Optional[str] = None,
