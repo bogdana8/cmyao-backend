@@ -5862,11 +5862,15 @@ def _zoom_fetch_meetings(d_from: str, d_to: str, mtype: str = "past") -> list:
     """Усі конференції акаунта за період (Dashboard API), з пагінацією. Блокуюча — викликати в потоці."""
     out, token, pages = [], None, 0
     while pages < ZOOM_MAX_PAGES:
-        params = {"type": mtype, "page_size": ZOOM_PAGE_SIZE}
+        params = {
+            "type": mtype,
+            "page_size": ZOOM_PAGE_SIZE,
+            "from": d_from,
+            "to": d_to,
+        }
         if token:
-            params["next_page_token"] = token                    # токен сторінки живе недовго — беремо сторінки одразу
-        else:
-            params.update({"from": d_from, "to": d_to})
+            params["next_page_token"] = token
+            
         data = _zoom_get("/metrics/meetings", params)
         out.extend(data.get("meetings") or [])
         token, pages = data.get("next_page_token"), pages + 1
