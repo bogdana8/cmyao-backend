@@ -6321,19 +6321,28 @@ async def zoom_meetings(date_from: str, date_to: Optional[str] = None, q: Option
                      "last_webhook_at": _sched_fmt_label(st.last_webhook_at)}}
 
 
-@app.get("/api/cmyo/schedule/overview")
-async def schedule_overview(date_from: str, date_to: Optional[str] = None,
-                            user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def _sched_parse_range(date_from, date_to, max_days: int):
     d_from = _parse_iso_date(date_from, "Від")
     d_to = _parse_iso_date(date_to, "До") or d_from
     if d_to < d_from:
         d_from, d_to = d_to, d_from
-    if (datetime.strptime(d_to, "%Y-%m-%d") - datetime.strptime(d_from, "%Y-%m-%d")).days > 62:
-        raise HTTPException(status_code=400, detail="Максимальний період — 62 дні")
+    if (datetime.strptime(d_to, "%Y-%m-%d") - datetime.strptime(d_from, "%Y-%m-%d")).days > max_days:
+        raise HTTPException(status_code=400, detail=f"Максимальний період — {max_days} дн.")
+    return d_from, d_to
 
+@app.get("/api/cmyo/schedule/overview")
+async def schedule_overview(date_from: str, date_to: Optional[str] = None,
+                            user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    d_from, d_to = _sched_parse_range(date_from, date_to, 62)
+    return await _schedule_overview_core(db, d_from, d_to)
+
+async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Optional[int] = None, other_limit: Optional[int] = 12):
+    """Спільне ядро: пари за розкладом ↔ Zoom ↔ тривоги. teacher_id — лише один викладач (для відвідуваності)."""
     teachers = {t.id: t for t in db.query(DBLessonTeacher).all()}
-    items = db.query(DBLessonSchedItem).filter(DBLessonSchedItem.lesson_date >= d_from, DBLessonSchedItem.lesson_date <= d_to)\
-        .order_by(DBLessonSchedItem.lesson_date, DBLessonSchedItem.start_time).all()
+    items_q = db.query(DBLessonSchedItem).filter(DBLessonSchedItem.lesson_date >= d_from, DBLessonSchedItem.lesson_date <= d_to)
+    if teacher_id is not None:
+        items_q = items_q.filter(DBLessonSchedItem.lesson_teacher_id == teacher_id)
+    items = items_q.order_by(DBLessonSchedItem.lesson_date, DBLessonSchedItem.start_time).all()
 
     accounts = db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.lesson_teacher_id.isnot(None),
                                                     DBLessonZoomAccount.link_status.in_(("auto", "manual"))).all()
@@ -6414,7 +6423,8 @@ async def schedule_overview(date_from: str, date_to: Optional[str] = None,
                 card["other_meetings"].append({"date": ds, "start": _sched_dt(m.start_dt).strftime("%H:%M"), "end": _sched_dt(m.end_dt).strftime("%H:%M"),
                                                "duration_min": int(round(m.duration_sec / 60)), "topic": m.topic, "participants": m.participants})
         card["other_meetings"].sort(key=lambda x: (x["date"], x["start"]))
-        card["other_meetings"] = card["other_meetings"][:12]
+        if other_limit:
+            card["other_meetings"] = card["other_meetings"][:other_limit]
         card["counts"] = dict(card["counts"])
 
     summary = defaultdict(int)
@@ -6437,6 +6447,231 @@ async def schedule_overview(date_from: str, date_to: Optional[str] = None,
         "summary": {"teachers": len(cards), "lessons": sum(summary.values()), **dict(summary)},
         "teachers": sorted(cards.values(), key=lambda c: c["name"]),
     }
+
+# =========================================================
+# 📊 ВІДВІДУВАНІСТЬ ПО ВИКЛАДАЧУ
+# Той самий розрахунок статусів, що й на вкладці «Розклад і Zoom» (_schedule_overview_core),
+# але для одного викладача за довільний період (до ATT_MAX_DAYS) + підсумки + експорт в Excel.
+# Відвідуваність, % = проведено / (проведено + частково + не знайдено).
+# «Тривога» (поважна причина), «Очікується», «Без акаунта Zoom» та «Очно» у знаменник не входять.
+# =========================================================
+ATT_MAX_DAYS = 366
+ATT_STATUS_LABELS = {
+    "ok": "Проведено", "partial": "Частково", "missed": "Не знайдено", "alert": "Тривога",
+    "pending": "Очікується", "no_data": "Немає даних", "no_account": "Без акаунта Zoom", "offline": "Очно",
+}
+ATT_STATUS_FILLS = {
+    "ok": "D1FAE5", "partial": "FEF3C7", "missed": "FEE2E2", "alert": "CCFBF1",
+    "pending": "E5E7EB", "no_data": "E5E7EB", "no_account": "EDE9FE", "offline": "DBEAFE",
+}
+ATT_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+ATT_GROUPS = ("ok", "partial", "missed", "alert", "pending", "no_account", "offline")
+
+def _att_stats(lessons: list) -> dict:
+    """Підсумок за списком пар (статус no_data зливається з pending)."""
+    c = defaultdict(int)
+    planned = conducted = 0
+    for l in lessons:
+        st = "pending" if l["status"] == "no_data" else l["status"]
+        c[st] += 1
+        if st in ("ok", "partial", "missed"):
+            planned += SCHED_SLOT_MINUTES
+            conducted += min(int(l.get("overlap_min") or 0), SCHED_SLOT_MINUTES)
+    checked = c["ok"] + c["partial"] + c["missed"]
+    out = {"total": len(lessons), **{k: c[k] for k in ATT_GROUPS}, "checked": checked,
+           "rate": round(100.0 * c["ok"] / checked, 1) if checked else None,
+           "planned_min": planned, "conducted_min": conducted,
+           "min_rate": round(100.0 * conducted / planned, 1) if planned else None}
+    return out
+
+def _att_week_start(date_iso: str) -> str:
+    d = datetime.strptime(date_iso, "%Y-%m-%d")
+    return (d - timedelta(days=d.weekday())).strftime("%Y-%m-%d")
+
+async def _teacher_attendance_build(db, teacher_id: int, date_from: str, date_to: Optional[str]) -> dict:
+    t = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == teacher_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Викладача не знайдено в списку")
+    d_from, d_to = _sched_parse_range(date_from, date_to, ATT_MAX_DAYS)
+    ov = await _schedule_overview_core(db, d_from, d_to, teacher_id=t.id, other_limit=None)
+    card = ov["teachers"][0] if ov["teachers"] else None
+    lessons = card["lessons"] if card else []
+    has_account = bool(card["has_account"]) if card else bool(
+        db.query(DBLessonZoomAccount.id).filter(DBLessonZoomAccount.lesson_teacher_id == t.id,
+                                                DBLessonZoomAccount.link_status.in_(("auto", "manual"))).first())
+
+    by_subject, by_day, by_week = {}, defaultdict(list), defaultdict(list)
+    for l in lessons:
+        by_subject.setdefault(l["subject"] or "—", []).append(l)
+        by_day[l["date"]].append(l)
+        by_week[_att_week_start(l["date"])].append(l)
+    subjects = [{"subject": k, "types": sorted({x["type"] for x in v if x.get("type")}), **_att_stats(v)} for k, v in by_subject.items()]
+    subjects.sort(key=lambda r: (-r["total"], r["subject"].lower()))
+    days = [{"date": k, **_att_stats(v)} for k, v in sorted(by_day.items())]
+    weeks = [{"from": k, "to": (datetime.strptime(k, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d"), **_att_stats(v)}
+             for k, v in sorted(by_week.items())]
+    return {
+        "teacher": {"id": t.id, "name": t.name, "note": t.note, "has_account": has_account},
+        "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES,
+        "coverage": ov["coverage"], "alerts": ov["alerts"],
+        "totals": _att_stats(lessons),
+        "by_subject": subjects, "by_day": days, "by_week": weeks,
+        "lessons": lessons,
+        "other_meetings": card["other_meetings"] if card else [],
+    }
+
+@app.get("/api/cmyo/schedule/teacher-attendance")
+async def teacher_attendance(teacher_id: int, date_from: str, date_to: Optional[str] = None,
+                             user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    return await _teacher_attendance_build(db, teacher_id, date_from, date_to)
+
+@app.get("/api/cmyo/schedule/teacher-attendance/export")
+async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Optional[str] = None,
+                                    user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Excel: підсумок, розбивка за предметами й тижнями, повний список пар зі статусами, зустрічі Zoom поза розкладом."""
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    data = await _teacher_attendance_build(db, teacher_id, date_from, date_to)
+    tch, tot = data["teacher"], data["totals"]
+    if not tot["total"]:
+        raise HTTPException(status_code=404, detail="За цей період у викладача немає пар за розкладом")
+
+    fmt_d = lambda iso: f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}" if iso else ""
+    thin = Side(style="thin", color="BBBBBB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="1F3A5F")
+    now_ = _sched_now()
+
+    def hdr(ws, row, headers):
+        for j, h in enumerate(headers, 1):
+            c = ws.cell(row=row, column=j, value=h)
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border
+
+    def put(ws, row, vals, center=(), pct=(), wrap=()):
+        for j, v in enumerate(vals, 1):
+            c = ws.cell(row=row, column=j, value=v)
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=(j in wrap), horizontal="center" if j in center else "left")
+            if j in pct and v is not None:
+                c.number_format = "0.0%"
+
+    def widths(ws, ws_widths):
+        for j, w in enumerate(ws_widths, 1):
+            ws.column_dimensions[get_column_letter(j)].width = w
+
+    def page(ws, landscape=True):
+        ws.page_setup.orientation = "landscape" if landscape else "portrait"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+    wb = openpyxl.Workbook()
+
+    # ── Підсумок ──
+    ws = wb.active
+    ws.title = "Підсумок"
+    ws["A1"] = f"Відвідуваність викладача: {tch['name']}"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = f"Період: {fmt_d(data['date_from'])} – {fmt_d(data['date_to'])} · сформовано {now_.strftime('%d.%m.%Y %H:%M')}"
+    ws["A2"].font = Font(color="666666", size=10)
+    notes_ = []
+    if not tch["has_account"]:
+        notes_.append("До викладача не прив'язано акаунт Zoom: онлайн-пари не можна перевірити.")
+    cov = data["coverage"]
+    notes_.append("Звіт Zoom: " + (f"до {_sched_fmt_label(cov['zoom_until'])}" if cov.get("zoom_until") else "не завантажено") + ".")
+    al = data["alerts"]
+    if al.get("enabled") and al.get("configured") and al.get("pending_days"):
+        notes_.append(f"Історія тривог за період завантажена не повністю ({al['days_total'] - al['pending_days']} з {al['days_total']} днів): "
+                      "статуси «Тривога» можуть змінитися.")
+    r = 3
+    for n_ in notes_:
+        ws.cell(row=r, column=1, value=n_).font = Font(color="B45309", size=10)
+        r += 1
+    r += 1
+    hdr(ws, r, ["Показник", "Значення"])
+    rows_ = [
+        ("Пар за розкладом", tot["total"]), ("Проведено", tot["ok"]), ("Частково", tot["partial"]), ("Не знайдено", tot["missed"]),
+        ("Тривога (поважна причина)", tot["alert"]), ("Очікується / немає даних", tot["pending"]),
+        ("Без акаунта Zoom", tot["no_account"]), ("Очно (Zoom не перевіряється)", tot["offline"]),
+        ("Перевірено пар (проведено + частково + не знайдено)", tot["checked"]),
+        ("Відвідуваність, % (проведено / перевірено)", None if tot["rate"] is None else tot["rate"] / 100.0),
+        ("Час у Zoom у межах пар, хв", tot["conducted_min"]), ("Час перевірених пар, хв", tot["planned_min"]),
+        ("Час у Zoom, % від часу перевірених пар", None if tot["min_rate"] is None else tot["min_rate"] / 100.0),
+    ]
+    for lab, val in rows_:
+        r += 1
+        put(ws, r, [lab, val if val is not None else "—"], center=(2,), pct=(2,) if "%" in lab else ())
+        if "%" in lab:
+            ws.cell(row=r, column=1).font = Font(bold=True)
+            ws.cell(row=r, column=2).font = Font(bold=True)
+    r += 2
+
+    def breakdown(title, label_head, items, label_of):
+        nonlocal r
+        ws.cell(row=r, column=1, value=title).font = Font(bold=True, size=12)
+        r += 1
+        hdr(ws, r, [label_head, "Усього", "Проведено", "Частково", "Не знайдено", "Тривога", "Очікується", "Без акаунта", "Очно", "Відвідуваність, %"])
+        for it in items:
+            r += 1
+            put(ws, r, [label_of(it), it["total"], it["ok"], it["partial"], it["missed"], it["alert"], it["pending"],
+                        it["no_account"], it["offline"], None if it["rate"] is None else it["rate"] / 100.0],
+                center=range(2, 11), pct=(10,), wrap=(1,))
+            if it["rate"] is None:
+                ws.cell(row=r, column=10, value="—")
+        r += 2
+
+    breakdown("По предметах", "Предмет", data["by_subject"],
+              lambda it: it["subject"] + (f" ({', '.join(it['types'])})" if it["types"] else ""))
+    breakdown("По тижнях", "Тиждень", data["by_week"], lambda it: f"{fmt_d(it['from'])} – {fmt_d(it['to'])}")
+    widths(ws, [52, 14, 14, 14, 14, 14, 14, 14, 12, 18])
+    page(ws)
+
+    # ── Пари ──
+    wl = wb.create_sheet("Пари")
+    heads = ["№", "Дата", "День", "Початок", "Кінець", "№ пари", "Предмет", "Тип", "Групи", "Формат", "Місце", "Статус",
+             "Zoom у парі, хв", "Тривога, хв", "Без студентів", "Заміна (за розкладом)", "Зустрічі Zoom", "Примітка розкладу"]
+    hdr(wl, 1, heads)
+    for i, l in enumerate(data["lessons"], 1):
+        d_ = datetime.strptime(l["date"], "%Y-%m-%d")
+        meets = "; ".join(f"{m['start']}–{m['end']} ({m['duration_min']} хв" + (f", учасників: {m['participants']}" if m.get("participants") is not None else "") + ")"
+                          for m in l.get("meetings", []))
+        vals = [i, d_.strftime("%d.%m.%Y"), ATT_WEEKDAYS[d_.weekday()], l["start"], l["end"], l.get("slot_no") or "",
+                l["subject"], l.get("type") or "", l.get("groups") or "", "Zoom" if l["online"] else "Очно",
+                l.get("place") or "", ATT_STATUS_LABELS.get(l["status"], l["status"]),
+                l["overlap_min"] if l["status"] in ("ok", "partial", "missed", "alert") else "",
+                l.get("alert_min") or "", "так" if l.get("alone") else "", l.get("substitute_for") or "", meets, l.get("note") or ""]
+        put(wl, i + 1, vals, center=(1, 2, 3, 4, 5, 6, 8, 10, 13, 14, 15), wrap=(7, 9, 11, 16, 17, 18))
+        wl.cell(row=i + 1, column=12).fill = PatternFill("solid", fgColor=ATT_STATUS_FILLS.get(l["status"], "FFFFFF"))
+        wl.cell(row=i + 1, column=12).alignment = Alignment(horizontal="center", vertical="top")
+    widths(wl, [5, 12, 6, 9, 9, 8, 38, 6, 26, 9, 18, 18, 12, 11, 12, 22, 42, 28])
+    wl.freeze_panes = "A2"
+    wl.auto_filter.ref = f"A1:{get_column_letter(len(heads))}{len(data['lessons']) + 1}"
+    page(wl)
+
+    # ── Зустрічі поза розкладом ──
+    if data["other_meetings"]:
+        wo = wb.create_sheet("Zoom поза розкладом")
+        hdr(wo, 1, ["Дата", "Початок", "Кінець", "Тривалість, хв", "Учасників", "Тема"])
+        for i, m in enumerate(data["other_meetings"], 2):
+            put(wo, i, [fmt_d(m["date"]), m["start"], m["end"], m["duration_min"], m.get("participants") if m.get("participants") is not None else "", m.get("topic") or ""],
+                center=(1, 2, 3, 4, 5), wrap=(6,))
+        widths(wo, [12, 10, 10, 14, 11, 70])
+        wo.freeze_panes = "A2"
+        page(wo)
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    safe = re.sub(r"[\\/:*?\"<>|]+", "", tch["name"]).strip().replace(" ", "_")
+    fname = f"Відвідуваність_{safe}_{data['date_from']}_{data['date_to']}.xlsx"
+    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
 
 # ── Акаунти Zoom ↔ викладачі ────────────────────────────────────
 class ZoomAccountLinkSchema(BaseModel):
