@@ -509,7 +509,6 @@ class DBLessonTeacher(Base):
     name_norm = Column(String, nullable=False, unique=True, index=True)
     note      = Column(String, nullable=True)     # примітка про викладача (Zoom, вичитка пар тощо); порожньо = немає
     note_at   = Column(String, nullable=True)     # коли примітку востаннє змінено (ISO, київський час)
-    count_until = Column(String, nullable=True)   # облік пар лише до цієї дати включно (YYYY-MM-DD); порожньо = увесь термін
 
 class DBLessonCheck(Base):
     """Рядок таблиці перевірки пар. Усі довідники — власні (lesson_*), без FK на інші таблиці."""
@@ -537,10 +536,10 @@ class DBLessonCheck(Base):
 # =========================================================
 SCHED_SLOT_MINUTES = 80                                   # тривалість одного слота розкладу (пари), хв
 SCHED_SLOT_STARTS = ["09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:30"]   # початки слотів 1..7
-# Пропорції рахуються від «залишку» пари: (80 хв − тривалість тривоги). Без тривоги залишок = 80 хв.
-SCHED_OK_RATIO = 0.75                                     # «проведено»: у Zoom ≥ 75% залишку пари
-SCHED_PARTIAL_RATIO = 0.15                                # «частково»: у Zoom ≥ 15% залишку пари; менше — «не знайдено»
-SCHED_OUTAGE_DATE = "2026-11-03"                          # з цієї дати почались відключення (типова дата для «обліку до»)
+# Пропорції рахуються від «залишку» пари: E = 80 хв − тривалість тривоги (враховуються ВСІ тривоги, навіть на 1 хв).
+SCHED_OK_RATIO = 0.75                                     # «проведено»: у Zoom ≥ 75% від E (без тривоги — 60 хв)
+SCHED_PARTIAL_MIN = 1                                     # «частково»: у Zoom від 1 хв; 0 хв — «не проведено»
+SCHED_OUTAGE_DATE = "2026-11-03"                          # з цієї дати почались відключення: друга графа відсотків у звіті — пари ДО цієї дати
 
 class DBLessonSchedBatch(Base):
     """Журнал завантажень: що, коли й ким завантажено (розклад або звіт Zoom)"""
@@ -746,7 +745,6 @@ def _run_migrations():
         # 📝 Примітки до викладачів
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note VARCHAR",
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note_at VARCHAR",
-        "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS count_until VARCHAR",
         # 🚨 Тривоги: друге джерело, історія від дати, спільний «слот» запитів
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS source VARCHAR",
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS history_from VARCHAR",
@@ -4233,7 +4231,7 @@ async def list_lesson_catalog(kind: str, user: dict = Depends(require_cmyo_admin
         raise HTTPException(status_code=404, detail="Невідомий список")
     rows = db.query(model).order_by(model.name).all()
     if kind == "teachers":
-        return [{"id": r.id, "name": r.name, "note": r.note, "note_at": r.note_at, "count_until": r.count_until} for r in rows]
+        return [{"id": r.id, "name": r.name, "note": r.note, "note_at": r.note_at} for r in rows]
     return [{"id": r.id, "name": r.name} for r in rows]
 
 def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
@@ -4995,16 +4993,15 @@ def _sched_zoom_coverage(db):
     return out, (max((c[1] for c in out), default=None))
 
 def _sched_eff_minutes(alert_min: float) -> float:
-    """Скільки хвилин пари лишається після вирахування тривоги (тривоги коротші за ALERT_EXCUSE_MIN не враховуються)."""
-    a = alert_min if alert_min >= ALERT_EXCUSE_MIN else 0.0
-    return max(0.0, SCHED_SLOT_MINUTES - a)
+    """Залишок пари E після вирахування тривоги (враховується будь-яка тривога, навіть на 1 хв)."""
+    return max(0.0, SCHED_SLOT_MINUTES - max(0.0, alert_min))
 
 def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, global_until, alert_min=0.0):
     """Статус пари. Пропорції від залишку пари E = 80 − тривога:
-       проведено  — Zoom ≥ 75% від E (без тривоги: ≥ 60 хв);
-       тривога    — пара не «проведено» без урахування тривоги, але Zoom ≥ 75% від E (пропущеною не вважаємо);
-       частково   — Zoom ≥ 15% від E;  не знайдено — менше.
-       Немає звіту Zoom за цей час (і пара не майбутня) — «no_data» (показується як «Не проведено»)."""
+       проведено    — Zoom ≥ 75% від 80 хв (60 хв);
+       тривога      — пара не «проведено», але Zoom ≥ 75% від E: пропущеною не вважаємо;
+       частково     — Zoom від 1 хв;
+       не проведено — у Zoom нічого (або немає звіту Zoom за цей час), хоча пара за розкладом була."""
     if not it.is_online:
         return "offline"
     eps = 1e-6
@@ -5012,13 +5009,15 @@ def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, 
         return "ok"
     if not has_account and not it.zoom_meeting_id:
         return "no_account"
-    if not covered:
-        # дані Zoom ще неповні (пара йде або попереду) → «очікується»; немає звіту за цей час → «не проведено»
-        return "pending" if (global_until is not None and slot_e > global_until) else "no_data"
     eff = _sched_eff_minutes(alert_min)
+    if not covered:
+        # дані Zoom ще неповні (пара йде або попереду) → «очікується»; немає звіту за цей час → як 0 хв у Zoom
+        if global_until is not None and slot_e > global_until:
+            return "pending"
+        return "alert" if eff <= eps else "missed"
     if overlap_min + eps >= eff * SCHED_OK_RATIO:
         return "alert"
-    return "partial" if overlap_min + eps >= eff * SCHED_PARTIAL_RATIO else "missed"
+    return "partial" if overlap_min + eps >= SCHED_PARTIAL_MIN else "missed"
 
 # =========================================================
 # 🚨 ТРИВОГИ — офіційна підстава не проводити пару
@@ -5029,7 +5028,7 @@ def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, 
 # після ліміту (HTTP 429) — пауза без жодних запитів, решта днів дозавантажується поступово.
 # Правило поважної причини: якщо Zoom і тривога РАЗОМ покривають ≥ 60% пари, а самого Zoom замало — статус «Тривога».
 # =========================================================
-ALERT_EXCUSE_MIN = 1            # тривога коротша за 10 хв у межах пари не береться до уваги як причина
+ALERT_EXCUSE_MIN = 0             # порога немає: враховуються всі тривоги, навіть на 1 хв (константа лишається для сумісності з вікном «Тривоги»)
 ALERT_CACHE_TTL_SEC = 180        # поточний день (ukrainealarm) перезавантажуємо не частіше, ніж раз на 3 хв
 ALERT_INUA_TTL_SEC = 300         # місячну історію alerts.in.ua — не частіше, ніж раз на 5 хв
 ALERT_RETRY_SEC = 60             # після помилки (не ліміт) наступна спроба не раніше ніж за хвилину
@@ -5552,7 +5551,7 @@ async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Sessio
     cfg = _alerts_default_config(db)
     source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
     saved = (cfg.regions if cfg and cfg.regions else [])
-    out = {"source": source, "saved": bool(saved), "regions": saved, "suggested": [], "excuse_min": ALERT_EXCUSE_MIN, "ok_ratio": SCHED_OK_RATIO, "partial_ratio": SCHED_PARTIAL_RATIO,
+    out = {"source": source, "saved": bool(saved), "regions": saved, "suggested": [], "excuse_min": ALERT_EXCUSE_MIN, "ok_ratio": SCHED_OK_RATIO, "partial_min": SCHED_PARTIAL_MIN,
            "providers": {p: {"label": v["label"], "key_env": v["key_env"], "enabled": bool(_alerts_key(p))} for p, v in ALERT_PROVIDERS.items()},
            "types": [{"code": t, "label": ALERT_TYPE_LABELS.get(t, t)} for t in sorted(_alerts_types())],
            "updated_at": _sched_fmt_label(cfg.updated_at) if cfg else None}
@@ -6379,14 +6378,10 @@ async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Option
     alerts_ctx = await _alerts_prepare(db, d_from, d_to)      # тривоги обраних регіонів (з кешу або з API)
 
     cards = {}
-    cut_skipped = defaultdict(int)
     used_meeting_ids = defaultdict(set)
     for it in items:
         t = teachers.get(it.lesson_teacher_id)
         if not t:
-            continue
-        if t.count_until and it.lesson_date > t.count_until:
-            cut_skipped[t.id] += 1            # облік цього викладача обмежено датою (відключення) — пари після неї не враховуємо
             continue
         slot_s = datetime.strptime(f"{it.lesson_date} {it.start_time}", "%Y-%m-%d %H:%M")
         slot_e = slot_s + timedelta(minutes=SCHED_SLOT_MINUTES)
@@ -6407,7 +6402,7 @@ async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Option
                 used_meeting_ids[t.id].add(m.id)
         overlap = _sched_overlap_minutes(slot_s, slot_e, ivs)
         covered = any(a <= slot_s and slot_e <= b + timedelta(minutes=5) for a, b in cov)
-        # тривога — офіційна підстава не проводити пару: час тривоги віднімається від пари, пропорції рахуються від залишку
+        # тривога — офіційна підстава не проводити пару: її час віднімається від пари, пропорції рахуються від залишку E
         a_hit = [a for a in alerts_ctx["intervals"] if min(a[1], slot_e) > max(a[0], slot_s)]
         alert_min = _sched_overlap_minutes(slot_s, slot_e, [(a[0], a[1]) for a in a_hit]) if a_hit else 0.0
         eff_min = _sched_eff_minutes(alert_min)
@@ -6415,7 +6410,7 @@ async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Option
         card = cards.setdefault(t.id, {"id": t.id, "name": t.name, "has_account": bool(acc_by_teacher.get(t.id)), "note": t.note,
                                        "counts": defaultdict(int), "planned_min": 0, "conducted_min": 0, "lessons": [], "other_meetings": []})
         card["counts"][status] += 1
-        if status in ("ok", "partial", "missed", "no_data"):
+        if status in ("ok", "partial", "missed"):
             card["planned_min"] += SCHED_SLOT_MINUTES
             card["conducted_min"] += int(round(min(overlap, SCHED_SLOT_MINUTES)))
         card["lessons"].append({
@@ -6423,10 +6418,10 @@ async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Option
             "subject": it.subject_name, "type": it.lesson_type, "groups": it.groups_text, "place": it.place, "online": bool(it.is_online),
             "note": it.note, "substitute_for": (it.source_owner if it.source_owner and _norm(it.source_owner) != t.name_norm else None),
             "status": status, "overlap_min": int(round(overlap)),
-            "alert_min": int(round(alert_min)),
-            "eff_min": int(round(eff_min)),                                    # залишок пари після тривоги
-            "need_ok": int(round(eff_min * SCHED_OK_RATIO)),                   # скільки хв у Zoom потрібно для «Проведено»
-            "need_partial": int(round(eff_min * SCHED_PARTIAL_RATIO)),         # …і для «Частково»
+            "alert_min": (max(1, int(round(alert_min))) if alert_min > 0 else 0),
+            "eff_min": int(round(eff_min)),                                    # залишок пари E після тривоги
+            "need_ok": int(round(eff_min * SCHED_OK_RATIO)) if alert_min > 0 else int(round(SCHED_SLOT_MINUTES * SCHED_OK_RATIO)),   # хв у Zoom для «Проведено»
+            "need_partial": SCHED_PARTIAL_MIN,
             "alerts": [{"start": max(m["start"], slot_s).strftime("%H:%M"), "end": min(m["end"], slot_e).strftime("%H:%M"),
                         "types": sorted(m["types"]), "regions": sorted(m["regions"])} for m in _alerts_merge(a_hit)],
             # у зустрічах під час пари був лише ведучий — студентів не було
@@ -6459,8 +6454,7 @@ async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Option
     return {
         "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES,
         "alerts": alerts_ctx["public"],
-        "cut_skipped": dict(cut_skipped),
-        "ratios": {"ok": SCHED_OK_RATIO, "partial": SCHED_PARTIAL_RATIO},
+        "ratios": {"ok": SCHED_OK_RATIO, "partial_min": SCHED_PARTIAL_MIN},
         "coverage": {
             "schedule_from": rng[0], "schedule_to": rng[1],
             "schedule_uploaded": _sched_fmt_label(last_sched.created_at) if last_sched else None,
@@ -6476,20 +6470,22 @@ async def _schedule_overview_core(db, d_from: str, d_to: str, teacher_id: Option
 # 📊 ВІДВІДУВАНІСТЬ ПО ВИКЛАДАЧУ
 # Той самий розрахунок статусів, що й на вкладці «Розклад і Zoom» (_schedule_overview_core),
 # але для одного викладача за довільний період (до ATT_MAX_DAYS) + підсумки + експорт в Excel.
-# Відвідуваність, % = проведено / (проведено + частково + не знайдено + не проведено).
+# Відвідуваність, % = проведено / (проведено + частково + не проведено).
 # «Тривога» (поважна причина), «Очікується», «Без акаунта Zoom» та «Очно» у знаменник не входять.
+# Відсотки рахуються у двох графах: за весь обраний період і лише за пари ДО SCHED_OUTAGE_DATE
+# (з цієї дати почались відключення, тож викладачі могли не вести пари).
 # =========================================================
 ATT_MAX_DAYS = 366
 ATT_STATUS_LABELS = {
-    "ok": "Проведено", "partial": "Частково", "missed": "Не знайдено", "alert": "Тривога",
-    "pending": "Очікується", "no_data": "Не проведено", "no_account": "Без акаунта Zoom", "offline": "Очно",
+    "ok": "Проведено", "partial": "Частково", "missed": "Не проведено", "alert": "Тривога",
+    "pending": "Очікується", "no_account": "Без акаунта Zoom", "offline": "Очно",
 }
 ATT_STATUS_FILLS = {
     "ok": "D1FAE5", "partial": "FEF3C7", "missed": "FEE2E2", "alert": "CCFBF1",
-    "pending": "E5E7EB", "no_data": "FFEDD5", "no_account": "EDE9FE", "offline": "DBEAFE",
+    "pending": "E5E7EB", "no_account": "EDE9FE", "offline": "DBEAFE",
 }
 ATT_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
-ATT_GROUPS = ("ok", "partial", "missed", "no_data", "alert", "pending", "no_account", "offline")
+ATT_GROUPS = ("ok", "partial", "missed", "alert", "pending", "no_account", "offline")
 
 def _att_stats(lessons: list) -> dict:
     """Підсумок за списком пар."""
@@ -6498,15 +6494,23 @@ def _att_stats(lessons: list) -> dict:
     for l in lessons:
         st = l["status"]
         c[st] += 1
-        if st in ("ok", "partial", "missed", "no_data"):
+        if st in ("ok", "partial", "missed"):
             planned += SCHED_SLOT_MINUTES
             conducted += min(int(l.get("overlap_min") or 0), SCHED_SLOT_MINUTES)
-    checked = c["ok"] + c["partial"] + c["missed"] + c["no_data"]
-    out = {"total": len(lessons), **{k: c[k] for k in ATT_GROUPS}, "checked": checked,
-           "rate": round(100.0 * c["ok"] / checked, 1) if checked else None,
-           "planned_min": planned, "conducted_min": conducted,
-           "min_rate": round(100.0 * conducted / planned, 1) if planned else None}
-    return out
+    checked = c["ok"] + c["partial"] + c["missed"]
+    return {"total": len(lessons), **{k: c[k] for k in ATT_GROUPS}, "checked": checked,
+            "rate": round(100.0 * c["ok"] / checked, 1) if checked else None,
+            "planned_min": planned, "conducted_min": conducted,
+            "min_rate": round(100.0 * conducted / planned, 1) if planned else None}
+
+def _att_pre(lessons: list) -> list:
+    """Пари, що відбулися ДО початку відключень (дата строго раніше за SCHED_OUTAGE_DATE)."""
+    return [l for l in lessons if l["date"] < SCHED_OUTAGE_DATE]
+
+def _att_item(lessons: list) -> dict:
+    """Підсумок + друга графа відсотків (лише пари до відключень)."""
+    pre = _att_stats(_att_pre(lessons))
+    return {**_att_stats(lessons), "rate_pre": pre["rate"], "checked_pre": pre["checked"]}
 
 def _att_week_start(date_iso: str) -> str:
     d = datetime.strptime(date_iso, "%Y-%m-%d")
@@ -6529,38 +6533,21 @@ async def _teacher_attendance_build(db, teacher_id: int, date_from: str, date_to
         by_subject.setdefault(l["subject"] or "—", []).append(l)
         by_day[l["date"]].append(l)
         by_week[_att_week_start(l["date"])].append(l)
-    subjects = [{"subject": k, "types": sorted({x["type"] for x in v if x.get("type")}), **_att_stats(v)} for k, v in by_subject.items()]
+    subjects = [{"subject": k, "types": sorted({x["type"] for x in v if x.get("type")}), **_att_item(v)} for k, v in by_subject.items()]
     subjects.sort(key=lambda r: (-r["total"], r["subject"].lower()))
-    days = [{"date": k, **_att_stats(v)} for k, v in sorted(by_day.items())]
-    weeks = [{"from": k, "to": (datetime.strptime(k, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d"), **_att_stats(v)}
+    days = [{"date": k, **_att_item(v)} for k, v in sorted(by_day.items())]
+    weeks = [{"from": k, "to": (datetime.strptime(k, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d"), **_att_item(v)}
              for k, v in sorted(by_week.items())]
     return {
-        "teacher": {"id": t.id, "name": t.name, "note": t.note, "has_account": has_account, "count_until": t.count_until},
-        "cut_skipped": ov.get("cut_skipped", {}).get(t.id, 0),
-        "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES,
+        "teacher": {"id": t.id, "name": t.name, "note": t.note, "has_account": has_account},
+        "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES, "outage_date": SCHED_OUTAGE_DATE,
         "coverage": ov["coverage"], "alerts": ov["alerts"], "ratios": ov["ratios"],
-        "totals": _att_stats(lessons),
+        "totals": _att_stats(lessons),                       # перша графа: увесь обраний період
+        "totals_pre": _att_stats(_att_pre(lessons)),         # друга графа: лише пари до відключень
         "by_subject": subjects, "by_day": days, "by_week": weeks,
         "lessons": lessons,
         "other_meetings": card["other_meetings"] if card else [],
     }
-
-class TeacherCutoffSchema(BaseModel):
-    teacher_ids: List[int] = []
-    date: Optional[str] = None        # YYYY-MM-DD; порожньо = без обмеження (увесь термін)
-
-@app.put("/api/cmyo/schedule/teacher-cutoff")
-async def set_teacher_cutoff(data: TeacherCutoffSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    """Облік пар викладачів лише до дати (напр. 03.11 — початок відключень). Пари після дати не враховуються ні тут, ні в «Розкладі і Zoom»."""
-    ids = list(dict.fromkeys(data.teacher_ids or []))
-    if not ids:
-        raise HTTPException(status_code=400, detail="Оберіть хоча б одного викладача")
-    if len(ids) > 5000:
-        raise HTTPException(status_code=400, detail="Забагато викладачів за раз")
-    d = _parse_iso_date((data.date or "").strip() or None, "Облік до")
-    n = db.query(DBLessonTeacher).filter(DBLessonTeacher.id.in_(ids)).update({DBLessonTeacher.count_until: d}, synchronize_session=False)
-    db.commit()
-    return {"updated": n, "date": d}
 
 @app.get("/api/cmyo/schedule/teacher-attendance")
 async def teacher_attendance(teacher_id: int, date_from: str, date_to: Optional[str] = None,
@@ -6570,18 +6557,19 @@ async def teacher_attendance(teacher_id: int, date_from: str, date_to: Optional[
 @app.get("/api/cmyo/schedule/teacher-attendance/export")
 async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Optional[str] = None,
                                     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    """Excel: підсумок, розбивка за предметами й тижнями, повний список пар зі статусами, зустрічі Zoom поза розкладом."""
+    """Excel: підсумок у двох графах (увесь період / до відключень), розбивка за предметами й тижнями, повний список пар."""
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.properties import PageSetupProperties
 
     data = await _teacher_attendance_build(db, teacher_id, date_from, date_to)
-    tch, tot = data["teacher"], data["totals"]
+    tch, tot, pre = data["teacher"], data["totals"], data["totals_pre"]
     if not tot["total"]:
         raise HTTPException(status_code=404, detail="За цей період у викладача немає пар за розкладом")
 
     fmt_d = lambda iso: f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}" if iso else ""
+    cut_short = f"{SCHED_OUTAGE_DATE[8:10]}.{SCHED_OUTAGE_DATE[5:7]}"
     thin = Side(style="thin", color="BBBBBB")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     head_fill = PatternFill("solid", fgColor="1F3A5F")
@@ -6600,7 +6588,7 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
             c = ws.cell(row=row, column=j, value=v)
             c.border = border
             c.alignment = Alignment(vertical="top", wrap_text=(j in wrap), horizontal="center" if j in center else "left")
-            if j in pct and v is not None:
+            if j in pct and isinstance(v, (int, float)):
                 c.number_format = "0.0%"
 
     def widths(ws, ws_widths):
@@ -6613,6 +6601,8 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
 
+    frac = lambda v: (v / 100.0) if v is not None else "—"
+
     wb = openpyxl.Workbook()
 
     # ── Підсумок ──
@@ -6622,10 +6612,7 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"] = f"Період: {fmt_d(data['date_from'])} – {fmt_d(data['date_to'])} · сформовано {now_.strftime('%d.%m.%Y %H:%M')}"
     ws["A2"].font = Font(color="666666", size=10)
-    notes_ = []
-    if tch.get("count_until"):
-        notes_.append(f"Облік обмежено датою {fmt_d(tch['count_until'])} (відключення): пар після неї не враховано"
-                      + (f" — {data['cut_skipped']}." if data.get("cut_skipped") else "."))
+    notes_ = [f"Друга графа «До {cut_short}» рахує лише пари, які були раніше за {fmt_d(SCHED_OUTAGE_DATE)}: з цієї дати почались відключення."]
     if not tch["has_account"]:
         notes_.append("До викладача не прив'язано акаунт Zoom: онлайн-пари не можна перевірити.")
     cov = data["coverage"]
@@ -6639,56 +6626,62 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         ws.cell(row=r, column=1, value=n_).font = Font(color="B45309", size=10)
         r += 1
     r += 1
-    hdr(ws, r, ["Показник", "Значення"])
+    hdr(ws, r, ["Показник", "Увесь період", f"До {cut_short}"])
     rows_ = [
-        ("Пар за розкладом", tot["total"]), ("Проведено", tot["ok"]), ("Частково", tot["partial"]), ("Не знайдено", tot["missed"]),
-        ("Не проведено (немає звіту Zoom)", tot["no_data"]),
-        ("Тривога (поважна причина)", tot["alert"]), ("Очікується", tot["pending"]),
-        ("Без акаунта Zoom", tot["no_account"]), ("Очно (Zoom не перевіряється)", tot["offline"]),
-        ("Перевірено пар (проведено + частково + не знайдено + не проведено)", tot["checked"]),
-        ("Відвідуваність, % (проведено / перевірено)", None if tot["rate"] is None else tot["rate"] / 100.0),
-        ("Час у Zoom у межах пар, хв", tot["conducted_min"]), ("Час перевірених пар, хв", tot["planned_min"]),
-        ("Час у Zoom, % від часу перевірених пар", None if tot["min_rate"] is None else tot["min_rate"] / 100.0),
+        ("Пар за розкладом", tot["total"], pre["total"], False),
+        ("Проведено", tot["ok"], pre["ok"], False),
+        ("Частково", tot["partial"], pre["partial"], False),
+        ("Не проведено", tot["missed"], pre["missed"], False),
+        ("Тривога (поважна причина)", tot["alert"], pre["alert"], False),
+        ("Очікується", tot["pending"], pre["pending"], False),
+        ("Без акаунта Zoom", tot["no_account"], pre["no_account"], False),
+        ("Очно (Zoom не перевіряється)", tot["offline"], pre["offline"], False),
+        ("Перевірено пар (проведено + частково + не проведено)", tot["checked"], pre["checked"], False),
+        ("Відвідуваність, % (проведено / перевірено)", frac(tot["rate"]), frac(pre["rate"]), True),
+        ("Час у Zoom у межах пар, хв", tot["conducted_min"], pre["conducted_min"], False),
+        ("Час перевірених пар, хв", tot["planned_min"], pre["planned_min"], False),
+        ("Час у Zoom, % від часу перевірених пар", frac(tot["min_rate"]), frac(pre["min_rate"]), True),
     ]
-    for lab, val in rows_:
+    for lab, v_all, v_pre, is_pct in rows_:
         r += 1
-        put(ws, r, [lab, val if val is not None else "—"], center=(2,), pct=(2,) if "%" in lab else ())
-        if "%" in lab:
-            ws.cell(row=r, column=1).font = Font(bold=True)
-            ws.cell(row=r, column=2).font = Font(bold=True)
+        put(ws, r, [lab, v_all, v_pre], center=(2, 3), pct=(2, 3) if is_pct else ())
+        if is_pct:
+            for j in (1, 2, 3):
+                ws.cell(row=r, column=j).font = Font(bold=True)
     r += 2
 
     def breakdown(title, label_head, items, label_of):
         nonlocal r
         ws.cell(row=r, column=1, value=title).font = Font(bold=True, size=12)
         r += 1
-        hdr(ws, r, [label_head, "Усього", "Проведено", "Частково", "Не знайдено", "Не проведено", "Тривога", "Очікується", "Без акаунта", "Очно", "Відвідуваність, %"])
+        hdr(ws, r, [label_head, "Усього", "Проведено", "Частково", "Не проведено", "Тривога", "Очікується", "Без акаунта", "Очно",
+                    "Відвідуваність, % (увесь період)", f"Відвідуваність, % (до {cut_short})"])
         for it in items:
             r += 1
-            put(ws, r, [label_of(it), it["total"], it["ok"], it["partial"], it["missed"], it["no_data"], it["alert"], it["pending"],
-                        it["no_account"], it["offline"], None if it["rate"] is None else it["rate"] / 100.0],
-                center=range(2, 12), pct=(11,), wrap=(1,))
-            if it["rate"] is None:
-                ws.cell(row=r, column=11, value="—")
+            put(ws, r, [label_of(it), it["total"], it["ok"], it["partial"], it["missed"], it["alert"], it["pending"],
+                        it["no_account"], it["offline"], frac(it["rate"]), frac(it["rate_pre"])],
+                center=range(2, 12), pct=(10, 11), wrap=(1,))
         r += 2
 
     breakdown("По предметах", "Предмет", data["by_subject"],
               lambda it: it["subject"] + (f" ({', '.join(it['types'])})" if it["types"] else ""))
     breakdown("По тижнях", "Тиждень", data["by_week"], lambda it: f"{fmt_d(it['from'])} – {fmt_d(it['to'])}")
+
     # правила — щоб цифри в таблиці можна було перевірити
     ws.cell(row=r, column=1, value="Як рахуються статуси").font = Font(bold=True, size=12)
     r += 1
     for rule in (
-        f"Пара = {SCHED_SLOT_MINUTES} хв. Залишок E = {SCHED_SLOT_MINUTES} хв − тривалість тривоги в межах пари (тривоги коротші за {ALERT_EXCUSE_MIN} хв не враховуються).",
-        f"Проведено: у Zoom ≥ {int(SCHED_OK_RATIO * 100)}% від {SCHED_SLOT_MINUTES} хв (60 хв).",
-        f"Тривога: пара не «проведено», але Zoom ≥ {int(SCHED_OK_RATIO * 100)}% від E — пропущеною не вважається.",
-        f"Частково: Zoom ≥ {int(SCHED_PARTIAL_RATIO * 100)}% від E. Не знайдено: менше.",
-        "Не проведено: за цей час немає звіту Zoom. Очікується: пара ще йде або попереду. Без акаунта / Очно: Zoom не перевіряється.",
+        f"Пара = {SCHED_SLOT_MINUTES} хв. Залишок E = {SCHED_SLOT_MINUTES} хв − тривалість тривоги в межах пари (враховуються всі тривоги, навіть на 1 хв).",
+        f"Проведено: у Zoom ≥ {int(SCHED_OK_RATIO * 100)}% від {SCHED_SLOT_MINUTES} хв ({int(SCHED_SLOT_MINUTES * SCHED_OK_RATIO)} хв).",
+        f"Тривога: пара не «проведено», але Zoom ≥ {int(SCHED_OK_RATIO * 100)}% від E: пропущеною не вважається.",
+        "Частково: у Zoom від 1 хв, але менше, ніж для «Проведено».",
+        "Не проведено: у Zoom немає жодної зустрічі викладача в час пари (або немає звіту Zoom за цей час).",
+        "Очікується: пара ще йде або попереду. Без акаунта / Очно: Zoom не перевіряється.",
+        "Відвідуваність, % = Проведено / (Проведено + Частково + Не проведено).",
     ):
-        c_ = ws.cell(row=r, column=1, value=rule)
-        c_.font = Font(color="555555", size=10)
+        ws.cell(row=r, column=1, value=rule).font = Font(color="555555", size=10)
         r += 1
-    widths(ws, [52, 14, 14, 14, 14, 14, 14, 14, 14, 12, 18])
+    widths(ws, [52, 18, 18, 14, 14, 14, 14, 14, 12, 22, 22])
     page(ws)
 
     # ── Пари ──
