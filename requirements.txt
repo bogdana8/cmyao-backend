@@ -17,3 +17,4 @@ docxtpl
 num2words
 psycopg-binary
 py7zr
+matplotlib
