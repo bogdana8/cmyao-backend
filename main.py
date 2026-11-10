@@ -6627,24 +6627,26 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         r += 1
     r += 1
     hdr(ws, r, ["Показник", "Увесь період", f"До {cut_short}"])
+    ok_min = int(SCHED_SLOT_MINUTES * SCHED_OK_RATIO)
+    ok_pct = int(SCHED_OK_RATIO * 100)
     rows_ = [
-        ("Пар за розкладом", tot["total"], pre["total"], False),
-        ("Проведено", tot["ok"], pre["ok"], False),
-        ("Частково", tot["partial"], pre["partial"], False),
-        ("Не проведено", tot["missed"], pre["missed"], False),
-        ("Тривога (поважна причина)", tot["alert"], pre["alert"], False),
-        ("Очікується", tot["pending"], pre["pending"], False),
-        ("Без акаунта Zoom", tot["no_account"], pre["no_account"], False),
-        ("Очно (Zoom не перевіряється)", tot["offline"], pre["offline"], False),
-        ("Перевірено пар (проведено + частково + не проведено)", tot["checked"], pre["checked"], False),
+        ("Пар за розкладом (усі пари викладача за період)", tot["total"], pre["total"], False),
+        (f"Проведено (у Zoom ≥ {ok_min} хв із {SCHED_SLOT_MINUTES}, тобто ≥ {ok_pct}% пари)", tot["ok"], pre["ok"], False),
+        (f"Частково (у Zoom від 1 хв, але менше, ніж для «Проведено»)", tot["partial"], pre["partial"], False),
+        ("Не проведено (у Zoom 0 хв: жодної зустрічі викладача в час пари, або немає звіту Zoom за цей час)", tot["missed"], pre["missed"], False),
+        (f"Тривога (була тривога: від пари віднімається її тривалість; якщо Zoom ≥ {ok_pct}% залишку {SCHED_SLOT_MINUTES} хв − тривога, пара не вважається пропущеною)", tot["alert"], pre["alert"], False),
+        ("Очікується (пара ще йде або попереду, перевірити неможливо)", tot["pending"], pre["pending"], False),
+        ("Без акаунта Zoom (до викладача не прив'язано акаунт, порівняти нема з чим)", tot["no_account"], pre["no_account"], False),
+        ("Очно (очні пари, Zoom не перевіряється)", tot["offline"], pre["offline"], False),
+        ("Перевірено пар (проведено + частково + не проведено; тривога, очні, без акаунта та очікується не входять)", tot["checked"], pre["checked"], False),
         ("Відвідуваність, % (проведено / перевірено)", frac(tot["rate"]), frac(pre["rate"]), True),
-        ("Час у Zoom у межах пар, хв", tot["conducted_min"], pre["conducted_min"], False),
-        ("Час перевірених пар, хв", tot["planned_min"], pre["planned_min"], False),
-        ("Час у Zoom, % від часу перевірених пар", frac(tot["min_rate"]), frac(pre["min_rate"]), True),
+        (f"Час у Zoom у межах пар, хв (сума хвилин у Zoom всередині перевірених пар, не більше {SCHED_SLOT_MINUTES} хв на пару)", tot["conducted_min"], pre["conducted_min"], False),
+        (f"Час перевірених пар, хв (кількість перевірених пар × {SCHED_SLOT_MINUTES} хв)", tot["planned_min"], pre["planned_min"], False),
+        ("Час у Zoom, % (час у Zoom / час перевірених пар)", frac(tot["min_rate"]), frac(pre["min_rate"]), True),
     ]
     for lab, v_all, v_pre, is_pct in rows_:
         r += 1
-        put(ws, r, [lab, v_all, v_pre], center=(2, 3), pct=(2, 3) if is_pct else ())
+        put(ws, r, [lab, v_all, v_pre], center=(2, 3), pct=(2, 3) if is_pct else (), wrap=(1,))
         if is_pct:
             for j in (1, 2, 3):
                 ws.cell(row=r, column=j).font = Font(bold=True)
@@ -6654,7 +6656,8 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         nonlocal r
         ws.cell(row=r, column=1, value=title).font = Font(bold=True, size=12)
         r += 1
-        hdr(ws, r, [label_head, "Усього", "Проведено", "Частково", "Не проведено", "Тривога", "Очікується", "Без акаунта", "Очно",
+        hdr(ws, r, [label_head, "Усього", f"Проведено (≥ {ok_min} хв)", "Частково (від 1 хв)", "Не проведено (0 хв)", f"Тривога (Zoom ≥ {ok_pct}% залишку)",
+                    "Очікується (ще йде)", "Без акаунта Zoom", "Очно",
                     "Відвідуваність, % (увесь період)", f"Відвідуваність, % (до {cut_short})"])
         for it in items:
             r += 1
@@ -6681,7 +6684,7 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
     ):
         ws.cell(row=r, column=1, value=rule).font = Font(color="555555", size=10)
         r += 1
-    widths(ws, [52, 18, 18, 14, 14, 14, 14, 14, 12, 22, 22])
+    widths(ws, [78, 18, 18, 16, 16, 18, 16, 14, 12, 22, 22])
     page(ws)
 
     # ── Пари ──
@@ -6724,6 +6727,63 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
     safe = re.sub(r"[\\/:*?\"<>|]+", "", tch["name"]).strip().replace(" ", "_")
     fname = f"Відвідуваність_{safe}_{data['date_from']}_{data['date_to']}.xlsx"
     return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
+
+# =========================================================
+# 📄 АНАЛІТИЧНІ ДОВІДКИ ЗА РЕЗУЛЬТАТАМИ ОПИТУВАННЯ (xlsx/csv) — по кожній спеціальності та рівню освіти
+# Уся логіка в окремому модулі survey_reports.py (потрібні: pandas, openpyxl, python-docx, matplotlib).
+# =========================================================
+from fastapi import Form as _SrForm
+SURVEY_REPORT_MAX_MB = 25
+SURVEY_REPORT_MAX_GROUPS = 80
+
+def _sr_module():
+    try:
+        import survey_reports
+        return survey_reports
+    except ImportError as e:
+        raise HTTPException(status_code=501, detail=f"Для довідок бракує бібліотеки ({e.name}). Встановіть: pip install matplotlib python-docx openpyxl")
+
+async def _sr_read(file: UploadFile, options: str):
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Файл порожній")
+    if len(data) > SURVEY_REPORT_MAX_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"Файл завеликий (максимум {SURVEY_REPORT_MAX_MB} МБ)")
+    try:
+        opts = json.loads(options or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Некоректні налаштування")
+    return data, (opts if isinstance(opts, dict) else {})
+
+@app.post("/api/cmyo/survey-reports/preview")
+async def survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
+                                 user: dict = Depends(require_cmyo_admin)):
+    """Розбір файлу: які колонки — рівень/спеціальність/дата, типи питань, групи (рівень × спеціальність) і кількість відповідей."""
+    sr = _sr_module()
+    data, opts = await _sr_read(file, options)
+    try:
+        return await run_in_threadpool(sr.analyze, data, file.filename or "", opts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
+
+@app.post("/api/cmyo/survey-reports/generate")
+async def survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
+                                  user: dict = Depends(require_cmyo_admin)):
+    """Одна група → .docx, кілька → .zip з .docx на кожну групу."""
+    sr = _sr_module()
+    data, opts = await _sr_read(file, options)
+    if len(opts.get("groups") or []) > SURVEY_REPORT_MAX_GROUPS:
+        raise HTTPException(status_code=400, detail=f"Забагато груп за раз (максимум {SURVEY_REPORT_MAX_GROUPS})")
+    try:
+        fname, body, mime = await run_in_threadpool(sr.generate, data, file.filename or "", opts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не вдалося сформувати довідку: {e}")
+    return StreamingResponse(io.BytesIO(body), media_type=mime,
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
 
 # ── Акаунти Zoom ↔ викладачі ────────────────────────────────────
