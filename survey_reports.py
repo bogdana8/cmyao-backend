@@ -3,13 +3,14 @@
 Аналітичні довідки за результатами опитування (xlsx / csv) — окремо для кожної спеціальності та рівня освіти.
 
 Структура довідки повторює ваші зразки:
-  заголовок → вступ (коли/де проведено, мета, скільки респондентів) → діаграми по кожному питанню →
-  «За результатами опитування визначено:» + текст висновків → (додаток) текстові відповіді респондентів.
+  заголовок → вступ (коли/де проведено, мета, скільки респондентів) → діаграми по кожному питанню (текстові відповіді — гарними картками на місці питання) →
+  «За результатами опитування визначено:» + текст висновків.
 
 Висновки формуються за правилами з самих цифр (без AI), тому це ЧЕРНЕТКА: текст у .docx можна й потрібно редагувати.
 Залежності: pandas, openpyxl, python-docx, matplotlib.
 """
 import io
+import math
 import re
 import textwrap
 import zipfile
@@ -82,8 +83,9 @@ THEMES = [
     ("комунікація та командна робота", r"команд|комунікац"),
 ]
 
-BLUE, GREEN, RED, YELLOW, ORANGE, CYAN = "#4285F4", "#34A853", "#EA4335", "#FBBC04", "#FF6D01", "#46BDC6"
-PALETTE = [BLUE, RED, YELLOW, GREEN, ORANGE, CYAN, "#7BAAF7", "#F07B72", "#FCD04F", "#57BB8A", "#AB47BC", "#8D6E63"]
+BLUE, GREEN, RED, YELLOW, ORANGE, CYAN = "#4F6BED", "#2FBF9B", "#F25C78", "#FFB547", "#FF8A4C", "#22B8CF"
+PALETTE = [BLUE, RED, YELLOW, GREEN, "#8B5CF6", CYAN, ORANGE, "#E879A8", "#84CC16", "#9AA5B8", "#6EA8FE", "#A78BFA"]
+INK, MUTED, FAINT, TRACK, LINE = "#1F2433", "#6B7285", "#9AA1B2", "#EEF0F6", "#E1E4EE"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,96 +315,266 @@ def compute_stats(gdf: pd.DataFrame, q: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Діаграми (matplotlib → PNG)
+# Діаграми та картки текстових відповідей (matplotlib → PNG)
+# Усе малюється на «полотні» в дюймах (_Canvas), тому макет повністю під контролем:
+# заокруглені картки, кільцеві діаграми, смуги з прогресом, картки відповідей у два стовпці.
 # ─────────────────────────────────────────────────────────────────────────────
-def _png(fig):
+CHART_W = 6.6       # дюймів; у документі вставляється шириною 15,2 см
+DPI = 200
+PAD = 0.26          # внутрішні поля картки діаграми, дюймів
+TITLE_SIZE, TITLE_LH = 11.5, 0.215
+FONT_STACK = ["Inter", "Segoe UI", "Calibri", "Arial", "DejaVu Sans"]     # перший, що є в системі (є кирилиця)
+
+_FONT = None
+def _font():
+    global _FONT
+    if _FONT is None:
+        try:
+            from matplotlib import font_manager as fm
+            have = {f.name for f in fm.fontManager.ttflist}
+            _FONT = next((n for n in FONT_STACK if n in have), "DejaVu Sans")
+        except Exception:       # noqa: BLE001
+            _FONT = "DejaVu Sans"
+    return _FONT
+
+# ---- кольори -----------------------------------------------------------------
+def _hex2rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+def _mix(c1, c2, t):
+    a, b = _hex2rgb(c1), _hex2rgb(c2)
+    return "#%02X%02X%02X" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+def _scale_color(t):
+    """0 → червоний, 0,5 → бурштиновий, 1 → зелений."""
+    t = min(1.0, max(0.0, t))
+    return _mix(RED, YELLOW, t * 2) if t < 0.5 else _mix(YELLOW, GREEN, (t - 0.5) * 2)
+
+def _text_on(c):
+    r, g, b = _hex2rgb(c)
+    return INK if (0.299 * r + 0.587 * g + 0.114 * b) > 170 else "white"
+
+# ---- вимірювання й перенесення тексту -------------------------------------------
+_MEAS, _TW = {}, {}
+
+def _measurer():
+    if "r" not in _MEAS:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = Figure(figsize=(4, 1), dpi=100)
+        FigureCanvasAgg(fig)
+        _MEAS["fig"], _MEAS["r"] = fig, fig.canvas.get_renderer()
+    return _MEAS["fig"], _MEAS["r"]
+
+def _esc(s):
+    return str(s).replace("$", r"\$")       # щоб matplotlib не сприймав $...$ як формулу
+
+_EMOJI_RE = re.compile("[\U00010000-\U0010FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200b-\u200d]")
+def _clean(s):
+    s = _EMOJI_RE.sub("", str(s))
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s).strip()
+
+def _tw(s, size, weight="normal"):
+    k = (s, size, weight)
+    if k not in _TW:
+        fig, r = _measurer()
+        t = fig.text(0, 0, _esc(s), fontsize=size, fontweight=weight, family=_font())
+        _TW[k] = t.get_window_extent(r).width / 100.0
+        t.remove()
+    return _TW[k]
+
+def _wrap(text, size, max_w, weight="normal"):
+    sp = _tw("a a", size, weight) - _tw("aa", size, weight)
+    out = []
+    for para in str(text).splitlines() or [""]:
+        cur, cur_w = "", 0.0
+        for w in para.split():
+            ww = _tw(w, size, weight)
+            if ww > max_w:                              # дуже довге слово — ріжемо за символами
+                if cur:
+                    out.append(cur); cur, cur_w = "", 0.0
+                piece = ""
+                for ch in w:
+                    if piece and _tw(piece + ch, size, weight) > max_w:
+                        out.append(piece); piece = ch
+                    else:
+                        piece += ch
+                cur, cur_w = piece, _tw(piece, size, weight)
+                continue
+            if cur and cur_w + sp + ww > max_w:
+                out.append(cur); cur, cur_w = w, ww
+            else:
+                cur, cur_w = (cur + " " + w, cur_w + sp + ww) if cur else (w, ww)
+        if cur:
+            out.append(cur)
+    return out or [""]
+
+# ---- полотно ---------------------------------------------------------------------
+class _Canvas:
+    def __init__(self, h):
+        from matplotlib.figure import Figure
+        self.w, self.h = CHART_W, h
+        self.fig = Figure(figsize=(CHART_W, h), dpi=DPI, facecolor="white")
+        self.ax = self.fig.add_axes([0, 0, 1, 1])
+        self.ax.set_xlim(0, CHART_W); self.ax.set_ylim(h, 0); self.ax.axis("off")
+
+    def box(self, x, y, w, h, r=0.08, fc="white", ec="none", lw=0.0, z=1):
+        from matplotlib.patches import FancyBboxPatch
+        r = max(0.001, min(r, w / 2 - 0.001, h / 2 - 0.001))
+        self.ax.add_patch(FancyBboxPatch((x + r, y + r), max(w - 2 * r, 0.002), max(h - 2 * r, 0.002),
+                                         boxstyle=f"round,pad={r},rounding_size={r}", fc=fc, ec=ec, lw=lw, zorder=z))
+
+    def text(self, x, y, s, size=9, color=None, weight="normal", ha="left", z=5):
+        self.ax.text(x, y, _esc(s), fontsize=size, color=color or INK, fontweight=weight, family=_font(),
+                     ha=ha, va="center", zorder=z)
+
+    def lines(self, x, y, lines, size, lh, **kw):
+        for i, ln in enumerate(lines):
+            self.text(x, y + lh * (i + 0.5), ln, size, **kw)
+        return y + lh * len(lines)
+
+    def hline(self, x0, x1, y, color="#EEF0F6", lw=0.8):
+        self.ax.plot([x0, x1], [y, y], color=color, lw=lw, solid_capstyle="butt", zorder=2)
+
+    def png(self):
+        buf = io.BytesIO()
+        self.fig.savefig(buf, format="png", dpi=DPI, facecolor="white")
+        return buf.getvalue()
+
+def _shell(cv):
+    cv.box(0.03, 0.03, cv.w - 0.06, cv.h - 0.06, r=0.14, fc="white", ec=LINE, lw=1.0, z=0)
+
+def _title_lines(title):
+    return _wrap(_clean(title), TITLE_SIZE, CHART_W - 2 * PAD - 0.2, "bold")
+
+def _draw_title(cv, lines, y):
+    cv.box(PAD, y + 0.03, 0.05, len(lines) * TITLE_LH - 0.06, r=0.025, fc=PALETTE[0], z=2)
+    cv.lines(PAD + 0.17, y, lines, TITLE_SIZE, TITLE_LH, color=INK, weight="bold")
+    return y + len(lines) * TITLE_LH
+
+def _png(fig):          # залишено для сумісності
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     FigureCanvasAgg(fig)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, facecolor="white")      # без bbox_inches="tight": усі діаграми однакової ширини
+    fig.savefig(buf, format="png", dpi=DPI, facecolor="white")
     return buf.getvalue()
 
-CHART_W = 6.6      # дюймів; у документі вставляється шириною 15,2 см
-
-def _heading(fig, title, h):
-    """Заголовок діаграми зліва вгорі. Повертає частку висоти, де закінчується поле під заголовок."""
-    lines = textwrap.wrap(title, 76) or [""]
-    fig.text(0.012, 1 - 0.10 / h, "\n".join(lines), ha="left", va="top", fontsize=10.5, fontweight="bold", color="#202124", linespacing=1.25)
-    return 1 - (0.10 + 0.20 * len(lines) + 0.14) / h, len(lines)
-
-def _clean_axes(ax):
-    for sp in ("top", "right"):
-        ax.spines[sp].set_visible(False)
-    ax.spines["left"].set_color("#BDC1C6"); ax.spines["bottom"].set_color("#BDC1C6")
-    ax.tick_params(colors="#5F6368", labelsize=8.5)
-
-def _int_ticks(axis):
-    from matplotlib.ticker import MaxNLocator
-    axis.set_major_locator(MaxNLocator(integer=True))
-
+# ---- оцінки за шкалою ---------------------------------------------------------------
 def chart_rating(st):
-    from matplotlib.figure import Figure
     lo, hi = st["lo"], st["hi"]
-    xs = list(range(lo, hi + 1)); ys = [st["counts"].get(x, 0) for x in xs]
-    nl = len(textwrap.wrap(st["label"], 76) or [""])
-    h = 2.75 + 0.20 * nl
-    fig = Figure(figsize=(CHART_W, h)); ax = fig.add_subplot(111)
-    top_frac, _ = _heading(fig, st["label"], h)
-    fig.subplots_adjust(left=0.07, right=0.985, bottom=0.20, top=top_frac)
-    bars = ax.bar([str(x) for x in xs], ys, color=BLUE, width=0.62)
-    top = max(ys) or 1
-    for b, y in zip(bars, ys):
-        if y:
-            ax.text(b.get_x() + b.get_width() / 2, y + top * 0.02, f"{y} ({pct(y, st['n'])})", ha="center", va="bottom", fontsize=8, color="#3C4043")
-    ax.set_ylim(0, top * 1.28); _int_ticks(ax.yaxis)
-    ax.set_xlabel(f"Середній бал: {num(st['mean'], 2)} з {hi}  ·  відповідей: {st['n']}", fontsize=8.5, color="#5F6368")
-    _clean_axes(ax)
-    return _png(fig)
+    xs = list(range(hi, lo - 1, -1))
+    cnt = st["counts"]
+    top = max(cnt.get(x, 0) for x in xs) or 1
+    tl = _title_lines(st["label"])
+    rh = 0.30 if len(xs) <= 6 else 0.235
+    area = max(len(xs) * rh, 1.6)
+    y_top = PAD + len(tl) * TITLE_LH + 0.2
+    cv = _Canvas(y_top + area + PAD)
+    _shell(cv); _draw_title(cv, tl, PAD)
 
+    pw = 1.55                                                   # ліва панель із середнім балом
+    cv.box(PAD, y_top, pw, area, r=0.1, fc="#F5F6FB", z=1)
+    cx = PAD + pw / 2
+    col = _scale_color((st["mean"] - lo) / max(hi - lo, 1))
+    cy = y_top + (area - 1.27) / 2
+    cv.text(cx, cy + 0.42, num(st["mean"], 2), 28, col, "bold", "center")
+    cv.text(cx, cy + 0.80, f"з {hi}", 10, MUTED, "normal", "center")
+    cv.text(cx, cy + 1.02, "середній бал", 8.5, MUTED, "normal", "center")
+    cv.text(cx, cy + 1.27, f"відповідей: {st['n']}", 8, FAINT, "normal", "center")
+
+    x1 = CHART_W - PAD
+    bx0 = PAD + pw + 0.25
+    tx0, tx1 = bx0 + 0.34, x1 - 0.95
+    ry = y_top + (area - len(xs) * rh) / 2
+    for i, x in enumerate(xs):
+        v = cnt.get(x, 0)
+        yc = ry + rh * (i + 0.5)
+        cv.text(bx0 + 0.12, yc, str(x), 9, MUTED, "bold", "center")
+        cv.box(tx0, yc - 0.065, tx1 - tx0, 0.13, r=0.065, fc=TRACK, z=1)
+        if v:
+            cv.box(tx0, yc - 0.065, max((tx1 - tx0) * v / top, 0.13), 0.13, r=0.065,
+                   fc=_scale_color((x - lo) / max(hi - lo, 1)), z=2)
+        cv.text(x1, yc, f"{v} ({pct(v, st['n'])})" if v else "0", 8.5, INK if v else FAINT, "normal", "right")
+    return cv.png()
+
+# ---- одна відповідь з кількох варіантів → кільцева діаграма ----------------------------
 def chart_pie(st):
-    from matplotlib.figure import Figure
-    import math
-    opts = st["opts"]; total = sum(c for _, c in opts)
-    nl = len(textwrap.wrap(st["label"], 76) or [""])
-    h = 2.9 + 0.20 * nl
-    fig = Figure(figsize=(CHART_W, h))
-    top_frac, _ = _heading(fig, st["label"], h)
-    side = 2.35 / h
-    ax = fig.add_axes([0.03, max(0.08, top_frac - side - 0.02), 2.35 / CHART_W, side])
-    wedges, _t = ax.pie([c for _, c in opts], colors=PALETTE[:len(opts)], startangle=90, counterclock=False,
-                        wedgeprops=dict(edgecolor="white", linewidth=1.2))
-    for w, (_, c) in zip(wedges, opts):
+    opts = st["opts"]
+    total = sum(c for _, c in opts)
+    tl = _title_lines(st["label"])
+    D = 2.15
+    x1 = CHART_W - PAD
+    lx0 = PAD + D + 0.35
+    vals = [f"{c} ({pct(c, total)})" for _, c in opts]
+    vw = max(_tw(v, 8.8, "bold") for v in vals) + 0.05
+    txt_w = x1 - lx0 - 0.22 - vw - 0.12
+    rows = []
+    for (o, _c), v in zip(opts, vals):
+        ln = _wrap(_clean(o), 9, txt_w)
+        rows.append((ln, v, len(ln) * 0.17 + 0.17))
+    leg_h = sum(r[2] for r in rows) - 0.17
+    area = max(D, leg_h)
+    y_top = PAD + len(tl) * TITLE_LH + 0.2
+    h = y_top + area + PAD
+    cv = _Canvas(h)
+    _shell(cv); _draw_title(cv, tl, PAD)
+
+    ax = cv.fig.add_axes([PAD / CHART_W, 1 - (y_top + (area - D) / 2 + D) / h, D / CHART_W, D / h])
+    ax.set_facecolor("none")
+    colors = [PALETTE[i % len(PALETTE)] for i in range(len(opts))]
+    wedges, _t = ax.pie([c for _, c in opts], colors=colors, startangle=90, counterclock=False,
+                        wedgeprops=dict(width=0.40, edgecolor="white", linewidth=2.0))
+    for w, (_o, c), col in zip(wedges, opts, colors):
         if c / total >= 0.07:
             ang = math.radians((w.theta1 + w.theta2) / 2)
-            ax.text(0.68 * math.cos(ang), 0.68 * math.sin(ang), pct(c, total), ha="center", va="center", color="white", fontsize=9, fontweight="bold")
-    fig.legend(wedges, [f"{textwrap.fill(o, 40)} — {c} ({pct(c, total)})" for o, c in opts], loc="center left",
-               bbox_to_anchor=(2.55 / CHART_W, max(0.08, top_frac - side - 0.02) + side / 2), fontsize=8.5, frameon=False, labelcolor="#3C4043")
-    fig.text(0.012, 0.03, f"відповідей: {st['n']}", fontsize=8.5, color="#5F6368")
-    return _png(fig)
+            ax.text(0.80 * math.cos(ang), 0.80 * math.sin(ang), pct(c, total), ha="center", va="center",
+                    color=_text_on(col), fontsize=8.5, fontweight="bold", family=_font())
+    ax.text(0, 0.08, str(total), ha="center", va="center", fontsize=19, fontweight="bold", color=INK, family=_font())
+    ax.text(0, -0.24, "відповідей", ha="center", va="center", fontsize=8, color=MUTED, family=_font())
 
+    y = y_top + (area - leg_h) / 2
+    for i, ((ln, v, rh), col) in enumerate(zip(rows, colors)):
+        cv.box(lx0, y + 0.085 - 0.06, 0.12, 0.12, r=0.06, fc=col, z=2)
+        cv.lines(lx0 + 0.22, y, ln, 9, 0.17, color=INK)
+        cv.text(x1, y + 0.085, v, 8.8, INK, "bold", "right")
+        if i < len(rows) - 1:
+            cv.hline(lx0, x1, y + rh - 0.085)
+        y += rh
+    return cv.png()
+
+# ---- горизонтальні смуги (багато варіантів / множинний вибір) ----------------------------
 def chart_hbar(st):
-    from matplotlib.figure import Figure
-    opts = st["opts"][:15]
+    opts = list(st["opts"][:15])
     rest = sum(c for _, c in st["opts"][15:])
     if rest:
-        opts = opts + [(f"Інші відповіді ({len(st['opts']) - 15})", rest)]
-    k = len(opts)
-    nl = len(textwrap.wrap(st["label"], 76) or [""])
-    h = max(2.0, 0.40 * k + 0.95) + 0.20 * nl
-    fig = Figure(figsize=(CHART_W, h)); ax = fig.add_subplot(111)
-    top_frac, _ = _heading(fig, st["label"], h)
-    fig.subplots_adjust(left=0.47, right=0.97, bottom=0.62 / h + 0.02, top=top_frac)
-    vals = [c for _, c in opts][::-1]
-    labels = [textwrap.fill(o, 44) for o, _ in opts][::-1]
-    ax.barh(range(k), vals, color=BLUE, height=0.62)
-    top = max(vals) or 1
-    for i, v in enumerate(vals):
-        ax.text(v + top * 0.015, i, f"{v} ({pct(v, st['n'])})", va="center", fontsize=8, color="#3C4043")
-    ax.set_yticks(range(k)); ax.set_yticklabels(labels, fontsize=8.5, color="#3C4043")
-    ax.set_xlim(0, top * 1.3); _int_ticks(ax.xaxis)
-    ax.set_xlabel(f"відповідей: {st['n']}" + ("  ·  можна було обрати кілька варіантів" if st["kind"] == "multi" else ""), fontsize=8.5, color="#5F6368")
-    _clean_axes(ax)
-    return _png(fig)
+        opts.append((f"Інші відповіді ({len(st['opts']) - 15})", rest))
+    x0, x1 = PAD, CHART_W - PAD
+    vals = [f"{c} ({pct(c, st['n'])})" for _, c in opts]
+    vw = max(_tw(v, 8.5) for v in vals) + 0.05
+    tr_w = x1 - x0 - vw - 0.18
+    top = max(c for _, c in opts) or 1
+    tl = _title_lines(st["label"])
+    rows = []
+    for o, c in opts:
+        ln = _wrap(_clean(o), 8.8, x1 - x0)
+        rows.append((ln, len(ln) * 0.165 + 0.04 + 0.13 + 0.17))
+    foot = f"відповідей: {st['n']}" + ("  ·  можна було обрати кілька варіантів" if st["kind"] == "multi" else "")
+    y_top = PAD + len(tl) * TITLE_LH + 0.2
+    h = y_top + sum(r[1] for r in rows) + 0.12 + 0.2 + PAD * 0.7
+    cv = _Canvas(h)
+    _shell(cv); _draw_title(cv, tl, PAD)
+    y = y_top
+    for i, ((ln, rh), (o, c), v) in enumerate(zip(rows, opts, vals)):
+        yy = cv.lines(x0, y, ln, 8.8, 0.165, color=INK)
+        yb = yy + 0.04 + 0.065
+        grey = o.startswith("Інші відповіді")
+        cv.box(x0, yb - 0.065, tr_w, 0.13, r=0.065, fc=TRACK, z=1)
+        cv.box(x0, yb - 0.065, max(tr_w * c / top, 0.13), 0.13, r=0.065, fc=("#B8BECC" if grey else PALETTE[0]), z=2)
+        cv.text(x1, yb, v, 8.5, INK, "normal", "right")
+        y += rh
+    cv.text(x0, y + 0.12, foot, 8, MUTED)
+    return cv.png()
 
 def make_chart(st):
     k = st["kind"]
@@ -413,6 +585,78 @@ def make_chart(st):
     if k in ("single", "multi"):
         return chart_hbar(st)
     return None
+
+# ---- текстові відповіді → картки (як у Google Forms), по сторінках ------------------------
+ACCENTS = ["#4F6BED", "#22B8CF", "#E879A8", "#8B5CF6", "#2FBF9B"]
+
+def make_open_cards(st, max_h=5.4):
+    """Повертає список PNG: відповіді респондентів у картках; довгий список ділиться на кілька зображень."""
+    answers = [a for a in (_clean(x) for x in st.get("answers", [])) if a]
+    if not answers:
+        return []
+    PADO, GAP, px, py, TS, LH = 0.22, 0.12, 0.15, 0.11, 9.2, 0.172
+    cw = CHART_W - 2 * PADO
+    half = (cw - GAP) / 2
+    cards = []
+    for a in answers:
+        lf = _wrap(a, TS, cw - 2 * px)
+        lh = _wrap(a, TS, half - 2 * px)
+        cards.append({"full": lf, "half": lh, "short": len(lh) <= 2})
+    rows, i = [], 0
+    while i < len(cards):                       # дві короткі відповіді поруч, довгі — на всю ширину
+        if cards[i]["short"] and i + 1 < len(cards) and cards[i + 1]["short"]:
+            rows.append([i, i + 1]); i += 2
+        else:
+            rows.append([i]); i += 1
+
+    def card_h(lines):
+        return max(0.38, 2 * py + len(lines) * LH)
+
+    def row_h(r):
+        return max(card_h(cards[j]["half"] if len(r) == 2 else cards[j]["full"]) for j in r)
+
+    t_first = _wrap(_clean(st["label"]), 12.5, cw, "bold")
+    hdr_first = len(t_first) * 0.25 + 0.22 + 0.14
+    t_cont = _wrap(_clean(st["label"]) + " (продовження)", 10.5, cw, "bold")
+    hdr_cont = len(t_cont) * 0.21 + 0.12
+
+    chunks, cur, cur_h = [], [], 0.0
+    for r in rows:
+        hdr = hdr_first if not chunks else hdr_cont
+        rh = row_h(r) + 0.11
+        if cur and PADO * 2 + hdr + cur_h + rh > max_h:
+            chunks.append(cur); cur, cur_h = [], 0.0
+            hdr = hdr_cont
+        cur.append(r); cur_h += rh
+    if cur:
+        chunks.append(cur)
+
+    out, idx = [], 0
+    for ci, chunk in enumerate(chunks):
+        first = ci == 0
+        hdr = hdr_first if first else hdr_cont
+        h = PADO * 2 + hdr + sum(row_h(r) + 0.11 for r in chunk) - 0.11
+        cv = _Canvas(h)
+        cv.box(0.03, 0.03, cv.w - 0.06, cv.h - 0.06, r=0.14, fc="#F3F4FC", z=0)
+        y = PADO
+        if first:
+            y = cv.lines(PADO, y, t_first, 12.5, 0.25, color=INK, weight="bold")
+            cv.text(PADO, y + 0.11, f"Змістовних відповідей: {len(answers)}", 8.5, MUTED)
+            y += 0.22 + 0.14
+        else:
+            y = cv.lines(PADO, y, t_cont, 10.5, 0.21, color=MUTED, weight="bold") + 0.12
+        for r in chunk:
+            rh = row_h(r)
+            for k, j in enumerate(r):
+                x = PADO + k * (half + GAP) if len(r) == 2 else PADO
+                w = half if len(r) == 2 else cw
+                lines = cards[j]["half"] if len(r) == 2 else cards[j]["full"]
+                col = ACCENTS[(j + idx) % len(ACCENTS)]
+                cv.box(x, y, w, rh, r=0.09, fc="white", ec=col, lw=1.3, z=2)
+                cv.lines(x + px, y + (rh - len(lines) * LH) / 2, lines, TS, LH, color=INK)
+            y += rh + 0.11
+        out.append(cv.png())
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,6 +803,19 @@ def _p(doc, text="", bold=False, center=False, indent=True, after=6, keep_next=F
         r = p.add_run(text); r.bold = bold
     return p
 
+def _picture(doc, png):
+    """Діаграма / картки відповідей — зображення по центру на повну ширину тексту (15,2 см)."""
+    from docx.shared import Cm, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_after = Pt(8)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+    p.paragraph_format.keep_together = True
+    p.add_run().add_picture(io.BytesIO(png), width=Cm(15.2))
+    return p
+
 def build_docx(gdf, questions, ctx) -> bytes:
     """gdf — відповіді однієї групи; questions — перелік питань (з типами); ctx — контекст довідки."""
     from docx.shared import Cm, Pt
@@ -589,28 +846,33 @@ def build_docx(gdf, questions, ctx) -> bytes:
 
     stats = [compute_stats(gdf, q) for q in questions]
     stats = [s for s in stats if s["kind"] != "empty"]
+    include_open = ctx.get("include_open", True)
+    appendix = []                       # open_placement="appendix" — картки відповідей окремим додатком у кінці
     for st in stats:
+        if st["kind"] == "open":
+            if not (include_open and st["answers"]):
+                continue
+            if ctx.get("open_placement", "inline") == "appendix":
+                appendix.append(st)
+            else:
+                for png in make_open_cards(st):
+                    _picture(doc, png)
+            continue
         png = make_chart(st)
         if png:
-            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.space_after = 8
-            p.paragraph_format.keep_together = True
-            p.add_run().add_picture(io.BytesIO(png), width=Cm(15.2))
+            _picture(doc, png)
 
     p = _p(doc, "За результатами опитування визначено:", indent=False, after=6, keep_next=True)
     p.paragraph_format.space_before = Pt(10)
     for text in conclusions(stats, n):
         _p(doc, text)
 
-    if ctx.get("include_open", True):
-        opens = [s for s in stats if s["kind"] == "open" and s["answers"]]
-        if opens:
-            doc.add_page_break()
-            _p(doc, "Додаток. Текстові відповіді респондентів", bold=True, center=True, indent=False, after=6, keep_next=True)
-            for st in opens:
-                _p(doc, st["label"], bold=True, indent=False, after=3, keep_next=True)
-                for a in st["answers"]:
-                    _p(doc, a, indent=False, after=2, style="List Bullet")
+    if appendix:
+        doc.add_page_break()
+        _p(doc, "Додаток. Текстові відповіді респондентів", bold=True, center=True, indent=False, after=8, keep_next=True)
+        for st in appendix:
+            for png in make_open_cards(st):
+                _picture(doc, png)
     buf = io.BytesIO(); doc.save(buf)
     return buf.getvalue()
 
