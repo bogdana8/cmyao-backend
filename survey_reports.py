@@ -4,9 +4,9 @@
 
 Структура довідки повторює ваші зразки:
   заголовок → вступ (коли/де проведено, мета, скільки респондентів) → діаграми по кожному питанню (текстові відповіді — гарними картками на місці питання) →
-  «За результатами опитування визначено:» + текст висновків.
+  «За результатами опитування визначено:» (порожній розділ для ваших висновків).
 
-Висновки формуються за правилами з самих цифр (без AI), тому це ЧЕРНЕТКА: текст у .docx можна й потрібно редагувати.
+Текст висновків не генерується — його вписують вручну. Заголовки діаграм беруться з opts["titles"] (справжні питання анкети), якщо їх передано.
 Залежності: pandas, openpyxl, python-docx, matplotlib.
 """
 import io
@@ -864,8 +864,7 @@ def build_docx(gdf, questions, ctx) -> bytes:
 
     p = _p(doc, "За результатами опитування визначено:", indent=False, after=6, keep_next=True)
     p.paragraph_format.space_before = Pt(10)
-    for text in conclusions(stats, n):
-        _p(doc, text)
+    _p(doc, "")         # місце для ваших висновків — текст не генерується
 
     if appendix:
         doc.add_page_break()
@@ -882,7 +881,7 @@ def build_docx(gdf, questions, ctx) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 def generate(data: bytes, filename: str, opts: dict):
     """opts: level, specialty, timestamp (назви колонок), groups (список ключів «рівень||спеціальність»),
-    exclude (колонки-питання, які не включати), category, institution, purpose, include_open.
+    exclude (колонки-питання, які не включати), titles ({колонка: точне формулювання питання}), category, institution, purpose, include_open.
     Повертає (ім'я_файлу, байти, mime)."""
     df = read_table(data, filename)
     det = detect_columns(df)
@@ -897,6 +896,9 @@ def generate(data: bytes, filename: str, opts: dict):
             continue
         q = classify_question(c, df[c])
         if q["kind"] != "empty":
+            title = _clean(str((opts.get("titles") or {}).get(c) or ""))
+            if title:                                   # справжнє формулювання питання замість назви колонки
+                q["label"], q["label_short"] = title, label_short(title)
             questions.append(q)
 
     lc, sc = det["level"], det["specialty"]
