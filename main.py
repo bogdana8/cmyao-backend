@@ -7164,6 +7164,43 @@ async def survey_reports_generate(file: UploadFile = File(...), options: str = _
     return StreamingResponse(io.BytesIO(body), media_type=mime,
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
 
+# ── Аналітична довідка ЦСК (інша структура + текст від AI) ───────────────────────────────────
+# Модуль survey_reports_csk.py (+ csk_template.docx поруч). Для AI потрібен ANTHROPIC_API_KEY у .env.
+def _sr_csk_module():
+    try:
+        import survey_reports_csk
+        return survey_reports_csk
+    except ImportError as e:
+        raise HTTPException(status_code=501, detail=f"Для довідок ЦСК бракує бібліотеки ({e.name}). Встановіть: pip install matplotlib python-docx openpyxl requests")
+
+@app.post("/api/csk/survey-reports/preview")
+async def csk_survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
+                                     user: dict = Depends(require_csk_admin)):
+    """Розбір файлу: колонка підрозділу/дати, типи питань, підрозділи з кількістю відповідей, період."""
+    sr = _sr_csk_module()
+    data, opts = await _sr_read(file, options)
+    try:
+        return await run_in_threadpool(sr.analyze_csk, data, file.filename or "", opts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
+
+@app.post("/api/csk/survey-reports/generate")
+async def csk_survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
+                                      user: dict = Depends(require_csk_admin)):
+    """Одна аналітична довідка .docx на весь файл. Текст аналізу, висновків і рекомендацій пише AI (якщо options.ai != false)."""
+    sr = _sr_csk_module()
+    data, opts = await _sr_read(file, options)
+    try:
+        fname, body, mime = await run_in_threadpool(sr.generate_csk, data, file.filename or "", opts)
+    except ValueError as e:                      # у т.ч. AIError — повідомлення зрозуміле користувачеві
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не вдалося сформувати довідку: {e}")
+    return StreamingResponse(io.BytesIO(body), media_type=mime,
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
+
 # ── Акаунти Zoom ↔ викладачі ────────────────────────────────────
 class ZoomAccountLinkSchema(BaseModel):
     teacher_id: Optional[int] = None
