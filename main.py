@@ -6775,7 +6775,7 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         r += 1
         hdr(ws, r, [label_head, "Усього", f"Проведено (≥ {ok_min} хв)", "Частково (від 1 хв)", "Не проведено (0 хв)", f"Тривога (Zoom ≥ {ok_pct}% залишку)",
                     "Очікується (ще йде)", "Без акаунта Zoom", "Очно",
-                    "Відвідуваність, % (увесь період)", f"Відвідуваність, % (до {cut_short})"])
+                    "Проведеність, % (увесь період)", f"Проведеність, % (до {cut_short})"])
         for it in items:
             r += 1
             put(ws, r, [label_of(it), it["total"], it["ok"], it["partial"], it["missed"], it["alert"], it["pending"],
@@ -6940,7 +6940,7 @@ async def export_department_attendance(date_from: str, date_to: Optional[str] = 
 
     metric_heads = ["Усього пар", f"Проведено (≥ {ok_min} хв)", "Частково (від 1 хв)", "Не проведено (0 хв)", f"Тривога (Zoom ≥ {ok_pct}% залишку)",
                     "Очікується (ще йде)", "Без акаунта Zoom", "Очно", "Перевірено пар",
-                    "Відвідуваність, % (увесь період)", f"Відвідуваність, % (до {cut_short})"]
+                    "Проведеність, % (увесь період)", f"Проведеність, % (до {cut_short})"]
     metrics = lambda it: [it["total"], it["ok"], it["partial"], it["missed"], it["alert"], it["pending"], it["no_account"], it["offline"],
                           it["checked"], frac(it["rate"]), frac(it["rate_pre"])]
     now_ = _sched_now()
