@@ -539,6 +539,7 @@ SCHED_SLOT_MINUTES = 80                                   # тривалість
 SCHED_SLOT_STARTS = ["09:00", "10:30", "12:30", "14:00", "15:30", "17:00", "18:30"]   # початки слотів 1..7
 # Пропорції рахуються від «залишку» пари: E = 80 хв − тривалість тривоги (враховуються ВСІ тривоги, навіть на 1 хв).
 SCHED_OK_RATIO = 0.75                                     # «проведено»: у Zoom ≥ 75% від E (без тривоги — 60 хв)
+SCHED_ALERT_FULL_RATIO = 0.75                              # якщо тривога сама покрила ≥ 75% пари (залишок < чверті) — пара «Тривога», навіть якщо в Zoom нічого
 SCHED_PARTIAL_MIN = 1                                     # «частково»: у Zoom від 1 хв; 0 хв — «не проведено»
 SCHED_OUTAGE_DATE = "2026-11-03"                          # з цієї дати почались відключення: друга графа відсотків у звіті — пари ДО цієї дати
 
@@ -5112,7 +5113,8 @@ def _sched_eff_minutes(alert_min: float) -> float:
 def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, global_until, alert_min=0.0):
     """Статус пари. Пропорції від залишку пари E = 80 − тривога:
        проведено    — Zoom ≥ 75% від 80 хв (60 хв);
-       тривога      — пара не «проведено», але Zoom ≥ 75% від E: пропущеною не вважаємо;
+       тривога      — пара не «проведено», але Zoom ≥ 75% від E, АБО тривога сама покрила ≥ 75% пари
+                      (SCHED_ALERT_FULL_RATIO: проводити пару в залишку, що менший за чверть, нереально): пропущеною не вважаємо;
        частково     — Zoom від 1 хв;
        не проведено — у Zoom нічого (або немає звіту Zoom за цей час), хоча пара за розкладом була."""
     if not it.is_online:
@@ -5123,6 +5125,8 @@ def _sched_lesson_status(it, slot_s, slot_e, overlap_min, has_account, covered, 
     if not has_account and not it.zoom_meeting_id:
         return "no_account"
     eff = _sched_eff_minutes(alert_min)
+    if alert_min + eps >= SCHED_SLOT_MINUTES * SCHED_ALERT_FULL_RATIO:
+        return "alert"
     if not covered:
         # дані Zoom ще неповні (пара йде або попереду) → «очікується»; немає звіту за цей час → як 0 хв у Zoom
         if global_until is not None and slot_e > global_until:
@@ -6747,7 +6751,7 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         (f"Проведено (у Zoom ≥ {ok_min} хв із {SCHED_SLOT_MINUTES}, тобто ≥ {ok_pct}% пари)", tot["ok"], pre["ok"], False),
         (f"Частково (у Zoom від 1 хв, але менше, ніж для «Проведено»)", tot["partial"], pre["partial"], False),
         ("Не проведено (у Zoom 0 хв: жодної зустрічі викладача в час пари, або немає звіту Zoom за цей час)", tot["missed"], pre["missed"], False),
-        (f"Тривога (була тривога: від пари віднімається її тривалість; якщо Zoom ≥ {ok_pct}% залишку {SCHED_SLOT_MINUTES} хв − тривога, пара не вважається пропущеною)", tot["alert"], pre["alert"], False),
+        (f"Тривога (була тривога: від пари віднімається її тривалість; якщо Zoom ≥ {ok_pct}% залишку {SCHED_SLOT_MINUTES} хв − тривога, або тривога покрила ≥ {int(SCHED_ALERT_FULL_RATIO * 100)}% пари, пара не вважається пропущеною)", tot["alert"], pre["alert"], False),
         ("Очікується (пара ще йде або попереду, перевірити неможливо)", tot["pending"], pre["pending"], False),
         ("Без акаунта Zoom (до викладача не прив'язано акаунт, порівняти нема з чим)", tot["no_account"], pre["no_account"], False),
         ("Очно (очні пари, Zoom не перевіряється)", tot["offline"], pre["offline"], False),
@@ -6790,6 +6794,7 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
         f"Пара = {SCHED_SLOT_MINUTES} хв. Залишок E = {SCHED_SLOT_MINUTES} хв − тривалість тривоги в межах пари (враховуються всі тривоги, навіть на 1 хв).",
         f"Проведено: у Zoom ≥ {int(SCHED_OK_RATIO * 100)}% від {SCHED_SLOT_MINUTES} хв ({int(SCHED_SLOT_MINUTES * SCHED_OK_RATIO)} хв).",
         f"Тривога: пара не «проведено», але Zoom ≥ {int(SCHED_OK_RATIO * 100)}% від E: пропущеною не вважається.",
+        f"Тривога також, якщо сама тривога покрила ≥ {int(SCHED_ALERT_FULL_RATIO * 100)}% пари ({int(SCHED_SLOT_MINUTES * SCHED_ALERT_FULL_RATIO)} хв із {SCHED_SLOT_MINUTES}): у залишку пару провести нереально.",
         "Частково: у Zoom від 1 хв, але менше, ніж для «Проведено».",
         "Не проведено: у Zoom немає жодної зустрічі викладача в час пари (або немає звіту Zoom за цей час).",
         "Очікується: пара ще йде або попереду. Без акаунта / Очно: Zoom не перевіряється.",
