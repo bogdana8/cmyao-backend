@@ -1052,9 +1052,9 @@ def _apply_subject_constraints():
     stmts = [
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_subject_opp_name_sem ON subjects (opp_id, name_norm, (COALESCE(semester, 0)))",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_subject ON plan_subject_hours (study_plan_id, subject_id)",
-        "ALTER TABLE subjects ADD CONSTRAINT ck_subject_semester CHECK (semester IS NULL OR semester BETWEEN 1 AND 12)",
-        "ALTER TABLE subjects ADD CONSTRAINT ck_subject_control_form CHECK (control_form IS NULL OR control_form IN ('Екзамен','Залік','Диф. залік'))",
-        "ALTER TABLE plan_subject_hours ADD CONSTRAINT ck_hours_nonneg CHECK (COALESCE(hours,0) >= 0 AND COALESCE(lecture_hours,0) >= 0 AND COALESCE(practice_hours,0) >= 0 AND COALESCE(self_study_hours,0) >= 0)",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_subject_semester') THEN ALTER TABLE subjects ADD CONSTRAINT ck_subject_semester CHECK (semester IS NULL OR semester BETWEEN 1 AND 12); END IF; END $$",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_subject_control_form') THEN ALTER TABLE subjects ADD CONSTRAINT ck_subject_control_form CHECK (control_form IS NULL OR control_form IN ('Екзамен','Залік','Диф. залік')); END IF; END $$",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_hours_nonneg') THEN ALTER TABLE plan_subject_hours ADD CONSTRAINT ck_hours_nonneg CHECK (COALESCE(hours,0) >= 0 AND COALESCE(lecture_hours,0) >= 0 AND COALESCE(practice_hours,0) >= 0 AND COALESCE(self_study_hours,0) >= 0); END IF; END $$",
     ]
     with engine.connect() as conn:
         for sql in stmts:
@@ -6987,6 +6987,90 @@ async def export_department_attendance(date_from: str, date_to: Optional[str] = 
     wb.save(out)
     out.seek(0)
     fname = f"Відвідуваність_по_кафедрах_{data['date_from']}_{data['date_to']}.xlsx"
+    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
+
+# =========================================================
+# 🕳 ВИКЛАДАЧІ БЕЗ ДАНИХ ZOOM
+# Хто за розкладом ПОВИНЕН проводити пари в періоді, але перевірити його неможливо:
+#   no_account — до викладача не прив'язано акаунт Zoom (а онлайн-пари є);
+#   no_meetings — акаунт є, але в Zoom за період немає жодної зустрічі (ні в парах, ні поза розкладом).
+# Разом із приміткою викладача (вкладка «Викладачі»): видно, кого вже пояснено, а кого ні.
+# =========================================================
+ND_REASONS = {"no_account": "Немає акаунта Zoom", "no_meetings": "Акаунт є, зустрічей у Zoom немає"}
+
+async def _no_data_build(db, date_from: str, date_to: Optional[str]) -> dict:
+    d_from, d_to = _sched_parse_range(date_from, date_to, ATT_MAX_DAYS)
+    ov = await _schedule_overview_core(db, d_from, d_to, other_limit=1)
+    dept_of = {t.id: _clean(t.department) for t in db.query(DBLessonTeacher).all()}
+    rows = []
+    for card in ov["teachers"]:
+        lessons = card["lessons"]
+        need = [l for l in lessons if l["status"] in ("ok", "partial", "missed", "alert", "no_account")]   # пари, де Zoom мав би бути
+        if not need:
+            continue
+        if not card["has_account"]:
+            reason = "no_account"
+        elif not any(l.get("meetings") for l in lessons) and not card["other_meetings"]:
+            reason = "no_meetings"
+        else:
+            continue
+        dates = sorted(l["date"] for l in need)
+        rows.append({"id": card["id"], "name": card["name"], "department": dept_of.get(card["id"]) or "", "note": (card.get("note") or "").strip(),
+                     "reason": reason, "reason_label": ND_REASONS[reason], "lessons": len(need), "first": dates[0], "last": dates[-1]})
+    rows.sort(key=lambda r: (bool(r["note"]), r["name"].lower()))           # спершу ті, у кого примітки немає
+    return {"date_from": d_from, "date_to": d_to, "coverage": ov["coverage"], "teachers_count": len(ov["teachers"]), "teachers": rows,
+            "counts": {"total": len(rows), "with_note": sum(1 for r in rows if r["note"]), "without_note": sum(1 for r in rows if not r["note"]),
+                       "no_account": sum(1 for r in rows if r["reason"] == "no_account"), "no_meetings": sum(1 for r in rows if r["reason"] == "no_meetings")}}
+
+@app.get("/api/cmyo/schedule/no-data-teachers")
+async def no_data_teachers(date_from: str, date_to: Optional[str] = None,
+                           user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    return await _no_data_build(db, date_from, date_to)
+
+@app.get("/api/cmyo/schedule/no-data-teachers/export")
+async def export_no_data_teachers(date_from: str, date_to: Optional[str] = None,
+                                 user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    data = await _no_data_build(db, date_from, date_to)
+    if not data["teachers"]:
+        raise HTTPException(status_code=404, detail="За цей період немає викладачів без даних Zoom")
+    fmt_d = lambda iso: f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}" if iso else ""
+    thin = Side(style="thin", color="BBBBBB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Без даних Zoom"
+    ws["A1"] = "Викладачі, які мають пари за розкладом, але без даних Zoom"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = f"Період: {fmt_d(data['date_from'])} – {fmt_d(data['date_to'])} · сформовано {_sched_now().strftime('%d.%m.%Y %H:%M')}"
+    ws["A2"].font = Font(color="666666", size=10)
+    c = data["counts"]
+    ws["A3"] = f"Усього: {c['total']} · з приміткою: {c['with_note']} · без примітки: {c['without_note']}"
+    ws["A3"].font = Font(color="666666", size=10)
+    heads = ["Викладач", "Кафедра", "Причина", "Пар у періоді", "Перша пара", "Остання пара", "Примітка"]
+    for j, h in enumerate(heads, 1):
+        cell = ws.cell(row=5, column=j, value=h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F3A5F")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    for i, t in enumerate(data["teachers"], 6):
+        vals = [t["name"], t["department"], t["reason_label"], t["lessons"], fmt_d(t["first"]), fmt_d(t["last"]), t["note"]]
+        for j, v in enumerate(vals, 1):
+            cell = ws.cell(row=i, column=j, value=v)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=j in (1, 2, 3, 7), horizontal="center" if j in (4, 5, 6) else "left")
+    for j, w in enumerate([30, 34, 30, 12, 13, 13, 60], 1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = "A6"
+    ws.auto_filter.ref = f"A5:G{5 + len(data['teachers'])}"
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    fname = f"Без_даних_Zoom_{data['date_from']}_{data['date_to']}.xlsx"
     return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
 
