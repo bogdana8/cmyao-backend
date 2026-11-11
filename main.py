@@ -6890,7 +6890,7 @@ async def department_attendance(date_from: str, date_to: Optional[str] = None,
 @app.get("/api/cmyo/schedule/department-attendance/export")
 async def export_department_attendance(date_from: str, date_to: Optional[str] = None,
                                        user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    """Excel: аркуш «По кафедрах» (підсумок кафедр) і аркуш «Викладачі» (ті самі показники по кожному викладачеві з кафедрою)."""
+    """Excel: «По кафедрах» (підсумок кафедр), «Викладачі всі» (усі викладачі, кафедри окремими рядками) і по аркушу на кожну кафедру (назва — абревіатура)."""
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
@@ -6976,17 +6976,45 @@ async def export_department_attendance(date_from: str, date_to: Optional[str] = 
     widths(ws, [46, 14, 11, 14, 13, 13, 15, 12, 13, 12, 14, 16])
     page(ws)
 
-    wt = wb.create_sheet("Викладачі")
-    hdr(wt, 1, ["Кафедра", "Викладач"] + metric_heads)
-    i = 1
-    for d in data["departments"]:
-        for t in d["teachers"]:
+    # ── аркуші з викладачами: «Викладачі всі» (усі кафедри) і по одному аркушу на кафедру (назва — абревіатура) ──
+    DEPT_STOP = {"та", "і", "й", "з", "із", "зі", "у", "в", "на", "до", "для", "по", "при", "від", "про", "або"}
+
+    def dept_abbr(name):
+        s = re.sub(r"^\s*кафедра\s+", "", name.strip(), flags=re.I)
+        words = [w for w in re.split(r"[\s\-–—]+", s) if w and w.lower() not in DEPT_STOP]
+        ab = words[0][:2] if len(words) == 1 else "".join(w[0] for w in words)
+        return (re.sub(r"[\\/*?:\[\]]+", "", ab.upper()) or "Кафедра")[:31]
+
+    def teachers_sheet(wsx, depts):
+        hdr(wsx, 1, ["Викладач"] + metric_heads)
+        wsx.row_dimensions[1].height = 58
+        i = 1
+        for d in depts:
             i += 1
-            put(wt, i, [d["name"], t["name"]] + metrics(t), first_cols=2, pct=(12, 13))
-    widths(wt, [40, 30, 11, 14, 13, 13, 15, 12, 13, 12, 14, 16])
-    wt.freeze_panes = "C2"
-    wt.auto_filter.ref = f"A1:{get_column_letter(13)}{i}"
-    page(wt)
+            wsx.merge_cells(start_row=i, start_column=1, end_row=i, end_column=12)
+            for j in range(1, 13):
+                c = wsx.cell(row=i, column=j)
+                c.border = border
+                c.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+            wsx.cell(row=i, column=1, value=d["name"])
+            for t in d["teachers"]:
+                i += 1
+                put(wsx, i, [t["name"]] + metrics(t), first_cols=1, pct=(11, 12))
+        widths(wsx, [30, 11, 14, 13, 13, 15, 12, 13, 12, 14, 16, 16])
+        wsx.freeze_panes = "B2"
+        wsx.auto_filter.ref = f"A1:{get_column_letter(12)}{i}"
+        page(wsx)
+
+    teachers_sheet(wb.create_sheet("Викладачі всі"), data["departments"])
+    used_titles = {"по кафедрах", "викладачі всі"}
+    for d in data["departments"]:
+        base = dept_abbr(d["name"])
+        title, k = base, 1
+        while title.lower() in used_titles:
+            k += 1
+            title = f"{base[:28]}{k}"
+        used_titles.add(title.lower())
+        teachers_sheet(wb.create_sheet(title), [d])
 
     out = io.BytesIO()
     wb.save(out)
