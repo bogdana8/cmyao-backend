@@ -509,6 +509,7 @@ class DBLessonTeacher(Base):
     name_norm = Column(String, nullable=False, unique=True, index=True)
     note      = Column(String, nullable=True)     # примітка про викладача (Zoom, вичитка пар тощо); порожньо = немає
     note_at   = Column(String, nullable=True)     # коли примітку востаннє змінено (ISO, київський час)
+    department = Column(String, nullable=True)    # кафедра (з файлу «Список НПП» або вручну); порожньо = не вказано
 
 class DBLessonCheck(Base):
     """Рядок таблиці перевірки пар. Усі довідники — власні (lesson_*), без FK на інші таблиці."""
@@ -745,6 +746,8 @@ def _run_migrations():
         # 📝 Примітки до викладачів
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note VARCHAR",
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note_at VARCHAR",
+        # 🏛 Кафедра викладача
+        "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS department VARCHAR",
         # 🚨 Тривоги: друге джерело, історія від дати, спільний «слот» запитів
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS source VARCHAR",
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS history_from VARCHAR",
@@ -4075,6 +4078,116 @@ async def delete_lesson_teacher(item_id: int, user: dict = Depends(require_cmyo_
     db.commit()
     return {"message": "Видалено"}
 
+# ── Кафедри викладачів: підстановка зі списку НПП (xlsx) та ручна зміна ──
+LESSON_DEPT_MAX = 300
+# латинські «двійники» кирилиці (після _norm усе в нижньому регістрі)
+_LAT2CYR = str.maketrans({"i": "і", "a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у", "k": "к", "m": "м", "t": "т", "b": "в", "h": "н"})
+
+def _person_key(name):
+    """Ключ для зіставлення людей: прізвище + ініціали.
+    'Іваненко Іван Іванович', 'Іваненко І. І.', 'Іваненко І.І.' → ('іваненко', ('і', 'і'))"""
+    s = re.sub(r"[.,]", " ", _norm(name).translate(_LAT2CYR))
+    parts = [p for p in s.split() if p]
+    if not parts:
+        return None
+    return (parts[0], tuple(p[0] for p in parts[1:3]))
+
+def _parse_npp_departments(content: bytes):
+    """Читає перший аркуш «Списку НПП»: [(ПІП, кафедра або None), ...].
+    Рядок-заголовок «Кафедра …» задає кафедру для всіх людей під ним; назва інституту/факультету її скидає
+    (так відсіюються керівники на початку списку, які не належать до кафедри)."""
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+        rows = [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
+    name_col, start = 2, 0
+    found = False
+    for i, r in enumerate(rows[:10]):
+        for j, cell in enumerate(r):
+            if _norm(str(cell or "")).translate(_LAT2CYR) in ("піп", "піб"):
+                name_col, start, found = j, i + 1, True
+                break
+        if found:
+            break
+    people, dept = [], None
+    for r in rows[start:]:
+        r = r + [None] * (name_col + 1 - len(r))
+        name = _clean(str(r[name_col])) if r[name_col] is not None else ""
+        first = _clean(str(r[0])) if r[0] is not None else ""
+        if not name:
+            if first and not first.isdigit():
+                dept = (first[:1].upper() + first[1:]) if first.lower().startswith("кафедра") else None
+            continue
+        people.append((name, dept))
+    if not people:
+        raise HTTPException(status_code=400, detail="У файлі не знайдено жодного ПІП. Потрібен «Список НПП» з колонкою «ПІП».")
+    return people
+
+@app.post("/api/cmyo/lessons/teachers/departments/import")
+async def import_lesson_teacher_departments(file: UploadFile = File(...), user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Проставляє кафедри викладачам зі списку lesson_teachers за збігом «прізвище + ініціали».
+    Нових викладачів не створює. Кого не знайдено / неоднозначних — повертає у звіті (їх заповнюють вручну)."""
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Файл завеликий (максимум 5 МБ)")
+    people = _parse_npp_departments(content)
+    teachers = db.query(DBLessonTeacher).all()
+    by_key, by_surname = defaultdict(list), defaultdict(list)
+    for t in teachers:
+        k = _person_key(t.name)
+        if k:
+            by_key[k].append(t)
+            by_surname[k[0]].append(t.name)
+    from_file, skipped_no_dept = defaultdict(list), 0
+    for name, dept in people:
+        if not dept:
+            skipped_no_dept += 1
+            continue
+        k = _person_key(name)
+        if k:
+            from_file[k].append((name, dept))
+    updated = unchanged = 0
+    not_found, ambiguous = [], []
+    for k, entries in from_file.items():
+        names = list(dict.fromkeys(n for n, _ in entries))
+        depts = list(dict.fromkeys(d for _, d in entries))
+        cands = by_key.get(k, [])
+        item = {"name": names[0], "department": "; ".join(depts)}
+        if not cands:
+            item["similar"] = by_surname.get(k[0], [])[:3]
+            not_found.append(item)
+        elif len(cands) > 1 or (len(names) > 1 and len(depts) > 1):
+            item["names"] = [t.name for t in cands]
+            ambiguous.append(item)
+        else:
+            new_dept = "; ".join(depts)[:LESSON_DEPT_MAX]
+            if cands[0].department == new_dept:
+                unchanged += 1
+            else:
+                cands[0].department = new_dept
+                updated += 1
+    db.commit()
+    without = sum(1 for t in teachers if not (t.department or "").strip())
+    return {"updated": updated, "unchanged": unchanged, "people_in_file": len(from_file), "skipped_no_department": skipped_no_dept,
+            "not_found": not_found, "ambiguous": ambiguous, "teachers_without_department": without, "teachers_total": len(teachers)}
+
+class LessonTeacherDeptSchema(BaseModel):
+    department: Optional[str] = None
+
+@app.put("/api/cmyo/lessons/teachers/{item_id}/department")
+async def set_lesson_teacher_department(item_id: int, data: LessonTeacherDeptSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    obj = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == item_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Не знайдено")
+    dept = _clean(data.department)
+    if len(dept) > LESSON_DEPT_MAX:
+        raise HTTPException(status_code=400, detail=f"Назва кафедри задовга (максимум {LESSON_DEPT_MAX} символів)")
+    obj.department = dept or None                # порожньо = кафедру прибрано
+    db.commit()
+    return {"id": obj.id, "department": obj.department}
+
 # ── Примітки до викладачів (хто не використовує корпоративний Zoom, не вичитує пари тощо) ──
 LESSON_NOTE_MAX = 2000
 
@@ -4231,7 +4344,7 @@ async def list_lesson_catalog(kind: str, user: dict = Depends(require_cmyo_admin
         raise HTTPException(status_code=404, detail="Невідомий список")
     rows = db.query(model).order_by(model.name).all()
     if kind == "teachers":
-        return [{"id": r.id, "name": r.name, "note": r.note, "note_at": r.note_at} for r in rows]
+        return [{"id": r.id, "name": r.name, "note": r.note, "note_at": r.note_at, "department": r.department} for r in rows]
     return [{"id": r.id, "name": r.name} for r in rows]
 
 def _apply_lesson_check(db, obj, data: "LessonCheckSchema"):
@@ -6726,6 +6839,154 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
     out.seek(0)
     safe = re.sub(r"[\\/:*?\"<>|]+", "", tch["name"]).strip().replace(" ", "_")
     fname = f"Відвідуваність_{safe}_{data['date_from']}_{data['date_to']}.xlsx"
+    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
+
+# =========================================================
+# 🏛 ВІДВІДУВАНІСТЬ ПО КАФЕДРАХ
+# Той самий розрахунок, що й по викладачу (_schedule_overview_core + _att_item), але зведений по всіх викладачах:
+# кафедра береться з lesson_teachers.department, викладачі без кафедри — окремий рядок «Без кафедри».
+# Статуси, відсотки й «до дати відключень» — ті самі правила, що в «Відвідуваності» по викладачу.
+# =========================================================
+DEPT_NONE_LABEL = "Без кафедри"
+
+async def _department_attendance_build(db, date_from: str, date_to: Optional[str]) -> dict:
+    d_from, d_to = _sched_parse_range(date_from, date_to, ATT_MAX_DAYS)
+    ov = await _schedule_overview_core(db, d_from, d_to, other_limit=1)       # усі викладачі, зустрічі поза розкладом тут не потрібні
+    dept_of, in_dept = {}, defaultdict(int)
+    for t in db.query(DBLessonTeacher).all():
+        name = _clean(t.department) or DEPT_NONE_LABEL
+        dept_of[t.id] = name
+        in_dept[name] += 1
+    groups = defaultdict(list)
+    for card in ov["teachers"]:
+        groups[dept_of.get(card["id"], DEPT_NONE_LABEL)].append(card)
+    depts = []
+    for name, cards in groups.items():
+        teachers = [{"id": c["id"], "name": c["name"], "has_account": c["has_account"], **_att_item(c["lessons"])} for c in cards]
+        teachers.sort(key=lambda r: r["name"].lower())
+        depts.append({"name": name, "is_none": name == DEPT_NONE_LABEL, "teachers_with_lessons": len(cards), "teachers_total": in_dept[name],
+                      **_att_item([l for c in cards for l in c["lessons"]]), "teachers": teachers})
+    depts.sort(key=lambda d: (d["is_none"], d["name"].lower()))
+    all_lessons = [l for c in ov["teachers"] for l in c["lessons"]]
+    return {
+        "date_from": d_from, "date_to": d_to, "slot_minutes": SCHED_SLOT_MINUTES, "outage_date": SCHED_OUTAGE_DATE,
+        "coverage": ov["coverage"], "alerts": ov["alerts"], "ratios": ov["ratios"],
+        "teachers_count": len(ov["teachers"]),
+        "totals": _att_stats(all_lessons), "totals_pre": _att_stats(_att_pre(all_lessons)),
+        "departments": depts,
+    }
+
+@app.get("/api/cmyo/schedule/department-attendance")
+async def department_attendance(date_from: str, date_to: Optional[str] = None,
+                                user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    return await _department_attendance_build(db, date_from, date_to)
+
+@app.get("/api/cmyo/schedule/department-attendance/export")
+async def export_department_attendance(date_from: str, date_to: Optional[str] = None,
+                                       user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """Excel: аркуш «По кафедрах» (підсумок кафедр) і аркуш «Викладачі» (ті самі показники по кожному викладачеві з кафедрою)."""
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    data = await _department_attendance_build(db, date_from, date_to)
+    if not data["totals"]["total"]:
+        raise HTTPException(status_code=404, detail="За цей період немає пар за розкладом")
+    fmt_d = lambda iso: f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}" if iso else ""
+    cut_short = f"{SCHED_OUTAGE_DATE[8:10]}.{SCHED_OUTAGE_DATE[5:7]}"
+    ok_min, ok_pct = int(SCHED_SLOT_MINUTES * SCHED_OK_RATIO), int(SCHED_OK_RATIO * 100)
+    thin = Side(style="thin", color="BBBBBB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="1F3A5F")
+    sum_fill = PatternFill("solid", fgColor="E5E7EB")
+    frac = lambda v: (v / 100.0) if v is not None else "—"
+
+    def hdr(ws, row, headers):
+        for j, h in enumerate(headers, 1):
+            c = ws.cell(row=row, column=j, value=h)
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border
+
+    def put(ws, row, vals, first_cols=1, pct=(), bold=False, fill=None):
+        for j, v in enumerate(vals, 1):
+            c = ws.cell(row=row, column=j, value=v)
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=(j <= first_cols), horizontal="left" if j <= first_cols else "center")
+            if j in pct and isinstance(v, (int, float)):
+                c.number_format = "0.0%"
+            if bold:
+                c.font = Font(bold=True)
+            if fill:
+                c.fill = fill
+
+    def widths(ws, ws_widths):
+        for j, w in enumerate(ws_widths, 1):
+            ws.column_dimensions[get_column_letter(j)].width = w
+
+    def page(ws):
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+    metric_heads = ["Усього пар", f"Проведено (≥ {ok_min} хв)", "Частково (від 1 хв)", "Не проведено (0 хв)", f"Тривога (Zoom ≥ {ok_pct}% залишку)",
+                    "Очікується (ще йде)", "Без акаунта Zoom", "Очно", "Перевірено пар",
+                    "Відвідуваність, % (увесь період)", f"Відвідуваність, % (до {cut_short})"]
+    metrics = lambda it: [it["total"], it["ok"], it["partial"], it["missed"], it["alert"], it["pending"], it["no_account"], it["offline"],
+                          it["checked"], frac(it["rate"]), frac(it["rate_pre"])]
+    now_ = _sched_now()
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "По кафедрах"
+    ws["A1"] = "Відвідуваність по кафедрах"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = f"Період: {fmt_d(data['date_from'])} – {fmt_d(data['date_to'])} · сформовано {now_.strftime('%d.%m.%Y %H:%M')}"
+    ws["A2"].font = Font(color="666666", size=10)
+    notes_ = [f"Друга графа «До {cut_short}» рахує лише пари, які були раніше за {fmt_d(SCHED_OUTAGE_DATE)}: з цієї дати почались відключення.",
+              "Відвідуваність, % = Проведено / (Проведено + Частково + Не проведено). Тривога, очні, без акаунта Zoom та ті, що ще попереду, не враховуються."]
+    cov = data["coverage"]
+    notes_.append("Звіт Zoom: " + (f"до {_sched_fmt_label(cov['zoom_until'])}" if cov.get("zoom_until") else "не завантажено") + ".")
+    al = data["alerts"]
+    if al.get("enabled") and al.get("configured") and al.get("pending_days"):
+        notes_.append(f"Історія тривог за період завантажена не повністю ({al['days_total'] - al['pending_days']} з {al['days_total']} днів): статуси «Тривога» можуть змінитися.")
+    if any(d["is_none"] for d in data["departments"]):
+        notes_.append("Рядок «Без кафедри»: викладачам не вказано кафедру (вкладка «Викладачі»).")
+    r = 3
+    for n_ in notes_:
+        ws.cell(row=r, column=1, value=n_).font = Font(color="B45309", size=10)
+        r += 1
+    r += 1
+    hdr(ws, r, ["Кафедра", "Викладачів (з парами)"] + metric_heads)
+    for d in data["departments"]:
+        r += 1
+        put(ws, r, [d["name"], d["teachers_with_lessons"]] + metrics(d), pct=(12, 13))
+    r += 1
+    tot = {**data["totals"], "rate_pre": data["totals_pre"]["rate"]}
+    put(ws, r, ["Усього", data["teachers_count"]] + metrics(tot), pct=(12, 13), bold=True, fill=sum_fill)
+    widths(ws, [46, 14, 11, 14, 13, 13, 15, 12, 13, 12, 14, 16])
+    page(ws)
+
+    wt = wb.create_sheet("Викладачі")
+    hdr(wt, 1, ["Кафедра", "Викладач"] + metric_heads)
+    i = 1
+    for d in data["departments"]:
+        for t in d["teachers"]:
+            i += 1
+            put(wt, i, [d["name"], t["name"]] + metrics(t), first_cols=2, pct=(12, 13))
+    widths(wt, [40, 30, 11, 14, 13, 13, 15, 12, 13, 12, 14, 16])
+    wt.freeze_panes = "C2"
+    wt.auto_filter.ref = f"A1:{get_column_letter(13)}{i}"
+    page(wt)
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    fname = f"Відвідуваність_по_кафедрах_{data['date_from']}_{data['date_to']}.xlsx"
     return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
 
