@@ -6,12 +6,13 @@
   → 2. Аналіз результатів опитування (2.1, 2.2 … — тематичні підрозділи: текст аналізу + діаграми питань)
   → 3. Узагальнені висновки → 4. Рекомендації та пропозиції → дата.
 
-Текст аналізу, висновків і рекомендацій пише AI (Anthropic API) за ТОЧНИМИ числами з файлу:
+Текст аналізу, висновків і рекомендацій пише AI за ТОЧНИМИ числами з файлу (безкоштовний Google Gemini; запасний варіант — Anthropic):
 розподіли відповідей, середні бали, відкриті відповіді (без контактів). Діаграми будуються кодом, тож цифри в тексті й на діаграмах збігаються.
 Без AI (ai = false) довідка збирається за правилами з цифр, а висновки й рекомендації лишаються для ручного заповнення.
 
 Потрібні: survey_reports.py (поруч), csk_template.docx (поруч), pandas, openpyxl, python-docx, matplotlib, requests.
-Змінні середовища: ANTHROPIC_API_KEY (обов'язково для AI), CSK_REPORT_AI_MODEL (за замовчуванням claude-sonnet-5-5).
+Змінні середовища (достатньо однієї): GEMINI_API_KEY (безкоштовно, aistudio.google.com) або ANTHROPIC_API_KEY.
+Необов'язково: CSK_GEMINI_MODEL (за замовчуванням gemini-2.5-flash), CSK_REPORT_AI_MODEL (Anthropic, за замовчуванням claude-sonnet-5-5).
 """
 import io
 import json
@@ -26,8 +27,8 @@ import pandas as pd
 import survey_reports as sr
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csk_template.docx")
-AI_MODEL = os.environ.get("CSK_REPORT_AI_MODEL", "claude-sonnet-5-5")
-AI_URL = "https://api.anthropic.com/v1/messages"
+GEMINI_MODEL = os.environ.get("CSK_GEMINI_MODEL", "gemini-2.5-flash")
+ANTHROPIC_MODEL = os.environ.get("CSK_REPORT_AI_MODEL", "claude-sonnet-5-5")
 MAX_UNITS_IN_CHART = 12
 
 DEFAULTS = {
@@ -308,41 +309,92 @@ SYSTEM_PROMPT = """Ти — аналітик Центру студентськи
 Вимоги до sections: 3–8 підрозділів за темою питань; кожне питання (id з даних) входить рівно в один блок; порядок питань збережи; в одному блоці 1–3 споріднені питання і 3–5 абзаців. Питання про кількість респондентів чи підрозділи в блоки не включай, якщо їх немає в даних."""
 
 
-def _ai_call(system, user, max_tokens=7000):
+class _Retry(Exception):
+    """Тимчасова помилка сервісу AI — можна повторити запит."""
+
+
+def _gemini_call(key, system, user, max_tokens, state):
     import requests
-    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-    if not key:
-        raise AIError("AI не налаштовано: на сервері немає ANTHROPIC_API_KEY (додайте його в .env і перезапустіть сервер).")
-    body = {"model": AI_MODEL, "max_tokens": max_tokens, "temperature": 0.3, "system": system,
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    gen = {"temperature": 0.3, "maxOutputTokens": max_tokens + 8000, "responseMimeType": "application/json"}
+    if state.get("thinking", True):
+        gen["thinkingConfig"] = {"thinkingBudget": 0}          # без «роздумів», щоб вони не з'їдали ліміт токенів відповіді
+    body = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": gen}
+    r = requests.post(url, headers={"x-goog-api-key": key, "content-type": "application/json"}, json=body, timeout=240)
+    if r.status_code == 200:
+        j = r.json() or {}
+        cands = j.get("candidates") or []
+        if not cands:
+            why = (j.get("promptFeedback") or {}).get("blockReason")
+            raise AIError("Gemini не повернув відповіді" + (f" (запит заблоковано: {why})" if why else "") + ". Спробуйте ще раз.")
+        c = cands[0]
+        text = "".join(p.get("text", "") for p in ((c.get("content") or {}).get("parts") or []))
+        if c.get("finishReason") == "MAX_TOKENS" and not text.strip().endswith("}"):
+            raise AIError("Відповідь AI обрізалась через розмір. Спробуйте ще раз або виключіть частину питань.")
+        return text
+    msg = ""
+    try:
+        msg = ((r.json() or {}).get("error") or {}).get("message", "")
+    except Exception:       # noqa: BLE001
+        pass
+    if r.status_code == 400 and "thinking" in msg.lower() and state.get("thinking", True):
+        state["thinking"] = False                                # модель без thinkingConfig — повторюємо без нього
+        raise _Retry("повтор без thinkingConfig")
+    if r.status_code in (400, 401, 403) and ("API key" in msg or r.status_code in (401, 403)):
+        raise AIError("Gemini відхилив ключ доступу (перевірте GEMINI_API_KEY у змінних середовища Render).")
+    if r.status_code == 404:
+        raise AIError(f"Модель «{GEMINI_MODEL}» недоступна. Вкажіть чинну в CSK_GEMINI_MODEL.")
+    if r.status_code == 429:
+        raise _Retry("перевищено ліміт безкоштовного тарифу Gemini (запитів на хвилину/добу)")
+    if r.status_code in (500, 502, 503, 504):
+        raise _Retry(f"сервіс Gemini тимчасово недоступний ({r.status_code})")
+    raise AIError(f"Gemini відповів {r.status_code}: {msg[:200]}")
+
+
+def _anthropic_call(key, system, user, max_tokens, state):
+    import requests
+    body = {"model": ANTHROPIC_MODEL, "max_tokens": max_tokens, "temperature": 0.3, "system": system,
             "messages": [{"role": "user", "content": user}]}
     headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    last = ""
-    for attempt in range(3):
+    r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=240)
+    if r.status_code == 200:
+        return "".join(b.get("text", "") for b in ((r.json() or {}).get("content") or []) if b.get("type") == "text")
+    if r.status_code in (401, 403):
+        raise AIError("Anthropic відхилив ключ доступу (ANTHROPIC_API_KEY недійсний або без прав).")
+    if r.status_code == 404:
+        raise AIError(f"Модель «{ANTHROPIC_MODEL}» недоступна. Вкажіть чинну в CSK_REPORT_AI_MODEL.")
+    if r.status_code == 400 and "temperature" in r.text and "temperature" in body:
+        raise _Retry("повтор без temperature")
+    if r.status_code in (429, 500, 502, 503, 529):
+        raise _Retry(f"сервіс Anthropic відповів {r.status_code}")
+    raise AIError(f"Anthropic відповів {r.status_code}.")
+
+
+def _ai_call(system, user, max_tokens=7000):
+    """Gemini (безкоштовно) — якщо задано GEMINI_API_KEY; інакше Anthropic (ANTHROPIC_API_KEY)."""
+    import requests
+    gem = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    ant = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if gem:
+        fn, key = _gemini_call, gem
+    elif ant:
+        fn, key = _anthropic_call, ant
+    else:
+        raise AIError("AI не налаштовано: додайте GEMINI_API_KEY (безкоштовний ключ з aistudio.google.com) у змінні середовища "
+                      "(на Render: Environment) і перезапустіть сервіс.")
+    state, last = {}, ""
+    for wait in (0, 6, 20):
+        if wait:
+            time.sleep(wait)
         try:
-            r = requests.post(AI_URL, headers=headers, json=body, timeout=240)
+            return fn(key, system, user, max_tokens, state)
+        except _Retry as e:
+            last = str(e)
+            if last.startswith("повтор"):
+                continue
         except requests.RequestException as e:
             last = f"немає зв'язку з сервісом AI ({e.__class__.__name__})"
-            time.sleep(2)
-            continue
-        if r.status_code == 200:
-            blocks = (r.json() or {}).get("content") or []
-            return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        if r.status_code in (401, 403):
-            raise AIError("AI відхилив ключ доступу (ANTHROPIC_API_KEY недійсний або без прав).")
-        if r.status_code == 404:
-            raise AIError(f"Модель «{AI_MODEL}» недоступна. Вкажіть чинну в CSK_REPORT_AI_MODEL.")
-        last = f"сервіс AI відповів {r.status_code}"
-        if r.status_code == 400 and "temperature" in r.text and "temperature" in body:
-            body.pop("temperature")                         # деякі моделі не приймають цей параметр
-            continue
-        if r.status_code in (429, 500, 502, 503, 529):
-            time.sleep(4)
-            continue
-        try:
-            last += ": " + (r.json().get("error") or {}).get("message", "")[:200]
-        except Exception:       # noqa: BLE001
-            pass
-        break
     raise AIError(f"Не вдалося отримати текст від AI: {last}. Спробуйте ще раз за хвилину.")
 
 
