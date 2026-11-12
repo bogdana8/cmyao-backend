@@ -12,7 +12,7 @@
 
 Потрібні: survey_reports.py (поруч), csk_template.docx (поруч), pandas, openpyxl, python-docx, matplotlib, requests.
 Змінні середовища (достатньо однієї): GEMINI_API_KEY (безкоштовно, aistudio.google.com) або ANTHROPIC_API_KEY.
-Необов'язково: CSK_GEMINI_MODEL (за замовчуванням gemini-2.5-flash), CSK_REPORT_AI_MODEL (Anthropic, за замовчуванням claude-sonnet-5-5).
+Необов'язково: CSK_GEMINI_MODEL (примусово задати модель; інакше підбирається автоматично), CSK_REPORT_AI_MODEL (Anthropic, за замовчуванням claude-sonnet-5-5).
 """
 import io
 import json
@@ -27,7 +27,12 @@ import pandas as pd
 import survey_reports as sr
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csk_template.docx")
-GEMINI_MODEL = os.environ.get("CSK_GEMINI_MODEL", "gemini-2.5-flash")
+# Google часто міняє лінійку моделей, тому код не прив'язаний до однієї: бере CSK_GEMINI_MODEL (якщо задано), інакше
+# перебирає ці кандидати (лише ті, що реально доступні ключу) і запам'ятовує першу, що спрацювала.
+GEMINI_MODEL = (os.environ.get("CSK_GEMINI_MODEL") or "").strip()
+GEMINI_CANDIDATES = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview",
+                     "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+_GEMINI_OK = {"model": None}
 ANTHROPIC_MODEL = os.environ.get("CSK_REPORT_AI_MODEL", "claude-sonnet-5-5")
 MAX_UNITS_IN_CHART = 12
 
@@ -313,12 +318,34 @@ class _Retry(Exception):
     """Тимчасова помилка сервісу AI — можна повторити запит."""
 
 
-def _gemini_call(key, system, user, max_tokens, state):
+class _ModelUnavailable(Exception):
+    """Цієї моделі немає / вона недоступна ключу — пробуємо наступну."""
+
+
+def _gemini_available(key):
+    """Назви моделей, доступних ключу для generateContent (None — не вдалося отримати список)."""
     import requests
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    gen = {"temperature": 0.3, "maxOutputTokens": max_tokens + 8000, "responseMimeType": "application/json"}
-    if state.get("thinking", True):
-        gen["thinkingConfig"] = {"thinkingBudget": 0}          # без «роздумів», щоб вони не з'їдали ліміт токенів відповіді
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", params={"pageSize": 200},
+                         headers={"x-goog-api-key": key}, timeout=30)
+        if r.status_code != 200:
+            return None
+        return {m["name"].split("/", 1)[-1] for m in (r.json().get("models") or [])
+                if "generateContent" in (m.get("supportedGenerationMethods") or [])}
+    except Exception:       # noqa: BLE001
+        return None
+
+
+def _gemini_once(key, model, system, user, max_tokens, state):
+    import requests
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gen = {"maxOutputTokens": max_tokens + 8000, "responseMimeType": "application/json"}
+    if model.startswith("gemini-2."):
+        gen["temperature"] = 0.3
+        if state.get(model, True):
+            gen["thinkingConfig"] = {"thinkingBudget": 0}          # без «роздумів», щоб вони не з'їдали ліміт токенів
+    elif state.get(model, True):
+        gen["thinkingConfig"] = {"thinkingLevel": "LOW"}            # Gemini 3.x: рівень роздумів замість бюджету
     body = {"systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": gen}
     r = requests.post(url, headers={"x-goog-api-key": key, "content-type": "application/json"}, json=body, timeout=240)
@@ -338,18 +365,45 @@ def _gemini_call(key, system, user, max_tokens, state):
         msg = ((r.json() or {}).get("error") or {}).get("message", "")
     except Exception:       # noqa: BLE001
         pass
-    if r.status_code == 400 and "thinking" in msg.lower() and state.get("thinking", True):
-        state["thinking"] = False                                # модель без thinkingConfig — повторюємо без нього
-        raise _Retry("повтор без thinkingConfig")
-    if r.status_code in (400, 401, 403) and ("API key" in msg or r.status_code in (401, 403)):
+    low = msg.lower()
+    if r.status_code == 400 and "thinking" in low and state.get(model, True):
+        state[model] = False                                        # ця модель не приймає thinkingConfig — повтор без нього
+        return _gemini_once(key, model, system, user, max_tokens, state)
+    if r.status_code in (400, 401, 403) and ("api key" in low or r.status_code in (401, 403)):
         raise AIError("Gemini відхилив ключ доступу (перевірте GEMINI_API_KEY у змінних середовища Render).")
-    if r.status_code == 404:
-        raise AIError(f"Модель «{GEMINI_MODEL}» недоступна. Вкажіть чинну в CSK_GEMINI_MODEL.")
+    if r.status_code == 404 or (r.status_code == 400 and ("not supported" in low or "no longer available" in low)):
+        raise _ModelUnavailable(f"{model}: недоступна")
     if r.status_code == 429:
-        raise _Retry("перевищено ліміт безкоштовного тарифу Gemini (запитів на хвилину/добу)")
+        raise _ModelUnavailable(f"{model}: ліміт вичерпано")      # квоти рахуються по моделях — пробуємо іншу
     if r.status_code in (500, 502, 503, 504):
         raise _Retry(f"сервіс Gemini тимчасово недоступний ({r.status_code})")
     raise AIError(f"Gemini відповів {r.status_code}: {msg[:200]}")
+
+
+def _gemini_call(key, system, user, max_tokens, state):
+    if GEMINI_MODEL:
+        order = [GEMINI_MODEL]
+    else:
+        avail = _gemini_available(key)
+        order = [m for m in GEMINI_CANDIDATES if avail is None or m in avail]
+        if avail:
+            # якщо жодного з відомих кандидатів немає — беремо будь-яку доступну flash-модель (без tts/image/live/embedding)
+            order += sorted(m for m in avail if "flash" in m and m not in order and not re.search(r"tts|image|live|audio|embed|transcribe|translate|omni|robot", m))
+        if _GEMINI_OK["model"] in order:
+            order.remove(_GEMINI_OK["model"]); order.insert(0, _GEMINI_OK["model"])
+    tried = []
+    for model in order:
+        try:
+            text = _gemini_once(key, model, system, user, max_tokens, state)
+            _GEMINI_OK["model"] = model
+            return text
+        except _ModelUnavailable as e:
+            tried.append(str(e))
+    if not order:
+        raise AIError("Для вашого ключа Gemini немає доступних моделей generateContent. Перевірте ключ на aistudio.google.com.")
+    if any("ліміт" in t for t in tried):
+        raise _Retry("перевищено ліміт безкоштовного тарифу Gemini (" + "; ".join(tried) + ")")
+    raise AIError("Жодна модель Gemini недоступна: " + "; ".join(tried) + ". Задайте чинну модель у CSK_GEMINI_MODEL.")
 
 
 def _anthropic_call(key, system, user, max_tokens, state):
