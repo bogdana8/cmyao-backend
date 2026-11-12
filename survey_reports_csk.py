@@ -30,8 +30,8 @@ TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csk_te
 # Google часто міняє лінійку моделей, тому код не прив'язаний до однієї: бере CSK_GEMINI_MODEL (якщо задано), інакше
 # перебирає ці кандидати (лише ті, що реально доступні ключу) і запам'ятовує першу, що спрацювала.
 GEMINI_MODEL = (os.environ.get("CSK_GEMINI_MODEL") or "").strip()
-GEMINI_CANDIDATES = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview",
-                     "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+GEMINI_CANDIDATES = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite",
+                     "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 _GEMINI_OK = {"model": None}
 ANTHROPIC_MODEL = os.environ.get("CSK_REPORT_AI_MODEL", "claude-sonnet-5-5")
 MAX_UNITS_IN_CHART = 12
@@ -376,7 +376,7 @@ def _gemini_once(key, model, system, user, max_tokens, state):
     if r.status_code == 429:
         raise _ModelUnavailable(f"{model}: ліміт вичерпано")      # квоти рахуються по моделях — пробуємо іншу
     if r.status_code in (500, 502, 503, 504):
-        raise _Retry(f"сервіс Gemini тимчасово недоступний ({r.status_code})")
+        raise _ModelUnavailable(f"{model}: перевантажена ({r.status_code})")      # нова модель «лягла» — пробуємо іншу
     raise AIError(f"Gemini відповів {r.status_code}: {msg[:200]}")
 
 
@@ -401,8 +401,8 @@ def _gemini_call(key, system, user, max_tokens, state):
             tried.append(str(e))
     if not order:
         raise AIError("Для вашого ключа Gemini немає доступних моделей generateContent. Перевірте ключ на aistudio.google.com.")
-    if any("ліміт" in t for t in tried):
-        raise _Retry("перевищено ліміт безкоштовного тарифу Gemini (" + "; ".join(tried) + ")")
+    if any(("ліміт" in t or "перевантажена" in t) for t in tried):
+        raise _Retry("Gemini зараз перевантажений або вичерпано безкоштовний ліміт (" + "; ".join(tried) + ")")
     raise AIError("Жодна модель Gemini недоступна: " + "; ".join(tried) + ". Задайте чинну модель у CSK_GEMINI_MODEL.")
 
 
@@ -438,7 +438,7 @@ def _ai_call(system, user, max_tokens=7000):
         raise AIError("AI не налаштовано: додайте GEMINI_API_KEY (безкоштовний ключ з aistudio.google.com) у змінні середовища "
                       "(на Render: Environment) і перезапустіть сервіс.")
     state, last = {}, ""
-    for wait in (0, 6, 20):
+    for wait in (0, 8, 25):
         if wait:
             time.sleep(wait)
         try:
