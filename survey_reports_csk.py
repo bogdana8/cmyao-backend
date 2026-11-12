@@ -10,7 +10,7 @@
 розподіли відповідей, середні бали, відкриті відповіді (без контактів). Діаграми будуються кодом, тож цифри в тексті й на діаграмах збігаються.
 Без AI (ai = false) довідка збирається за правилами з цифр, а висновки й рекомендації лишаються для ручного заповнення.
 
-Потрібні: survey_reports.py (поруч), csk_template.docx (поруч), pandas, openpyxl, python-docx, matplotlib, requests.
+Потрібні поруч: survey_reports.py, csk_charts.py, csk_template.docx; pandas, openpyxl, python-docx, matplotlib, requests.
 Змінні середовища (достатньо однієї): GEMINI_API_KEY (безкоштовно, aistudio.google.com) або ANTHROPIC_API_KEY.
 Необов'язково: CSK_GEMINI_MODEL (примусово задати модель; інакше підбирається автоматично), CSK_REPORT_AI_MODEL (Anthropic, за замовчуванням claude-sonnet-5-5).
 """
@@ -24,6 +24,7 @@ from datetime import datetime
 
 import pandas as pd
 
+import csk_charts as ch
 import survey_reports as sr
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csk_template.docx")
@@ -57,8 +58,49 @@ class AIError(ValueError):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Розбір файлу
+# Інститут / факультет: колонка з файлу або автоматично за спеціальністю
 # ─────────────────────────────────────────────────────────────────────────────
+UNDEFINED = "Не визначено"
+UNIT_COL = "__institute__"
+# Порядок важливий: перше збіглося — те й береться. Перелік — зі сторінки вступу ДУЕТ; у інтерфейсі кожну відповідність можна виправити.
+INSTITUTES = [
+    ("ІТ-факультет", r"програмн|\bіт\b|\bit\b|іпз|ipz|інформаційн\w*\s+технолог|кібербезп"),
+    ("Юридичний інститут", r"право|правознав|психолог|публічн\w*\s+управлін|адмініструван|історі|середня\s+освіт|педагог"),
+    ("Технологічний інститут", r"металург|електроенерг|електротехн|машинобуд|автоматиз|хімічн|хімі\w*\s+технолог|гірнич|гірництв|енергетик"),
+    ("Інститут економіки та бізнес-освіти", r"економ|менеджмент|маркетинг|облік|оподаткув|фінанс|підприємництв|торгівл|бізнес|комп.ютерн\w*\s+наук"),
+]
+INSTITUTE_NAMES = ["Інститут економіки та бізнес-освіти", "Технологічний інститут", "Юридичний інститут", "ІТ-факультет"]    # порядок показу
+SPEC_RE = re.compile(r"спеціальн|освітн\w*\s+програм|напрям", re.I)
+
+
+def _norm(v):
+    return re.sub(r"\s+", " ", str(v).lower().replace("’", "'").replace("ʼ", "'").replace("`", "'")).strip()
+
+
+def classify_unit(value):
+    """Спеціальність (або назва інституту) → інститут/факультет; None, якщо не вдалося."""
+    t = _norm(value)
+    if not t:
+        return None
+    for name, rx in INSTITUTES:
+        if re.search(rx, t) or _norm(name) in t:
+            return name
+    return None
+
+
+def _unit_key(name):
+    return (INSTITUTE_NAMES.index(name) if name in INSTITUTE_NAMES else 90 if name != UNDEFINED else 99, str(name).lower())
+
+
+def _detect_specialty(df, skip):
+    for c in df.columns:
+        if c in skip or sr.PERSONAL_RE.search(c):
+            continue
+        if SPEC_RE.search(c) and 1 < df[c].nunique() <= 120:
+            return c
+    return None
+
+
 def _detect_unit(df, skip):
     for c in df.columns:
         if c in skip or sr.PERSONAL_RE.search(c):
@@ -68,16 +110,33 @@ def _detect_unit(df, skip):
     return None
 
 
-def _columns(df, overrides):
+def _prepare(df, overrides):
+    """→ (df, ts, unit, spec, spec_rows). unit — назва колонки з інститутом: справжньої або створеної за спеціальністю (UNIT_COL)."""
     ov = overrides or {}
     det = sr.detect_columns(df)
     ts = ov["timestamp"] if "timestamp" in ov else det["timestamp"]
     ts = ts if ts in df.columns else None
-    unit = ov["unit"] if "unit" in ov else _detect_unit(df, {ts})
-    unit = unit if unit in df.columns else None
-    return ts, unit
+    real = ov["unit"] if "unit" in ov else _detect_unit(df, {ts})
+    real = real if real in df.columns else None
+    spec = ov["specialty"] if "specialty" in ov else _detect_specialty(df, {ts, real})
+    spec = spec if spec in df.columns else None
+    spec_rows, unit = [], real
+    if not real and spec:
+        manual = {str(k): v for k, v in (ov.get("specialty_map") or {}).items()}
+        vals = df[spec].fillna("").astype(str).str.strip()
+        for v, n in vals[vals != ""].value_counts().items():
+            u = manual.get(v) if v in manual else classify_unit(v)
+            spec_rows.append({"value": v, "n": int(n), "unit": u or UNDEFINED})
+        mp = {r["value"]: r["unit"] for r in spec_rows}
+        df = df.copy()
+        df[UNIT_COL] = vals.map(lambda x: mp.get(x, UNDEFINED) if x else UNDEFINED)
+        unit = UNIT_COL
+    return df, ts, unit, spec, spec_rows
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Розбір файлу
+# ─────────────────────────────────────────────────────────────────────────────
 def _period(df, ts):
     if not ts:
         return None
@@ -115,66 +174,29 @@ def _questions(df, skip, exclude=(), titles=None):
 
 
 def analyze_csk(data: bytes, filename: str = "", overrides: dict = None) -> dict:
-    """Для екрана налаштувань: колонки, типи питань, підрозділи, період."""
-    df = sr.read_table(data, filename)
-    ts, unit = _columns(df, overrides)
-    qs = _questions(df, {ts, unit})
+    """Для екрана налаштувань: колонки, типи питань, інститути (з файлу або за спеціальністю), період."""
+    df0 = sr.read_table(data, filename)
+    df, ts, unit, spec, spec_rows = _prepare(df0, overrides)
+    qs = _questions(df, {ts, unit, spec})
     units = []
     if unit:
         units = [{"name": str(k), "n": int(v)} for k, v in df[unit].dropna().astype(str).value_counts().items()]
-        units.sort(key=lambda u: u["name"].lower())
-    return {"rows": int(len(df)), "columns": {"unit": unit, "timestamp": ts}, "all_columns": list(df.columns),
-            "questions": qs, "units": units, "period_text": _period_text(_period(df, ts)), "defaults": DEFAULTS}
+        units.sort(key=lambda u: _unit_key(u["name"]))
+    return {"rows": int(len(df)), "columns": {"unit": None if unit == UNIT_COL else unit, "timestamp": ts, "specialty": spec},
+            "derived_unit": unit == UNIT_COL, "all_columns": list(df0.columns), "questions": qs, "units": units,
+            "specialties": sorted(spec_rows, key=lambda r: -r["n"]), "institutes": INSTITUTE_NAMES + [UNDEFINED],
+            "period_text": _period_text(_period(df, ts)), "defaults": DEFAULTS}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Діаграми: участь за підрозділами та розподіл відповідей за підрозділами
+# Розподіл відповідей за інститутами (дані для діаграми; малює csk_charts.chart_by_unit)
 # ─────────────────────────────────────────────────────────────────────────────
-def chart_participation(rows, title="Участь в опитуванні за підрозділами"):
-    """rows: [(підрозділ, пройшли, всього|None)]. Дві смуги, якщо відомо «всього»."""
-    has_total = any(t for _, _, t in rows)
-    x0, x1 = sr.PAD, sr.CHART_W - sr.PAD
-    tl = sr._title_lines(title)
-    top = max([max(n, t or 0) for _, n, t in rows] + [1])
-    vw = 0.95
-    tr_w = x1 - x0 - vw - 0.18
-    blocks = []
-    for name, n, t in rows:
-        ln = sr._wrap(sr._clean(name), 8.8, x1 - x0)
-        h = len(ln) * 0.165 + 0.05 + (0.13 + 0.07) * (2 if (has_total and t) else 1) + 0.14
-        blocks.append((ln, h))
-    legend_h = 0.28 if has_total else 0.0
-    y_top = sr.PAD + len(tl) * sr.TITLE_LH + 0.2
-    cv = sr._Canvas(y_top + legend_h + sum(h for _, h in blocks) + sr.PAD * 0.6)
-    sr._shell(cv)
-    sr._draw_title(cv, tl, sr.PAD)
-    y = y_top
-    if has_total:
-        cv.box(x0, y + 0.07, 0.12, 0.12, r=0.06, fc=sr.BLUE, z=2); cv.text(x0 + 0.2, y + 0.13, "Пройшли опитування", 8.5, sr.MUTED)
-        cv.box(x0 + 1.75, y + 0.07, 0.12, 0.12, r=0.06, fc=sr.GREEN, z=2); cv.text(x0 + 1.95, y + 0.13, "Всього в Університеті", 8.5, sr.MUTED)
-        y += legend_h
-    for (name, n, t), (ln, h) in zip(rows, blocks):
-        yy = cv.lines(x0, y, ln, 8.8, 0.165, color=sr.INK, weight="bold")
-        yb = yy + 0.05 + 0.065
-        cv.box(x0, yb - 0.065, tr_w, 0.13, r=0.065, fc=sr.TRACK, z=1)
-        cv.box(x0, yb - 0.065, max(tr_w * n / top, 0.13), 0.13, r=0.065, fc=sr.BLUE, z=2)
-        lab = f"{n}" + (f" з {t} ({sr.pct(n, t)})" if t else "")
-        cv.text(x1, yb, lab, 8.5, sr.INK, "normal", "right")
-        if has_total and t:
-            yb += 0.2
-            cv.box(x0, yb - 0.065, tr_w, 0.13, r=0.065, fc=sr.TRACK, z=1)
-            cv.box(x0, yb - 0.065, max(tr_w * t / top, 0.13), 0.13, r=0.065, fc=sr.GREEN, z=2)
-            cv.text(x1, yb, str(t), 8.5, sr.MUTED, "normal", "right")
-        y += h
-    return cv.png()
-
-
 def _unit_matrix(df, unit, st):
     """→ (категорії [(підпис, колір)], рядки [(підрозділ, [кількості], усього)]) або None."""
     if st["kind"] == "rating":
         lo, hi = st["lo"], st["hi"]
         keys = list(range(lo, hi + 1))
-        cats = [(str(k), sr._scale_color((k - lo) / max(hi - lo, 1))) for k in keys]
+        cats = [(str(k), ch.scale_color((k - lo) / max(hi - lo, 1))) for k in keys]
 
         def vals(s):
             v = pd.to_numeric(s.astype(str).str.replace(",", ".", regex=False), errors="coerce").dropna().round().astype(int)
@@ -183,7 +205,7 @@ def _unit_matrix(df, unit, st):
     elif st["kind"] == "single":
         top = [o for o, _ in st["opts"][:5]]
         keys = top + (["Інші відповіді"] if len(st["opts"]) > 5 else [])
-        cats = [(k, sr.PALETTE[i % len(sr.PALETTE)] if k != "Інші відповіді" else "#B8BECC") for i, k in enumerate(keys)]
+        cats = [(k, ch.PAL[i % len(ch.PAL)] if k != "Інші відповіді" else ch.OTHER) for i, k in enumerate(keys)]
 
         def vals(s):
             c = Counter(s.astype(str).str.strip().tolist())
@@ -202,53 +224,8 @@ def _unit_matrix(df, unit, st):
             rows.append((u, v, sum(v)))
     rows.sort(key=lambda r: -r[2])
     rows = rows[:MAX_UNITS_IN_CHART]
-    rows.sort(key=lambda r: r[0].lower())
+    rows.sort(key=lambda r: _unit_key(r[0]))
     return (cats, rows) if len(rows) >= 2 else None
-
-
-def chart_by_unit(title, cats, rows):
-    x0, x1 = sr.PAD, sr.CHART_W - sr.PAD
-    lw = 1.85
-    bx0, bx1 = x0 + lw, x1 - 0.5
-    bw = bx1 - bx0
-    tl = sr._title_lines(title + " — за підрозділами")
-    # легенда: чипи з переносом
-    lg, cx, cy = [], bx0 - lw, 0.0
-    for lab, col in cats:
-        w = 0.22 + sr._tw(lab, 8.3) + 0.2
-        if cx + w > x1 - x0 + (bx0 - lw) and cx > bx0 - lw:
-            cx, cy = bx0 - lw, cy + 0.22
-        lg.append((cx, cy, lab, col))
-        cx += w
-    legend_h = cy + 0.26
-    rh = []
-    for u, _, _ in rows:
-        ln = sr._wrap(sr._clean(u), 8.6, lw - 0.12)
-        rh.append((ln, max(0.34, len(ln) * 0.16 + 0.12)))
-    y_top = sr.PAD + len(tl) * sr.TITLE_LH + 0.2
-    cv = sr._Canvas(y_top + legend_h + 0.08 + sum(h for _, h in rh) + sr.PAD * 0.7)
-    sr._shell(cv)
-    sr._draw_title(cv, tl, sr.PAD)
-    for gx, gy, lab, col in lg:
-        cv.box(x0 + gx, y_top + gy + 0.07, 0.12, 0.12, r=0.06, fc=col, z=2)
-        cv.text(x0 + gx + 0.19, y_top + gy + 0.13, lab, 8.3, sr.MUTED)
-    y = y_top + legend_h + 0.08
-    for (u, vals, tot), (ln, h) in zip(rows, rh):
-        cv.lines(x0, y + (h - len(ln) * 0.16) / 2, ln, 8.6, 0.16, color=sr.INK)
-        yc = y + h / 2
-        cv.box(bx0, yc - 0.11, bw, 0.22, r=0.05, fc=sr.TRACK, z=1)
-        xx = bx0
-        for v, (_lab, col) in zip(vals, cats):
-            if not v:
-                continue
-            w = bw * v / tot
-            cv.box(xx, yc - 0.11, w, 0.22, r=0.02, fc=col, ec="white", lw=0.8, z=2)
-            if w >= 0.36:
-                cv.text(xx + w / 2, yc, f"{round(100.0 * v / tot)}%", 7.8, sr._text_on(col), "bold", "center", z=6)
-            xx += w
-        cv.text(x1, yc, f"n={tot}", 8, sr.MUTED, "normal", "right")
-        y += h
-    return cv.png()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -599,6 +576,12 @@ def _picture(doc, png):
     return p
 
 
+def _qnum(st, idx):
+    """Номер питання для підпису діаграми: з назви колонки («5. Як …»), інакше порядковий."""
+    m = re.match(r"\s*(\d+)\s*[.)]", str(st.get("col", "")))
+    return int(m.group(1)) if m else idx
+
+
 def _date_phrase(now):
     return f"{now.day} {sr.MONTHS_GEN[now.month - 1]} {now.year} року"
 
@@ -659,13 +642,14 @@ def build_docx(df, stats, report, ctx, unit, by_unit, open_appendix) -> bytes:
                 st = by_id[qid]
                 if st["kind"] == "open":
                     continue                                    # відкриті відповіді аналізуються текстом (за потреби — окремий додаток)
-                png = sr.make_chart(st)
+                num = _qnum(st, int(qid[1:]))
+                png = ch.chart_for(st, num)
                 if png:
                     _picture(doc, png)
                 if by_unit and unit:
                     m = _unit_matrix(df, unit, st)
                     if m:
-                        _picture(doc, chart_by_unit(st["label"], *m))
+                        _picture(doc, ch.chart_by_unit(st["label"], *m, num))
 
     _para(doc, "3. Узагальнені висновки", style="Heading 2", size=13, keep_next=True)
     _para(doc, "За результатами опитування встановлено, що:", style="Normal (Web)", keep_next=True)
@@ -711,12 +695,11 @@ def _int(v):
 
 
 def generate_csk(data: bytes, filename: str, opts: dict):
-    """opts: unit, timestamp (колонки), exclude, titles, institution, audience, topic, respondents, instrument, purpose, period_text,
+    """opts: unit, timestamp, specialty (колонки; інститут за спеціальністю визначається автоматично), specialty_map {спеціальність: інститут}, exclude, titles, institution, audience, topic, respondents, instrument, purpose, period_text,
     total_students, unit_totals {підрозділ: кількість}, by_unit (bool), ai (bool), open_appendix (bool). → (ім'я_файлу, байти, mime)."""
-    df = sr.read_table(data, filename)
-    ts, unit = _columns(df, opts)
-    all_q = _questions(df, {ts, unit})
-    chosen = _questions(df, {ts, unit}, set(opts.get("exclude") or []), opts.get("titles"))
+    df, ts, unit, spec, _rows = _prepare(sr.read_table(data, filename), opts)
+    all_q = _questions(df, {ts, unit, spec})
+    chosen = _questions(df, {ts, unit, spec}, set(opts.get("exclude") or []), opts.get("titles"))
     stats = [s for s in (sr.compute_stats(df, q) for q in chosen) if s["kind"] != "empty"]
     if not stats:
         raise ValueError("Не залишилось жодного питання для довідки")
@@ -731,10 +714,10 @@ def generate_csk(data: bytes, filename: str, opts: dict):
     totals = {k: _int(v) for k, v in (opts.get("unit_totals") or {}).items() if _int(v)}
     charts = []
     if unit_counts and len(unit_counts) >= 2:
-        names = sorted(unit_counts, key=lambda k: k.lower())
+        names = sorted(unit_counts, key=_unit_key)
         for i in range(0, len(names), MAX_UNITS_IN_CHART):
             part = names[i:i + MAX_UNITS_IN_CHART]
-            charts.append(chart_participation([(u, unit_counts[u], totals.get(u)) for u in part]))
+            charts.append(ch.chart_participation([(u, unit_counts[u], totals.get(u)) for u in part]))
 
     ctx = {"institution": g("institution"), "audience": g("audience"), "topic": str(opts.get("topic", DEFAULTS["topic"])).strip(),
            "respondents": g("respondents"), "instrument": g("instrument"), "purpose": g("purpose"), "period_text": period_text,
