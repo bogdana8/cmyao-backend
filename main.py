@@ -6855,6 +6855,44 @@ async def export_teacher_attendance(teacher_id: int, date_from: str, date_to: Op
 # =========================================================
 DEPT_NONE_LABEL = "Без кафедри"
 
+# Порядок інститутів на аркуші «Викладачі всі» у експорті по кафедрах: (ключові слова в назві інституту, порядок).
+# Інші інститути/факультети йдуть далі в тому ж порядку, що й раніше; «Без кафедри» — завжди в кінці.
+DEPT_INSTITUTE_ORDER = [
+    (("економіки", "ннієбо", "бізнес-освіти", "бізнес освіти"), 0),
+    (("юридичн", "ннію"), 1),
+    (("технологічн", "нніт"), 2),
+    (("інформаційних технологій", "фіт"), 3),
+]
+
+def _institute_rank(inst_name: str, inst_full: str) -> int:
+    n = f"{inst_name or ''} {inst_full or ''}".lower()
+    for keys, rank in DEPT_INSTITUTE_ORDER:
+        if any(k in n for k in keys):
+            return rank
+    return len(DEPT_INSTITUTE_ORDER)
+
+def _order_depts_by_institute(db, depts: list) -> list:
+    """Лише міняє порядок кафедр (дані не чіпає): за інститутом із довідника Структури, всередині інституту — як було (за алфавітом)."""
+    inst = {i.id: i for i in db.query(DBInstitute).all()}
+    rank_of = {}
+    for d in db.query(DBDepartment).all():
+        i = inst.get(d.institute_id)
+        rk = _institute_rank(i.name, i.full_name) if i else len(DEPT_INSTITUTE_ORDER)
+        if d.full_name:
+            rank_of.setdefault(_norm_dept_name(d.full_name), rk)
+        rank_of.setdefault(_norm_dept_name(d.name), rk)
+
+    def rank(d):
+        if d["is_none"]:
+            return len(DEPT_INSTITUTE_ORDER) + 1
+        parts = [x for x in (d["name"] or "").split(";") if x.strip()] or [d["name"]]
+        for part in parts:                                   # у викладача може бути кілька кафедр через «;» — беремо першу, що знайшлась
+            k = _norm_dept_name(part)
+            if k in rank_of:
+                return rank_of[k]
+        return len(DEPT_INSTITUTE_ORDER)
+    return sorted(depts, key=rank)                           # sorted стабільний: порядок усередині групи не змінюється
+
 async def _department_attendance_build(db, date_from: str, date_to: Optional[str]) -> dict:
     d_from, d_to = _sched_parse_range(date_from, date_to, ATT_MAX_DAYS)
     ov = await _schedule_overview_core(db, d_from, d_to, other_limit=1)       # усі викладачі, зустрічі поза розкладом тут не потрібні
@@ -7005,7 +7043,7 @@ async def export_department_attendance(date_from: str, date_to: Optional[str] = 
         wsx.auto_filter.ref = f"A1:{get_column_letter(12)}{i}"
         page(wsx)
 
-    teachers_sheet(wb.create_sheet("Викладачі всі"), data["departments"])
+    teachers_sheet(wb.create_sheet("Викладачі всі"), _order_depts_by_institute(db, data["departments"]))
     used_titles = {"по кафедрах", "викладачі всі"}
     for d in data["departments"]:
         base = dept_abbr(d["name"])
