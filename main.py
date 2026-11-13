@@ -510,6 +510,7 @@ class DBLessonTeacher(Base):
     note      = Column(String, nullable=True)     # примітка про викладача (Zoom, вичитка пар тощо); порожньо = немає
     note_at   = Column(String, nullable=True)     # коли примітку востаннє змінено (ISO, київський час)
     department = Column(String, nullable=True)    # кафедра (з файлу «Список НПП» або вручну); порожньо = не вказано
+    institute = Column(String, nullable=True)     # інститут/факультет кафедри (з файлу «Список НПП»); потрібен лише для порядку в експорті
 
 class DBLessonCheck(Base):
     """Рядок таблиці перевірки пар. Усі довідники — власні (lesson_*), без FK на інші таблиці."""
@@ -749,6 +750,7 @@ def _run_migrations():
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS note_at VARCHAR",
         # 🏛 Кафедра викладача
         "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS department VARCHAR",
+        "ALTER TABLE lesson_teachers ADD COLUMN IF NOT EXISTS institute VARCHAR",
         # 🚨 Тривоги: друге джерело, історія від дати, спільний «слот» запитів
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS source VARCHAR",
         "ALTER TABLE lesson_alert_config ADD COLUMN IF NOT EXISTS history_from VARCHAR",
@@ -4094,7 +4096,7 @@ def _person_key(name):
     return (parts[0], tuple(p[0] for p in parts[1:3]))
 
 def _parse_npp_departments(content: bytes):
-    """Читає перший аркуш «Списку НПП»: [(ПІП, кафедра або None), ...].
+    """Читає перший аркуш «Списку НПП»: [(ПІП, кафедра або None, інститут або None), ...].
     Рядок-заголовок «Кафедра …» задає кафедру для всіх людей під ним; назва інституту/факультету її скидає
     (так відсіюються керівники на початку списку, які не належать до кафедри)."""
     import openpyxl
@@ -4112,16 +4114,19 @@ def _parse_npp_departments(content: bytes):
                 break
         if found:
             break
-    people, dept = [], None
+    people, dept, inst = [], None, None
     for r in rows[start:]:
         r = r + [None] * (name_col + 1 - len(r))
         name = _clean(str(r[name_col])) if r[name_col] is not None else ""
         first = _clean(str(r[0])) if r[0] is not None else ""
         if not name:
             if first and not first.isdigit():
-                dept = (first[:1].upper() + first[1:]) if first.lower().startswith("кафедра") else None
+                if first.lower().startswith("кафедра"):
+                    dept = first[:1].upper() + first[1:]
+                else:                                   # назва інституту/факультету: скидає кафедру й задає інститут
+                    dept, inst = None, first
             continue
-        people.append((name, dept))
+        people.append((name, dept, inst if dept else None))
     if not people:
         raise HTTPException(status_code=400, detail="У файлі не знайдено жодного ПІП. Потрібен «Список НПП» з колонкою «ПІП».")
     return people
@@ -4142,18 +4147,19 @@ async def import_lesson_teacher_departments(file: UploadFile = File(...), user: 
             by_key[k].append(t)
             by_surname[k[0]].append(t.name)
     from_file, skipped_no_dept = defaultdict(list), 0
-    for name, dept in people:
+    for name, dept, inst_ in people:
         if not dept:
             skipped_no_dept += 1
             continue
         k = _person_key(name)
         if k:
-            from_file[k].append((name, dept))
+            from_file[k].append((name, dept, inst_))
     updated = unchanged = 0
     not_found, ambiguous = [], []
     for k, entries in from_file.items():
-        names = list(dict.fromkeys(n for n, _ in entries))
-        depts = list(dict.fromkeys(d for _, d in entries))
+        names = list(dict.fromkeys(n for n, _, _ in entries))
+        depts = list(dict.fromkeys(d for _, d, _ in entries))
+        new_inst = _clean(entries[0][2])[:LESSON_DEPT_MAX] or None            # інститут першої кафедри
         cands = by_key.get(k, [])
         item = {"name": names[0], "department": "; ".join(depts)}
         if not cands:
@@ -4164,10 +4170,11 @@ async def import_lesson_teacher_departments(file: UploadFile = File(...), user: 
             ambiguous.append(item)
         else:
             new_dept = "; ".join(depts)[:LESSON_DEPT_MAX]
-            if cands[0].department == new_dept:
+            if cands[0].department == new_dept and (cands[0].institute or None) == new_inst:
                 unchanged += 1
             else:
                 cands[0].department = new_dept
+                cands[0].institute = new_inst
                 updated += 1
     db.commit()
     without = sum(1 for t in teachers if not (t.department or "").strip())
@@ -4185,6 +4192,8 @@ async def set_lesson_teacher_department(item_id: int, data: LessonTeacherDeptSch
     dept = _clean(data.department)
     if len(dept) > LESSON_DEPT_MAX:
         raise HTTPException(status_code=400, detail=f"Назва кафедри задовга (максимум {LESSON_DEPT_MAX} символів)")
+    if (obj.department or None) != (dept or None):
+        obj.institute = None                     # кафедру змінили вручну — інститут із файлу вже може не підходити
     obj.department = dept or None                # порожньо = кафедру прибрано
     db.commit()
     return {"id": obj.id, "department": obj.department}
@@ -6872,7 +6881,14 @@ def _institute_rank(inst_name: str, inst_full: str) -> int:
     return len(DEPT_INSTITUTE_ORDER)
 
 def _order_depts_by_institute(db, depts: list) -> list:
-    """Лише міняє порядок кафедр (дані не чіпає): за інститутом із довідника Структури, всередині інституту — як було (за алфавітом)."""
+    """Лише міняє порядок кафедр (дані не чіпає): за інститутом, всередині інституту — як було (за алфавітом).
+    Інститут беремо зі «Списку НПП» (lesson_teachers.institute), якщо його немає — з довідника Структури."""
+    dkey = lambda x: " ".join((x or "").lower().split())
+    inst_of_dept = {}
+    for t in db.query(DBLessonTeacher).all():
+        first_dept = _clean((t.department or "").split(";")[0])
+        if first_dept and _clean(t.institute):
+            inst_of_dept.setdefault(dkey(first_dept), _clean(t.institute))
     inst = {i.id: i for i in db.query(DBInstitute).all()}
     rank_of = {}
     for d in db.query(DBDepartment).all():
@@ -6885,6 +6901,9 @@ def _order_depts_by_institute(db, depts: list) -> list:
     def rank(d):
         if d["is_none"]:
             return len(DEPT_INSTITUTE_ORDER) + 1
+        first_dept = dkey((d["name"] or "").split(";")[0])
+        if first_dept in inst_of_dept:
+            return _institute_rank(inst_of_dept[first_dept], "")
         parts = [x for x in (d["name"] or "").split(";") if x.strip()] or [d["name"]]
         for part in parts:                                   # у викладача може бути кілька кафедр через «;» — беремо першу, що знайшлась
             k = _norm_dept_name(part)
