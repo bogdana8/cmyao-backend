@@ -42,7 +42,7 @@ DEFAULTS = {
     "audience": "здобувачів вищої освіти 1-го курсу",
     "topic": "щодо адаптації до навчання",
     "respondents": "здобувачі вищої освіти 1-го курсу денної форми здобуття освіти",
-    "instrument": "анонімна анкета",
+    "instrument": "анонімна анкета адаптації здобувачів освіти 1-го курсу",
     "purpose": ("вивчення рівня адаптації здобувачів вищої освіти першого курсу денної форми здобуття освіти до умов навчання "
                 "в Державному університеті економіки і технологій, оцінювання якості освітнього середовища, організації освітнього "
                 "процесу, рівня підтримки з боку викладачів та університетських сервісів, а також виявлення проблемних аспектів "
@@ -64,13 +64,16 @@ UNDEFINED = "Не визначено"
 UNIT_COL = "__institute__"
 # Порядок важливий: перше збіглося — те й береться. Перелік — зі сторінки вступу ДУЕТ; у інтерфейсі кожну відповідність можна виправити.
 INSTITUTES = [
-    ("ІТ-факультет", r"програмн|\bіт\b|\bit\b|іпз|ipz|інформаційн\w*\s+технолог|кібербезп"),
-    ("Юридичний інститут", r"право|правознав|психолог|публічн\w*\s+управлін|адмініструван|історі|середня\s+освіт|педагог"),
-    ("Технологічний інститут", r"металург|електроенерг|електротехн|машинобуд|автоматиз|хімічн|хімі\w*\s+технолог|гірнич|гірництв|енергетик"),
-    ("Інститут економіки та бізнес-освіти", r"економ|менеджмент|маркетинг|облік|оподаткув|фінанс|підприємництв|торгівл|бізнес|комп.ютерн\w*\s+наук"),
+    ("ФІТ", r"програмн|\bіт\b|\bit\b|іпз|ipz|інформаційн\w*\s+технолог|кібербезп"),
+    ("ННЮІ", r"право|правознав|психолог|публічн\w*\s+управлін|адмініструван|історі|середня\s+освіт|педагог|громадянськ"),
+    ("ННТІ", r"металург|електроенерг|електротехн|електричн\w*\s+інженер|машинобуд|технологічн\w*\s+машин|обладнанн|автоматиз|хімічн|хімі\w*\s+технолог|гірнич|гірництв|нафтогаз|енергетик"),
+    ("ННІЕБО", r"економ|менеджмент|маркетинг|облік|оподаткув|фінанс|підприємництв|торгівл|бізнес|журналіст|міжнародн\w*\s+комунікац|комп.ютерн\w*\s+наук"),
 ]
-INSTITUTE_NAMES = ["Інститут економіки та бізнес-освіти", "Технологічний інститут", "Юридичний інститут", "ІТ-факультет"]    # порядок показу
+INSTITUTE_NAMES = ["ННІЕБО", "ННТІ", "ННЮІ", "ФІТ"]                    # порядок показу, як у зразку
+INSTITUTE_FULL = {"ННІЕБО": "Навчально-науковий інститут економіки та бізнес-освіти", "ННТІ": "Навчально-науковий технологічний інститут",
+                  "ННЮІ": "Навчально-науковий юридичний інститут", "ФІТ": "Факультет інформаційних технологій"}
 SPEC_RE = re.compile(r"спеціальн|освітн\w*\s+програм|напрям", re.I)
+SPEC_COL = "__spec__"
 
 
 def _norm(v):
@@ -83,9 +86,42 @@ def classify_unit(value):
     if not t:
         return None
     for name, rx in INSTITUTES:
-        if re.search(rx, t) or _norm(name) in t:
+        if re.search(rx, t) or _norm(name) == t or _norm(INSTITUTE_FULL[name]) in t:
             return name
     return None
+
+
+def spec_label(v):
+    """«G10 Металургія (МТ)» → «Металургія»; «С3/С7 Міжнародні  комунікації…(МКЖ)» → «Міжнародні комунікації…»."""
+    t = re.sub(r"\s+", " ", str(v)).strip()
+    t = re.sub(r"^(?:[A-Za-zА-ЯІЇЄа-яіїє]{1,2}\d+(?:[./][A-Za-zА-ЯІЇЄа-яіїє]?\d+)*|\d{3}(?:\.\d+)?)\s+", "", t)
+    t = re.sub(r"\s*\([^()]{1,10}\)\s*$", "", t)
+    return t.strip() or str(v).strip()
+
+
+def _key(name):
+    return re.sub(r"[^\w]+", "", _norm(name))
+
+
+def parse_totals(text):
+    """Вставлений текст «спеціальність<Tab|;|:> кількість» (можна копіювати з Excel) → [(назва, кількість)]."""
+    out = []
+    for ln in str(text or "").replace("\r", "").split("\n"):
+        m = re.match(r"^\s*(.*?)[\t;:|,]*\s+(\d+)\s*$", ln.strip())
+        if m and m.group(1).strip():
+            out.append((re.sub(r"\s+", " ", m.group(1)).strip(), int(m.group(2))))
+    return out
+
+
+def _match_name(name, labels):
+    """Знаходить серед назв спеціальностей з відповідей ту саму (без урахування регістру/пробілів), інакше схожу (≥ 0.84)."""
+    import difflib
+    k = _key(name)
+    for l in labels:
+        if _key(l) == k:
+            return l
+    best = max(labels, key=lambda l: difflib.SequenceMatcher(None, k, _key(l)).ratio(), default=None)
+    return best if best and difflib.SequenceMatcher(None, k, _key(best)).ratio() >= 0.84 else None
 
 
 def _unit_key(name):
@@ -121,17 +157,54 @@ def _prepare(df, overrides):
     spec = ov["specialty"] if "specialty" in ov else _detect_specialty(df, {ts, real})
     spec = spec if spec in df.columns else None
     spec_rows, unit = [], real
-    if not real and spec:
+    if spec:
         manual = {str(k): v for k, v in (ov.get("specialty_map") or {}).items()}
         vals = df[spec].fillna("").astype(str).str.strip()
+        df = df.copy()
+        df[SPEC_COL] = vals.map(lambda x: spec_label(x) if x else None)               # «G10 Металургія (МТ)» → «Металургія»
         for v, n in vals[vals != ""].value_counts().items():
             u = manual.get(v) if v in manual else classify_unit(v)
-            spec_rows.append({"value": v, "n": int(n), "unit": u or UNDEFINED})
-        mp = {r["value"]: r["unit"] for r in spec_rows}
-        df = df.copy()
-        df[UNIT_COL] = vals.map(lambda x: mp.get(x, UNDEFINED) if x else UNDEFINED)
-        unit = UNIT_COL
+            spec_rows.append({"value": v, "label": spec_label(v), "n": int(n), "unit": u or UNDEFINED})
+        if not real:
+            mp = {r["value"]: r["unit"] for r in spec_rows}
+            df[UNIT_COL] = vals.map(lambda x: mp.get(x, UNDEFINED) if x else UNDEFINED)
+            unit = UNIT_COL
     return df, ts, unit, spec, spec_rows
+
+
+def _spec_totals(df, unit, ov):
+    """Кількість здобувачів по спеціальностях (вставлений текст) зіставляється зі спеціальностями з відповідей.
+    → {"rows": [{label, n, total, unit}], "sum", "unit_totals", "missing": [без загальної кількості], "unmatched": [без інституту]}."""
+    if SPEC_COL not in df.columns or not unit:
+        return None
+    d = df.dropna(subset=[SPEC_COL])
+    lab_unit = {l: str(g[unit].mode().iat[0]) for l, g in d.groupby(SPEC_COL)}
+    lab_n = d[SPEC_COL].value_counts().to_dict()
+    totals = {}
+    for name, tot in parse_totals(ov.get("spec_totals_text")):
+        lab = _match_name(name, list(lab_n)) or name
+        totals[lab] = totals.get(lab, 0) + tot
+    rows, unmatched = [], []
+    for lab in set(lab_n) | set(totals):
+        u = lab_unit.get(lab) or classify_unit(lab) or UNDEFINED
+        if u == UNDEFINED:
+            unmatched.append(lab)
+        rows.append({"label": lab, "n": int(lab_n.get(lab, 0)), "total": totals.get(lab), "unit": u})
+    rows.sort(key=lambda r: (_unit_key(r["unit"]), -(r["total"] or 0), -r["n"], r["label"].lower()))
+    unit_totals = {}
+    for r in rows:
+        if r["total"]:
+            unit_totals[r["unit"]] = unit_totals.get(r["unit"], 0) + r["total"]
+    return {"rows": rows, "sum": sum(unit_totals.values()), "unit_totals": unit_totals, "has_totals": bool(totals),
+            "missing": [r["label"] for r in rows if totals and r["n"] and not r["total"]], "unmatched": unmatched}
+
+
+def _spec_groups(tinfo):
+    """Для діаграми участі: [(інститут, [(спеціальність, пройшли, всього)])] у порядку інститутів."""
+    by = {}
+    for r in tinfo["rows"]:
+        by.setdefault(r["unit"], []).append((r["label"], r["n"], r["total"]))
+    return [(u, by[u]) for u in sorted(by, key=_unit_key)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,7 +250,8 @@ def analyze_csk(data: bytes, filename: str = "", overrides: dict = None) -> dict
     """Для екрана налаштувань: колонки, типи питань, інститути (з файлу або за спеціальністю), період."""
     df0 = sr.read_table(data, filename)
     df, ts, unit, spec, spec_rows = _prepare(df0, overrides)
-    qs = _questions(df, {ts, unit, spec})
+    qs = _questions(df, {ts, unit, spec, SPEC_COL})
+    tinfo = _spec_totals(df, unit, overrides or {}) if unit else None
     units = []
     if unit:
         units = [{"name": str(k), "n": int(v)} for k, v in df[unit].dropna().astype(str).value_counts().items()]
@@ -185,14 +259,55 @@ def analyze_csk(data: bytes, filename: str = "", overrides: dict = None) -> dict
     return {"rows": int(len(df)), "columns": {"unit": None if unit == UNIT_COL else unit, "timestamp": ts, "specialty": spec},
             "derived_unit": unit == UNIT_COL, "all_columns": list(df0.columns), "questions": qs, "units": units,
             "specialties": sorted(spec_rows, key=lambda r: -r["n"]), "institutes": INSTITUTE_NAMES + [UNDEFINED],
+            "institute_full": INSTITUTE_FULL, "spec_totals": tinfo,
             "period_text": _period_text(_period(df, ts)), "defaults": DEFAULTS}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Розподіл відповідей за інститутами (дані для діаграми; малює csk_charts.chart_by_unit)
 # ─────────────────────────────────────────────────────────────────────────────
-def _unit_matrix(df, unit, st):
-    """→ (категорії [(підпис, колір)], рядки [(підрозділ, [кількості], усього)]) або None."""
+OTHER_LABEL = "Інші відповіді"
+
+
+def _nk(v):
+    return sr._clean(str(v)).lower().strip(" .;")
+
+
+def _merge_variants(st):
+    """«Ні» і «ні» (різний регістр, зайві пробіли/крапки) — одна відповідь."""
+    if st["kind"] != "single":
+        return
+    best, total = {}, {}
+    for o, c in st["opts"]:
+        k = _nk(o)
+        total[k] = total.get(k, 0) + c
+        if k not in best:
+            best[k] = o
+    st["opts"] = sorted(((best[k], total[k]) for k in best), key=lambda t: -t[1])
+
+
+def _collapse_free_text(st):
+    """У питаннях «Так / Ні / Інше» вільні відповіді (довгі, поодинокі) зводяться в одну групу «Інші відповіді», як у зразку."""
+    if st["kind"] != "single":
+        return
+    opts = st["opts"]
+    top = [o for o, _ in opts[:2]]
+    if not top or max(len(o) for o in top) > 14:                     # варіанти довгі за задумом анкети — не чіпаємо
+        return
+    keep, other, texts = [], 0, []
+    for o, c in opts:
+        if len(o) > 20 and c <= 3:
+            other += c
+            texts.append(o)
+        else:
+            keep.append((o, c))
+    if other:
+        st["opts"] = keep + [(OTHER_LABEL, other)]
+        st["other_answers"] = texts[:12]
+
+
+def _cats_vals(st):
+    """Категорії діаграми розподілу та функція, що рахує кількості за серією відповідей. None — для питань, що не підходять."""
     if st["kind"] == "rating":
         lo, hi = st["lo"], st["hi"]
         keys = list(range(lo, hi + 1))
@@ -203,29 +318,60 @@ def _unit_matrix(df, unit, st):
             c = Counter(v.tolist())
             return [c.get(k, 0) for k in keys]
     elif st["kind"] == "single":
-        top = [o for o, _ in st["opts"][:5]]
-        keys = top + (["Інші відповіді"] if len(st["opts"]) > 5 else [])
-        cats = [(k, ch.PAL[i % len(ch.PAL)] if k != "Інші відповіді" else ch.OTHER) for i, k in enumerate(keys)]
+        named = [o for o, _ in st["opts"] if o != OTHER_LABEL]
+        top = named[:5]
+        has_other = len(named) > 5 or len(named) < len(st["opts"])
+        keys = top + ([OTHER_LABEL] if has_other else [])
+        cats = [(k, ch.PAL[i % len(ch.PAL)] if k != OTHER_LABEL else ch.OTHER) for i, k in enumerate(keys)]
+
+        topk = [_nk(o) for o in top]
 
         def vals(s):
-            c = Counter(s.astype(str).str.strip().tolist())
-            row = [c.get(o, 0) for o in top]
-            if len(keys) > len(top):
-                row.append(sum(v for o, v in c.items() if o not in top))
+            c = Counter(_nk(x) for x in s.astype(str).tolist())
+            row = [c.get(k, 0) for k in topk]
+            if has_other:
+                row.append(sum(v for k, v in c.items() if k not in topk))
             return row
     else:
         return None
+    return cats, vals
+
+
+def _answers(g, st):
+    s = g[st["col"]].dropna()
+    return s[s.astype(str).str.strip() != ""]
+
+
+def _unit_matrix(df, unit, st):
+    """→ (категорії, рядки [(інститут, [кількості], усього)]) або None."""
+    cv = _cats_vals(st)
+    if not cv:
+        return None
+    cats, vals = cv
     rows = []
     for u, g in df.groupby(df[unit].astype(str)):
-        s = g[st["col"]].dropna()
-        s = s[s.astype(str).str.strip() != ""]
+        s = _answers(g, st)
         if len(s):
             v = vals(s)
             rows.append((u, v, sum(v)))
-    rows.sort(key=lambda r: -r[2])
-    rows = rows[:MAX_UNITS_IN_CHART]
     rows.sort(key=lambda r: _unit_key(r[0]))
     return (cats, rows) if len(rows) >= 2 else None
+
+
+def _spec_matrix(df, unit, st):
+    """→ (категорії, групи [(інститут, [(спеціальність, [кількості], усього)])]) або None."""
+    cv = _cats_vals(st)
+    if not cv or SPEC_COL not in df.columns:
+        return None
+    cats, vals = cv
+    by = {}
+    for (u, sp), g in df.dropna(subset=[SPEC_COL]).groupby([df[unit].astype(str), SPEC_COL]):
+        s = _answers(g, st)
+        if len(s):
+            v = vals(s)
+            by.setdefault(u, []).append((sp, v, sum(v)))
+    groups = [(u, sorted(by[u], key=lambda r: (-r[2], r[0].lower()))) for u in sorted(by, key=_unit_key)]
+    return (cats, groups) if sum(len(r) for _, r in groups) >= 2 else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +395,8 @@ def _facts(stats, open_cap=120):
         elif st["kind"] in ("single", "multi"):
             it["multiple_choice_allowed"] = st["kind"] == "multi"
             it["options"] = [{"text": sr._clean(o), "count": c, "percent": round(100.0 * c / st["n"], 1)} for o, c in st["opts"][:20]]
+            if st.get("other_answers"):
+                it["other_answers_examples"] = [_redact(a, 160) for a in st["other_answers"]]
             if len(st["opts"]) > 20:
                 it["other_options_count"] = sum(c for _, c in st["opts"][20:])
         elif st["kind"] == "open":
@@ -258,37 +406,73 @@ def _facts(stats, open_cap=120):
     return out
 
 
-SYSTEM_PROMPT = """Ти — аналітик Центру студентських комунікацій (ЦСК) українського університету. Складаєш офіційну аналітичну довідку за результатами анонімного опитування здобувачів. Усі діаграми до довідки будуються окремо з тих самих даних, які тобі надано, — твоє завдання написати текст, що їх пояснює.
+SYSTEM_PROMPT = """Ти — аналітик Центру студентських комунікацій (ЦСК) українського університету. Складаєш офіційну аналітичну довідку за результатами анонімного опитування здобувачів. Діаграми до довідки будуються окремо з тих самих даних, які тобі надано, — твоє завдання написати текст, що їх пояснює, у стилі зразка нижче.
 
 ПРАВИЛА
-1. Пиши українською, офіційно-діловим стилем, від третьої особи («здобувачі зазначили…», «результати свідчать…»). Без «я», «ми», без емоційних оцінок, без markdown, без emoji.
-2. Використовуй ЛИШЕ числа з наданих даних. Нічого не вигадуй, не обчислюй нових показників, окрім простих відсотків від наданих кількостей. Кількості респондентів пиши цифрами з правильним узгодженням: 1 здобувач, 2–4 здобувачі, 5+ здобувачів.
-3. Для кожної групи питань: опиши найчастішу відповідь (з кількістю), помітні меншості (з кількістю), обережно поясни можливі причини («що може свідчити про…», «може бути пов'язано з…») і заверши абзацом, що починається зі слова «Загалом» і формулює висновок та, за потреби, напрям покращення.
-4. Відкриті відповіді: узагальнюй за темами («найчастіше згадували…», «окремі здобувачі пропонують…»). Кількість називай лише якщо вона є в даних (meaningful_answers). Не цитуй дослівно, не називай імен, прізвищ викладачів, груп чи контактів.
+1. Пиши українською, офіційно-діловим стилем, від третьої особи («здобувачі зазначили…», «результати свідчать…»). Без «я», «ми», без markdown, без emoji.
+2. Використовуй ЛИШЕ числа з наданих даних. Нічого не вигадуй і не обчислюй інших показників, окрім простих відсотків від наданих кількостей. Кількість респондентів пиши цифрами з правильним узгодженням: 1 здобувач, 2–4 здобувачі, 5+ здобувачів. Якщо відповідь явно переважає — пиши «більшість», «переважна більшість» і додавай число лише для меншостей; для середніх груп — «значна частина», «частина здобувачів».
+3. Для кожної групи питань роби 3–5 коротких абзаців: (1) найчастіша відповідь і що вона означає; (2) помітна меншість із кількістю та можливими причинами («що може свідчити про…», «може бути пов'язано з…»); (3) найменша група («Лише N здобувачів…») із оцінкою, чи це системна проблема; (4) останній абзац починається зі слова «Загалом…» і формулює висновок та, за потреби, напрям покращення. Для питань, де в блоці кілька діаграм, окремий абзац-висновок «Загалом…» ставай після опису кожного питання.
+4. Відкриті відповіді узагальнюй за темами («найчастіше згадували…», «окремі здобувачі пропонують…»). Кількість називай лише якщо вона є в даних (meaningful_answers). Не цитуй дослівно, не називай імен, прізвищ викладачів, груп чи контактів.
 5. Показники, що тривожать, не замовчуй; позитивні — не перебільшуй. Якщо респондентів мало (менше 30) — зазнач, що результати орієнтовні.
-6. Десяткові дроби пиши через кому (4,25), відсотки — із знаком % (31 %). Тон і обсяг — як у прикладі нижче.
+6. Десяткові дроби пиши через кому (4,25), відсотки — із знаком % (31 %).
 
-ПРИКЛАД СТИЛЮ (розділ «Загальна оцінка якості освітнього процесу», шкала 1–5):
+ПЕРЕВАЖНА СТРУКТУРА РОЗДІЛІВ (використовуй ці назви й порядок, якщо в даних є відповідні питання; питання, що не підходять, додай у найближчий за змістом розділ або створи свій):
+- «Загальна оцінка якості освітнього процесу» (загальна задоволеність, шкала)
+- «Організація навчального процесу» (розклад, онлайн-заняття, труднощі з підключенням, платформи)
+- «Адаптація до умов навчання»
+- «Навчальне навантаження та підтримка викладачів»
+- «Психологічний комфорт та комунікація» (комфорт, взаємодія з одногрупниками, пошук відповідей на звернення)
+- «Університетські сервіси та інфраструктура»
+- «Доступ до навчальних матеріалів та позанавчальна активність» (матеріали, позанавчальні заходи, студентське самоврядування)
+
+ЗРАЗОК СТИЛЮ (числа тут умовні — у твоїй відповіді мають бути лише числа з даних):
+
+Розділ «Загальна оцінка якості освітнього процесу», питання зі шкали 1–5:
 «Більшість здобувачів оцінили якість освіти на 4 або 5, що свідчить про загальне задоволення процесом навчання та його результатами.»
 «13 здобувачів поставили оцінку 3, що може означати певні зауваження або бажання покращити окремі аспекти навчання.»
 «Лише 2 здобувачі оцінили якість освіти на 2, а оцінки 1 не було. Це свідчить про мінімальний рівень критики.»
 «Загалом здобувачі позитивно оцінюють якість освіти в Університеті, причому велика частина дає максимально високі оцінки. Невелика група здобувачів із середніми оцінками вказує на можливість покращення деяких аспектів освітнього процесу, але критичні проблеми відсутні.»
 
+Розділ «Адаптація до умов навчання»:
+«43 здобувачі змогли адаптуватися без труднощів, що свідчить про наявність певного навчального досвіду та готовності до нових умов.»
+«Найбільша група, 47 здобувачів, відзначила, що адаптація проходила з певними труднощами, тобто перші місяці навчання були викликом, але здобувачам вдалося поступово звикнути до нових форматів та вимог.»
+«12 здобувачів ще не повністю адаптувалися, що вказує на потребу у додатковій підтримці або наставництві на початковому етапі навчання.»
+«Адаптація до нових умов навчання у перші два місяці була помірною: більшість здобувачів відчували певні труднощі, але з часом вони подолали їх. Це підкреслює важливість системи підтримки здобувачів на початку освітнього процесу, включно з консультаціями та адаптаційними заходами.»
+
+Розділ «Психологічний комфорт та комунікація»:
+«Більшість здобувачів освіти зазначили, що відчувають психологічний комфорт, що свідчить про сприятливу атмосферу в Університеті та комфортне освітнє середовище.»
+«32 здобувачі відповіли «частково», що може вказувати на наявність окремих чинників напруження (навчальне навантаження, адаптація, індивідуальні труднощі), які не мають системного характеру, але потребують уваги.»
+«Лише 2 здобувачі не відчувають психологічного комфорту, що є поодиноким випадком і не свідчить про загальну проблему.»
+«Загалом психологічний клімат в Університеті оцінюється позитивно. Водночас частка відповідей «частково» підкреслює доцільність подальшого розвитку заходів психологічної підтримки та комунікації зі здобувачами з метою підвищення рівня комфорту.»
+
+Вступ до розділу «Загальна інформація»:
+«В опитуванні взяли участь здобувачі першого курсу за різними спеціальностями. Опитування охопило 31 % здобувачів першого курсу, що дозволяє сформувати узагальнену картину процесу адаптації до освітнього середовища університету, водночас результати слід розглядати з урахуванням добровільної участі респондентів.»
+
+Узагальнені висновки (6 пунктів, кожен — 1–2 речення):
+«Загалом рівень адаптації першокурсників Університету є задовільним та позитивним: більшість здобувачів відзначають якість освіти, підтримку викладачів, психологічний комфорт і зручність сервісів.»
+«Освітній процес у цілому відповідає очікуванням здобувачів, однак частина першокурсників стикається з труднощами на початковому етапі навчання, що є типовим для періоду адаптації.»
+«Разом із тим виявлено низьку активність здобувачів в опитуваннях і студентському самоврядуванні, що потребує додаткової мотивації, інформування та залучення здобувачів до університетського життя.»
+
+Рекомендації (вступ: «З метою покращення адаптації здобувачів першого курсу рекомендовано:»; 6–7 пунктів):
+«Продовжити запроваджувати системні адаптаційні заходи для першокурсників на початку та протягом навчання із залученням кураторів, студентського самоврядування та інших структурних підрозділів.»
+«Посилити інформаційний супровід першокурсників щодо організації освітнього процесу та університетських сервісів.»
+«Підвищити залученість здобувачів до опитувань шляхом кращого інформування про їх значення та використання результатів.»
+
 СТРУКТУРА ВІДПОВІДІ — лише один JSON-об'єкт, без пояснень і без ```:
 {
-  "intro": "2–3 речення для розділу «Загальна інформація»: хто взяв участь, яку частку охоплено (якщо відомо загальну кількість), застереження про добровільність участі та те, що результати дають узагальнену картину",
+  "intro": "2–3 речення вступу до «Загальної інформації» (як у зразку: хто взяв участь, яку частку охоплено — лише якщо відомо загальну кількість, застереження про добровільність участі)",
   "sections": [
-    {"title": "тематична назва підрозділу без нумерації",
+    {"title": "назва підрозділу без нумерації",
      "blocks": [
         {"question_ids": ["q1", "q2"], "paragraphs": ["абзац", "абзац", "абзац", "Загалом …"]}
      ]}
   ],
-  "conclusions": ["5–7 узагальнених висновків, кожен — одне-два речення"],
+  "conclusions": ["5–7 узагальнених висновків"],
   "recommendations_intro": "одне речення виду «З метою … рекомендовано:»",
-  "recommendations": ["5–8 рекомендацій в інфінітиві («Посилити…», «Розглянути можливість…»), кожна випливає з даних"]
+  "recommendations": ["6–8 рекомендацій в інфінітиві («Посилити…», «Розглянути можливість…»), кожна випливає з даних"]
 }
 
-Вимоги до sections: 3–8 підрозділів за темою питань; кожне питання (id з даних) входить рівно в один блок; порядок питань збережи; в одному блоці 1–3 споріднені питання і 3–5 абзаців. Питання про кількість респондентів чи підрозділи в блоки не включай, якщо їх немає в даних."""
+Вимоги до sections: кожне питання (id з даних) входить рівно в один блок; порядок питань усередині розділів збережи; в одному блоці 1–3 споріднені питання. Питання, що розкривають респондентів (спеціальність), у блоки не включай."""
 
 
 class _Retry(Exception):
@@ -586,7 +770,7 @@ def _date_phrase(now):
     return f"{now.day} {sr.MONTHS_GEN[now.month - 1]} {now.year} року"
 
 
-def build_docx(df, stats, report, ctx, unit, by_unit, open_appendix) -> bytes:
+def build_docx(df, stats, report, ctx, unit, by_unit, by_spec, open_appendix) -> bytes:
     from docx import Document
     if not os.path.exists(TEMPLATE_PATH):
         raise ValueError("Не знайдено шаблон csk_template.docx — покладіть його поруч із survey_reports_csk.py.")
@@ -649,7 +833,12 @@ def build_docx(df, stats, report, ctx, unit, by_unit, open_appendix) -> bytes:
                 if by_unit and unit:
                     m = _unit_matrix(df, unit, st)
                     if m:
-                        _picture(doc, ch.chart_by_unit(st["label"], *m, num))
+                        _picture(doc, ch.chart_by_unit(ch.short_title(st), *m, num))
+                if by_spec and unit:
+                    m = _spec_matrix(df, unit, st)
+                    if m:
+                        for img in ch.chart_by_spec(ch.short_title(st), *m, num):
+                            _picture(doc, img)
 
     _para(doc, "3. Узагальнені висновки", style="Heading 2", size=13, keep_next=True)
     _para(doc, "За результатами опитування встановлено, що:", style="Normal (Web)", keep_next=True)
@@ -698,22 +887,30 @@ def generate_csk(data: bytes, filename: str, opts: dict):
     """opts: unit, timestamp, specialty (колонки; інститут за спеціальністю визначається автоматично), specialty_map {спеціальність: інститут}, exclude, titles, institution, audience, topic, respondents, instrument, purpose, period_text,
     total_students, unit_totals {підрозділ: кількість}, by_unit (bool), ai (bool), open_appendix (bool). → (ім'я_файлу, байти, mime)."""
     df, ts, unit, spec, _rows = _prepare(sr.read_table(data, filename), opts)
-    all_q = _questions(df, {ts, unit, spec})
-    chosen = _questions(df, {ts, unit, spec}, set(opts.get("exclude") or []), opts.get("titles"))
+    skip = {ts, unit, spec, SPEC_COL}
+    chosen = _questions(df, skip, set(opts.get("exclude") or []), opts.get("titles"))
+    q_total = sum(1 for c in df.columns if c not in (ts, UNIT_COL, SPEC_COL) and not sr.PERSONAL_RE.search(c))
     stats = [s for s in (sr.compute_stats(df, q) for q in chosen) if s["kind"] != "empty"]
+    for st in stats:
+        _merge_variants(st)
+        _collapse_free_text(st)
     if not stats:
         raise ValueError("Не залишилось жодного питання для довідки")
     g = lambda k: (str(opts.get(k) or "").strip() or DEFAULTS[k])
     n = int(len(df))
-    total = _int(opts.get("total_students"))
+    tinfo = _spec_totals(df, unit, opts) if unit else None
+    total = _int(opts.get("total_students")) or (tinfo["sum"] if tinfo and tinfo["sum"] else None)
     period_text = str(opts.get("period_text") or "").strip() or _period_text(_period(df, ts))
 
     unit_counts = {}
     if unit:
         unit_counts = {str(k): int(v) for k, v in df[unit].dropna().astype(str).value_counts().items()}
-    totals = {k: _int(v) for k, v in (opts.get("unit_totals") or {}).items() if _int(v)}
+    totals = {k: _int(v) for k, v in ((tinfo or {}).get("unit_totals") or {}).items() if _int(v)}
+    totals.update({k: _int(v) for k, v in (opts.get("unit_totals") or {}).items() if _int(v)})
     charts = []
-    if unit_counts and len(unit_counts) >= 2:
+    if tinfo and len(tinfo["rows"]) >= 2:                      # як у зразку: участь за спеціальностями в межах інститутів
+        charts = ch.chart_participation_specs(_spec_groups(tinfo))
+    elif unit_counts and len(unit_counts) >= 2:
         names = sorted(unit_counts, key=_unit_key)
         for i in range(0, len(names), MAX_UNITS_IN_CHART):
             part = names[i:i + MAX_UNITS_IN_CHART]
@@ -722,9 +919,9 @@ def generate_csk(data: bytes, filename: str, opts: dict):
     ctx = {"institution": g("institution"), "audience": g("audience"), "topic": str(opts.get("topic", DEFAULTS["topic"])).strip(),
            "respondents": g("respondents"), "instrument": g("instrument"), "purpose": g("purpose"), "period_text": period_text,
            "n": n, "total_students": total, "coverage": round(100.0 * n / total) if total else None,
-           "unit_counts": unit_counts or None, "questions_total": len(all_q), "participation_charts": charts, "now": datetime.now()}
+           "unit_counts": unit_counts or None, "questions_total": q_total, "participation_charts": charts, "now": datetime.now()}
 
     report = ai_report(stats, ctx) if opts.get("ai", True) else rule_report(stats, ctx)
-    body = build_docx(df, stats, report, ctx, unit, bool(opts.get("by_unit", True)), bool(opts.get("open_appendix", False)))
+    body = build_docx(df, stats, report, ctx, unit, bool(opts.get("by_unit", True)), bool(opts.get("by_spec", True)), bool(opts.get("open_appendix", False)))
     fname = "Аналітична_довідка_ЦСК_" + ctx["now"].strftime("%Y-%m-%d") + ".docx"
     return fname, body, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
