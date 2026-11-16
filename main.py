@@ -27,7 +27,7 @@ import gc
 import threading
 import hmac
 from starlette.concurrency import run_in_threadpool
-from collections import defaultdict
+from collections import defaultdict, Counter
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from shevchenko import in_genitive, GrammaticalGender, DeclensionInput
@@ -7096,80 +7096,219 @@ async def export_department_attendance(date_from: str, date_to: Optional[str] = 
 # =========================================================
 ND_REASONS = {"no_account": "Немає акаунта Zoom", "no_meetings": "Акаунт є, зустрічей у Zoom немає"}
 
-async def _no_data_build(db, date_from: str, date_to: Optional[str]) -> dict:
+# Корпоративні домени пошти: акаунт Zoom має бути створений на пошті закладу (змінна CORP_EMAIL_DOMAINS, через кому).
+CORP_EMAIL_DOMAINS = tuple(d.strip().lower().lstrip("@") for d in os.environ.get("CORP_EMAIL_DOMAINS", "duet.edu.ua", "kneu.dp.ua").split(",") if d.strip())
+ND_NONE_KEY = "__none__"                 # значення фільтра для «Без інституту / Без кафедри»
+ND_NO_INSTITUTE, ND_NO_DEPT = "Без інституту", "Без кафедри"
+
+def _is_corp_email(email: str) -> bool:
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return False
+    dom = e.rsplit("@", 1)[1]
+    return any(dom == d or dom.endswith("." + d) for d in CORP_EMAIL_DOMAINS)
+
+def _nd_match(value: str, wanted: Optional[str]) -> bool:
+    if not wanted:
+        return True
+    if wanted == ND_NONE_KEY:
+        return not value
+    return _norm(value) == _norm(wanted)
+
+def _nd_counts(rows: list, non_corp: list) -> dict:
+    return {"total": len(rows), "with_note": sum(1 for r in rows if r["note"]), "without_note": sum(1 for r in rows if not r["note"]),
+            "no_account": sum(1 for r in rows if r["reason"] == "no_account"), "no_meetings": sum(1 for r in rows if r["reason"] == "no_meetings"),
+            "non_corp": len(non_corp)}
+
+def _nd_summary(rows: list, non_corp: list) -> list:
+    """Зведення по кафедрах: скільки викладачів у кожній із трьох груп."""
+    acc = {}
+    def slot(r):
+        return acc.setdefault((r["institute"], r["department"]), {"institute": r["institute"], "department": r["department"],
+                                                                    "no_account": 0, "no_meetings": 0, "non_corp": 0})
+    for r in rows:
+        slot(r)[r["reason"]] += 1
+    for r in non_corp:
+        slot(r)["non_corp"] += 1
+    out = list(acc.values())
+    for s in out:
+        s["total"] = s["no_account"] + s["no_meetings"] + s["non_corp"]
+    out.sort(key=lambda s: ((s["institute"] or "\uffff").lower(), (s["department"] or "\uffff").lower()))
+    return out
+
+async def _no_data_build(db, date_from: str, date_to: Optional[str], institute: Optional[str] = None, department: Optional[str] = None) -> dict:
     d_from, d_to = _sched_parse_range(date_from, date_to, ATT_MAX_DAYS)
     ov = await _schedule_overview_core(db, d_from, d_to, other_limit=1)
-    dept_of = {t.id: _clean(t.department) for t in db.query(DBLessonTeacher).all()}
-    rows = []
+    tch = {t.id: t for t in db.query(DBLessonTeacher).all()}
+    emails = defaultdict(set)                 # пошти прив'язаних до викладача акаунтів (ключі «name:…» без пошти пропускаємо)
+    for a in db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.lesson_teacher_id.isnot(None),
+                                                  DBLessonZoomAccount.link_status.in_(("auto", "manual"))).all():
+        if "@" in (a.email_key or ""):
+            emails[a.lesson_teacher_id].add(a.email_key)
+    rows, non_corp = [], []
     for card in ov["teachers"]:
         lessons = card["lessons"]
         need = [l for l in lessons if l["status"] in ("ok", "partial", "missed", "alert", "no_account")]   # пари, де Zoom мав би бути
         if not need:
             continue
-        if not card["has_account"]:
-            reason = "no_account"
-        elif not any(l.get("meetings") for l in lessons) and not card["other_meetings"]:
-            reason = "no_meetings"
-        else:
-            continue
+        t = tch.get(card["id"])
         dates = sorted(l["date"] for l in need)
-        rows.append({"id": card["id"], "name": card["name"], "department": dept_of.get(card["id"]) or "", "note": (card.get("note") or "").strip(),
-                     "reason": reason, "reason_label": ND_REASONS[reason], "lessons": len(need), "first": dates[0], "last": dates[-1]})
+        base = {"id": card["id"], "name": card["name"],
+                "department": _clean(t.department) if t and t.department else "", "institute": _clean(t.institute) if t and t.institute else "",
+                "note": (card.get("note") or "").strip(), "lessons": len(need), "first": dates[0], "last": dates[-1],
+                "emails": sorted(emails.get(card["id"], ()))}
+        has_meet = any(l.get("meetings") for l in lessons) or bool(card["other_meetings"])
+        reason = "no_account" if not card["has_account"] else ("no_meetings" if not has_meet else None)
+        if reason:
+            rows.append({**base, "reason": reason, "reason_label": ND_REASONS[reason]})
+        # акаунт є, але жодна пошта не корпоративна → викладач користується особистим Zoom
+        if card["has_account"] and base["emails"] and not any(_is_corp_email(e) for e in base["emails"]):
+            non_corp.append({**base, "has_meetings": has_meet})
+
+    # довідники для фільтрів — до фільтрації, щоб список не «схлопувався»
+    inst_ids, dep_ids = defaultdict(set), defaultdict(set)
+    for r in rows + non_corp:
+        inst_ids[r["institute"]].add(r["id"])
+        dep_ids[(r["institute"], r["department"])].add(r["id"])
+    options = {"institutes": sorted(({"name": k, "count": len(v)} for k, v in inst_ids.items()), key=lambda x: (not x["name"], x["name"].lower())),
+               "departments": sorted(({"name": k[1], "institute": k[0], "count": len(v)} for k, v in dep_ids.items()),
+                                     key=lambda x: (not x["name"], x["name"].lower()))}
+
+    keep = lambda r: _nd_match(r["institute"], institute) and _nd_match(r["department"], department)
+    rows, non_corp = [r for r in rows if keep(r)], [r for r in non_corp if keep(r)]
     rows.sort(key=lambda r: (bool(r["note"]), r["name"].lower()))           # спершу ті, у кого примітки немає
-    return {"date_from": d_from, "date_to": d_to, "coverage": ov["coverage"], "teachers_count": len(ov["teachers"]), "teachers": rows,
-            "counts": {"total": len(rows), "with_note": sum(1 for r in rows if r["note"]), "without_note": sum(1 for r in rows if not r["note"]),
-                       "no_account": sum(1 for r in rows if r["reason"] == "no_account"), "no_meetings": sum(1 for r in rows if r["reason"] == "no_meetings")}}
+    non_corp.sort(key=lambda r: r["name"].lower())
+    return {"date_from": d_from, "date_to": d_to, "coverage": ov["coverage"], "teachers_count": len(ov["teachers"]),
+            "teachers": rows, "non_corp": non_corp, "counts": _nd_counts(rows, non_corp), "summary": _nd_summary(rows, non_corp),
+            "options": options, "corp_domains": list(CORP_EMAIL_DOMAINS)}
 
 @app.get("/api/cmyo/schedule/no-data-teachers")
-async def no_data_teachers(date_from: str, date_to: Optional[str] = None,
+async def no_data_teachers(date_from: str, date_to: Optional[str] = None, institute: Optional[str] = None, department: Optional[str] = None,
                            user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    return await _no_data_build(db, date_from, date_to)
+    return await _no_data_build(db, date_from, date_to, institute, department)
 
-@app.get("/api/cmyo/schedule/no-data-teachers/export")
-async def export_no_data_teachers(date_from: str, date_to: Optional[str] = None,
-                                 user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def _nd_fmt_d(iso: str) -> str:
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}" if iso else ""
+
+def _nd_safe(name: str) -> str:
+    return re.sub(r"[\\/:*?\"<>|\r\n]+", "_", (name or "").strip()).strip(" ._")[:80] or "без_назви"
+
+def _nd_workbook(data: dict, scope: str = "") -> bytes:
+    """Один .xlsx: «Зведення» (якщо кафедр більше однієї) + три таблиці. Порожні аркуші пропускаються."""
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
-    data = await _no_data_build(db, date_from, date_to)
-    if not data["teachers"]:
-        raise HTTPException(status_code=404, detail="За цей період немає викладачів без даних Zoom")
-    fmt_d = lambda iso: f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}" if iso else ""
     thin = Side(style="thin", color="BBBBBB")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    stamp = f"Період: {_nd_fmt_d(data['date_from'])} – {_nd_fmt_d(data['date_to'])} · сформовано {_sched_now().strftime('%d.%m.%Y %H:%M')}"
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Без даних Zoom"
-    ws["A1"] = "Викладачі, які мають пари за розкладом, але без даних Zoom"
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"] = f"Період: {fmt_d(data['date_from'])} – {fmt_d(data['date_to'])} · сформовано {_sched_now().strftime('%d.%m.%Y %H:%M')}"
-    ws["A2"].font = Font(color="666666", size=10)
-    c = data["counts"]
-    ws["A3"] = f"Усього: {c['total']} · з приміткою: {c['with_note']} · без примітки: {c['without_note']}"
-    ws["A3"].font = Font(color="666666", size=10)
-    heads = ["Викладач", "Кафедра", "Причина", "Пар у періоді", "Перша пара", "Остання пара", "Примітка"]
-    for j, h in enumerate(heads, 1):
-        cell = ws.cell(row=5, column=j, value=h)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F3A5F")
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = border
-    for i, t in enumerate(data["teachers"], 6):
-        vals = [t["name"], t["department"], t["reason_label"], t["lessons"], fmt_d(t["first"]), fmt_d(t["last"]), t["note"]]
-        for j, v in enumerate(vals, 1):
-            cell = ws.cell(row=i, column=j, value=v)
-            cell.border = border
-            cell.alignment = Alignment(vertical="top", wrap_text=j in (1, 2, 3, 7), horizontal="center" if j in (4, 5, 6) else "left")
-    for j, w in enumerate([30, 34, 30, 12, 13, 13, 60], 1):
-        ws.column_dimensions[get_column_letter(j)].width = w
-    ws.freeze_panes = "A6"
-    ws.auto_filter.ref = f"A5:G{5 + len(data['teachers'])}"
+    wb.remove(wb.active)
+
+    def sheet(title, caption, heads, widths, rows, center=(), wrap=(), fill_cols=()):
+        ws = wb.create_sheet(title[:31])
+        ws["A1"] = caption + (f" — {scope}" if scope else "")
+        ws["A1"].font = Font(bold=True, size=14)
+        ws["A2"] = stamp
+        ws["A2"].font = Font(color="666666", size=10)
+        ws["A3"] = f"Усього: {len(rows)}"
+        ws["A3"].font = Font(color="666666", size=10)
+        for j, h in enumerate(heads, 1):
+            c = ws.cell(row=5, column=j, value=h)
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1F3A5F")
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border
+        for i, vals in enumerate(rows, 6):
+            for j, v in enumerate(vals, 1):
+                c = ws.cell(row=i, column=j, value=v)
+                c.border = border
+                c.alignment = Alignment(vertical="top", wrap_text=j in wrap, horizontal="center" if j in center else "left")
+                if j in fill_cols:
+                    c.fill = PatternFill("solid", fgColor="FFF8DC")      # колонки, які треба заповнити вручну
+        for j, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(j)].width = w
+        ws.freeze_panes = "A6"
+        ws.auto_filter.ref = f"A5:{get_column_letter(len(heads))}{5 + len(rows)}"
+
+    rows, nc = data["teachers"], data["non_corp"]
+    no_acc = sorted((r for r in rows if r["reason"] == "no_account"), key=lambda r: ((r["institute"] or "\uffff").lower(), (r["department"] or "\uffff").lower(), r["name"].lower()))
+    unused = sorted((r for r in rows if r["reason"] == "no_meetings"), key=lambda r: ((r["institute"] or "\uffff").lower(), (r["department"] or "\uffff").lower(), r["name"].lower()))
+    nc = sorted(nc, key=lambda r: ((r["institute"] or "\uffff").lower(), (r["department"] or "\uffff").lower(), r["name"].lower()))
+    inst = lambda r: r["institute"] or ND_NO_INSTITUTE
+    dep = lambda r: r["department"] or ND_NO_DEPT
+
+    if len(data["summary"]) > 1:
+        sheet("Зведення", "Зведення по кафедрах", ["Інститут", "Кафедра", "Немає акаунта", "Акаунт є, не використовують", "Некорпоративна пошта", "Усього"],
+              [28, 44, 16, 22, 18, 10],
+              [[s["institute"] or ND_NO_INSTITUTE, s["department"] or ND_NO_DEPT, s["no_account"], s["no_meetings"], s["non_corp"], s["total"]] for s in data["summary"]],
+              center=(3, 4, 5, 6), wrap=(1, 2))
+    if no_acc:      # «Корпоративна пошта» — порожня колонка: сюди вносять пошти для створення акаунтів
+        sheet("Немає акаунта Zoom", "Викладачі без акаунта Zoom (є пари за розкладом)",
+              ["Інститут", "Викладач", "Кафедра", "Пар у періоді", "Перша пара", "Остання пара", "Примітка", "Корпоративна пошта"],
+              [24, 28, 38, 12, 13, 13, 50, 32],
+              [[inst(r), r["name"], dep(r), r["lessons"], _nd_fmt_d(r["first"]), _nd_fmt_d(r["last"]), r["note"], ""] for r in no_acc],
+              center=(4, 5, 6), wrap=(1, 2, 3, 7), fill_cols=(8,))
+    if unused:
+        sheet("Не використовують Zoom", "Акаунт Zoom є, але не використовується",
+              ["Інститут", "Викладач", "Кафедра", "Пошта акаунта", "Пар у періоді", "Перша пара", "Остання пара", "Примітка"],
+              [24, 28, 38, 34, 12, 13, 13, 50],
+              [[inst(r), r["name"], dep(r), ", ".join(r["emails"]), r["lessons"], _nd_fmt_d(r["first"]), _nd_fmt_d(r["last"]), r["note"]] for r in unused],
+              center=(5, 6, 7), wrap=(1, 2, 3, 4, 8))
+    if nc:
+        sheet("Некорпоративна пошта", "Zoom на некорпоративній пошті",
+              ["Інститут", "Викладач", "Кафедра", "Пошта в Zoom", "Зустрічі в Zoom", "Пар у періоді", "Примітка"],
+              [24, 28, 38, 36, 14, 12, 50],
+              [[inst(r), r["name"], dep(r), ", ".join(r["emails"]), "є" if r["has_meetings"] else "немає", r["lessons"], r["note"]] for r in nc],
+              center=(5, 6), wrap=(1, 2, 3, 4, 7))
     out = io.BytesIO()
     wb.save(out)
-    out.seek(0)
-    fname = f"Без_даних_Zoom_{data['date_from']}_{data['date_to']}.xlsx"
-    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
+    return out.getvalue()
+
+def _nd_subset(data: dict, pred) -> dict:
+    rows, nc = [r for r in data["teachers"] if pred(r)], [r for r in data["non_corp"] if pred(r)]
+    return {**data, "teachers": rows, "non_corp": nc, "counts": _nd_counts(rows, nc), "summary": _nd_summary(rows, nc)}
+
+@app.get("/api/cmyo/schedule/no-data-teachers/export")
+async def export_no_data_teachers(date_from: str, date_to: Optional[str] = None, institute: Optional[str] = None, department: Optional[str] = None,
+                                  split: str = "none",
+                                  user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+    """split=none → один .xlsx; institute / department → .zip з окремим .xlsx на кожен інститут / кафедру."""
+    data = await _no_data_build(db, date_from, date_to, institute, department)
+    if not data["teachers"] and not data["non_corp"]:
+        raise HTTPException(status_code=404, detail="За цей період немає викладачів без даних Zoom")
+    xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    period = f"{data['date_from']}_{data['date_to']}"
+    disp = lambda fn: {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fn)}"}
+    scope_name = ""
+    if department:
+        scope_name = ND_NO_DEPT if department == ND_NONE_KEY else department
+    elif institute:
+        scope_name = ND_NO_INSTITUTE if institute == ND_NONE_KEY else institute
+
+    if split == "none":
+        body = _nd_workbook(data, scope_name)
+        fname = f"Без_даних_Zoom_{_nd_safe(scope_name) + '_' if scope_name else ''}{period}.xlsx"
+        return StreamingResponse(io.BytesIO(body), media_type=xlsx_mime, headers=disp(fname))
+
+    if split == "institute":
+        keyf = lambda r: (r["institute"], r["institute"] or ND_NO_INSTITUTE)
+    else:
+        keyf = lambda r: ((r["institute"], r["department"]), r["department"] or ND_NO_DEPT)
+    groups = {}
+    for r in data["teachers"] + data["non_corp"]:
+        k, label = keyf(r)
+        groups.setdefault(k, label)
+    buf, used = io.BytesIO(), Counter()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:           # .xlsx уже стиснутий; по одному файлу — без накопичення в пам'яті
+        for k, label in sorted(groups.items(), key=lambda kv: (not kv[1] or kv[1].startswith("Без"), kv[1].lower())):
+            sub = _nd_subset(data, lambda r, k=k: keyf(r)[0] == k)
+            name = _nd_safe(label)
+            used[name] += 1
+            if used[name] > 1:
+                name += f"_{used[name]}"
+            z.writestr(f"Без_даних_Zoom_{name}_{period}.xlsx", _nd_workbook(sub, label))
+    fname = f"Без_даних_Zoom_по_{'інститутах' if split == 'institute' else 'кафедрах'}_{period}.zip"
+    return StreamingResponse(io.BytesIO(buf.getvalue()), media_type="application/zip", headers=disp(fname))
 
 # =========================================================
 # 📄 АНАЛІТИЧНІ ДОВІДКИ ЗА РЕЗУЛЬТАТАМИ ОПИТУВАННЯ (xlsx/csv) — по кожній спеціальності та рівню освіти
