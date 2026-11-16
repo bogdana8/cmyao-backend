@@ -7097,7 +7097,7 @@ async def export_department_attendance(date_from: str, date_to: Optional[str] = 
 ND_REASONS = {"no_account": "Немає акаунта Zoom", "no_meetings": "Акаунт є, зустрічей у Zoom немає"}
 
 # Корпоративні домени пошти: акаунт Zoom має бути створений на пошті закладу (змінна CORP_EMAIL_DOMAINS, через кому).
-CORP_EMAIL_DOMAINS = tuple(d.strip().lower().lstrip("@") for d in os.environ.get("CORP_EMAIL_DOMAINS", "duet.edu.ua", "kneu.dp.ua").split(",") if d.strip())
+CORP_EMAIL_DOMAINS = tuple(d.strip().lower().lstrip("@") for d in os.environ.get("CORP_EMAIL_DOMAINS", "duet.edu.ua,kneu.dp.ua").split(",") if d.strip())
 ND_NONE_KEY = "__none__"                 # значення фільтра для «Без інституту / Без кафедри»
 ND_NO_INSTITUTE, ND_NO_DEPT = "Без інституту", "Без кафедри"
 
