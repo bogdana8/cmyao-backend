@@ -32,11 +32,17 @@ class _Cv(sr._Canvas):
         import io
         from PIL import Image
         buf = io.BytesIO()
-        self.fig.savefig(buf, format="png", dpi=160, facecolor="white")
-        im = Image.open(io.BytesIO(buf.getvalue())).convert("RGB").quantize(colors=160, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
-        out = io.BytesIO()
-        im.save(out, format="PNG", optimize=True)
-        return out.getvalue()
+        try:
+            self.fig.savefig(buf, format="png", dpi=160, facecolor="white")
+            buf.seek(0)
+            im = Image.open(buf).convert("RGB").quantize(colors=160, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+            out = io.BytesIO()
+            im.save(out, format="PNG", optimize=True)
+            im.close()
+            return out.getvalue()
+        finally:
+            self.fig.clear()            # Figure має циклічні посилання — звільняємо одразу
+            buf.close()
 
 
 def scale_color(t):

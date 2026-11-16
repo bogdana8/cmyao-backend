@@ -439,8 +439,12 @@ class _Canvas:
 
     def png(self):
         buf = io.BytesIO()
-        self.fig.savefig(buf, format="png", dpi=DPI, facecolor="white")
-        return buf.getvalue()
+        try:
+            self.fig.savefig(buf, format="png", dpi=DPI, facecolor="white")
+            return buf.getvalue()
+        finally:
+            self.fig.clear()        # Figure має циклічні посилання — без цього пам'ять тримається до GC
+            buf.close()
 
 def _shell(cv):
     cv.box(0.03, 0.03, cv.w - 0.06, cv.h - 0.06, r=0.14, fc="white", ec=LINE, lw=1.0, z=0)
@@ -457,8 +461,12 @@ def _png(fig):          # залишено для сумісності
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     FigureCanvasAgg(fig)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=DPI, facecolor="white")
-    return buf.getvalue()
+    try:
+        fig.savefig(buf, format="png", dpi=DPI, facecolor="white")
+        return buf.getvalue()
+    finally:
+        fig.clear()
+        buf.close()
 
 # ---- оцінки за шкалою ---------------------------------------------------------------
 def chart_rating(st):
@@ -908,30 +916,34 @@ def generate(data: bytes, filename: str, opts: dict):
     if not keys:
         raise ValueError("Оберіть хоча б одну групу")
     period = _period_phrase(df, det["timestamp"])
-    results = []
-    for key in keys:
-        level, spec = (key.split("||", 1) + [""])[:2]
-        mask = (lv == level) & (sp == spec)
-        if not mask.any():
-            continue
-        ctx = {"category": opts.get("category") or DEFAULT_CATEGORY, "institution": opts.get("institution") or "",
-               "purpose": opts.get("purpose") or "", "include_open": opts.get("include_open", True),
-               "level": level, "specialty": spec, "period": period}
-        body = build_docx(df[mask].reset_index(drop=True), questions, ctx)
-        code, name = split_specialty(spec)
-        _, short, _ = level_info(level)
-        fname = "Аналітична_довідка_" + safe_name("_".join(x for x in (code, name, short) if x)) + ".docx"
-        results.append((fname, body))
-    if not results:
-        raise ValueError("Для обраних груп не знайдено відповідей")
     docx_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    if len(results) == 1:
-        return results[0][0], results[0][1], docx_mime
-    buf = io.BytesIO(); used = Counter()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for fname, body in results:
+    import gc
+    buf = io.BytesIO(); used = Counter(); names = []
+    # ZIP_STORED: .docx уже стиснутий, повторне стиснення лише з'їдає CPU
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for key in keys:
+            level, spec = (key.split("||", 1) + [""])[:2]
+            mask = (lv == level) & (sp == spec)
+            if not mask.any():
+                continue
+            ctx = {"category": opts.get("category") or DEFAULT_CATEGORY, "institution": opts.get("institution") or "",
+                   "purpose": opts.get("purpose") or "", "include_open": opts.get("include_open", True),
+                   "level": level, "specialty": spec, "period": period}
+            body = build_docx(df[mask].reset_index(drop=True), questions, ctx)
+            code, name = split_specialty(spec)
+            _, short, _ = level_info(level)
+            fname = "Аналітична_довідка_" + safe_name("_".join(x for x in (code, name, short) if x)) + ".docx"
             used[fname] += 1
             if used[fname] > 1:
                 fname = fname.replace(".docx", f"_{used[fname]}.docx")
             z.writestr(fname, body)
+            names.append(fname)
+            del body
+            gc.collect()                  # між групами повертаємо пам'ять (діаграми/PNG)
+    if not names:
+        raise ValueError("Для обраних груп не знайдено відповідей")
+    if len(names) == 1:                   # одна група → віддаємо сам .docx
+        with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zr:
+            return names[0], zr.read(names[0]), docx_mime
+
     return "Аналітичні_довідки.zip", buf.getvalue(), "application/zip"

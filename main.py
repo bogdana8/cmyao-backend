@@ -23,6 +23,8 @@ import hashlib
 import zipfile
 import difflib
 import asyncio
+import gc
+import threading
 import hmac
 from starlette.concurrency import run_in_threadpool
 from collections import defaultdict
@@ -129,7 +131,12 @@ def clear_failed_logins(db: Session, email: str):
 # =========================================================
 # 🗄️ БАЗА ДАНИХ
 # =========================================================
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+_db_kwargs = dict(pool_pre_ping=True)
+if not DATABASE_URL.startswith("sqlite"):
+    # Не даємо запитам висіти вічно, якщо з'єднання «мертві» (Supabase/Render рвуть неактивні з'єднання)
+    _db_kwargs.update(pool_recycle=300, pool_size=5, max_overflow=10, pool_timeout=15,
+                      connect_args={"connect_timeout": 10})
+engine = create_engine(DATABASE_URL, **_db_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -1447,7 +1454,7 @@ def award_feathers(db: Session, student_id: str, amount: int, reason: str, surve
 # 🔐 АВТОРИЗАЦІЯ
 # =========================================================
 @app.post("/api/login")
-async def login(
+def login(
     user: UserLoginSchema,
     request: Request,
     db: Session = Depends(get_db)
@@ -1472,7 +1479,7 @@ async def login(
     return {"access_token": access_token, "role": db_user.role}
 
 @app.post("/api/google-login")
-async def google_login(
+def google_login(
     auth_data: GoogleLoginSchema,
     request: Request,
     db: Session = Depends(get_db)
@@ -1535,7 +1542,7 @@ async def google_login(
 # 👑 СУПЕРАДМІН — КЕРУВАННЯ КОРИСТУВАЧАМИ
 # =========================================================
 @app.get("/api/superadmin/users")
-async def get_all_users(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+def get_all_users(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
     users = db.query(DBUser).all()
     return [{
         "id": u.id, "email": u.email, "full_name": u.full_name,
@@ -1567,7 +1574,7 @@ def _normalize_student_data_groups(db_session, student_data):
     return student_data
 
 @app.post("/api/superadmin/users")
-async def create_or_update_user(
+def create_or_update_user(
     user: UserCreateSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -1599,7 +1606,7 @@ async def create_or_update_user(
     return {"message": msg}
 
 @app.post("/api/superadmin/users/bulk")
-async def bulk_import_users(
+def bulk_import_users(
     payload: dict, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -1643,11 +1650,11 @@ async def bulk_import_users(
 # 📊 ЦСК — ЗАВАНТАЖЕННЯ ТА РЕДАГУВАННЯ ОЦІНОК
 # =========================================================
 @app.post("/api/csk/upload-grades")
-async def upload_grades(
+def upload_grades(
     request: Request, file: UploadFile = File(...),
     admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
 ):
-    content = await file.read()
+    content = file.file.read()
     try:
         xls = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
     except Exception as e:
@@ -1750,7 +1757,7 @@ def _student_study_values(sd: dict, key: str) -> list:
     return [str(x.get(key)).strip() for x in (sd.get("навчання") or []) if isinstance(x, dict) and x.get(key) not in (None, "")]
 
 @app.get("/api/csk/students")
-async def get_students_for_csk(
+def get_students_for_csk(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     q: str = Query(default=None),
@@ -1803,7 +1810,7 @@ async def get_students_for_csk(
     }
 
 @app.get("/api/csk/students/{student_id}")
-async def get_student_for_csk(
+def get_student_for_csk(
     student_id: str, admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
 ):
     s = db.query(DBUser).filter(DBUser.id == student_id, DBUser.role == "student").first()
@@ -1822,7 +1829,7 @@ async def get_student_for_csk(
     }
 
 @app.put("/api/csk/grades/{grade_id}")
-async def update_single_grade(
+def update_single_grade(
     grade_id: int, grade_data: GradeUpdateSchema, request: Request,
     admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
 ):
@@ -1849,7 +1856,7 @@ async def update_single_grade(
 # 🎓 СТУДЕНТ — ПРОФІЛЬ ТА ОПИТУВАННЯ
 # =========================================================
 @app.get("/api/student/me")
-async def get_student_profile(
+def get_student_profile(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
@@ -1872,7 +1879,7 @@ async def get_student_profile(
     }
 
 @app.get("/api/student/surveys")
-async def get_student_surveys(
+def get_student_surveys(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
@@ -1998,7 +2005,7 @@ async def get_student_surveys(
 # 📝 ЦМЯО — УПРАВЛІННЯ ОПИТУВАННЯМИ
 # =========================================================
 @app.get("/api/templates")
-async def get_templates(
+def get_templates(
     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)
 ):
     templates = db.query(DBTemplate).all()
@@ -2013,7 +2020,7 @@ async def get_templates(
     } for t in templates]
 
 @app.post("/api/templates")
-async def save_template(
+def save_template(
     survey: SurveyTemplateSchema,
     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)
 ):
@@ -2052,7 +2059,7 @@ async def save_template(
     return {"message": "Шаблон збережено!", "id": survey.id}
 
 @app.delete("/api/templates/{template_id}")
-async def delete_template(
+def delete_template(
     template_id: str,
     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)
 ):
@@ -2118,7 +2125,7 @@ def _survey_access_error(db_session, template, user: dict):
     return None
 
 @app.get("/api/templates/{template_id}")
-async def get_single_template(
+def get_single_template(
     template_id: str,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2147,7 +2154,7 @@ def _hashtag_to_dict(h: DBHashtagCatalog) -> dict:
     }
 
 @app.get("/api/hashtags")
-async def get_hashtags(
+def get_hashtags(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Повертає весь каталог хештегів (доступно всім авторизованим)"""
@@ -2155,7 +2162,7 @@ async def get_hashtags(
     return [_hashtag_to_dict(t) for t in tags]
 
 @app.post("/api/superadmin/hashtags")
-async def create_hashtag(
+def create_hashtag(
     data: HashtagCreateSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2176,7 +2183,7 @@ async def create_hashtag(
     return _hashtag_to_dict(tag)
 
 @app.put("/api/superadmin/hashtags/{tag_id}")
-async def update_hashtag(
+def update_hashtag(
     tag_id: int, data: HashtagUpdateSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2194,7 +2201,7 @@ async def update_hashtag(
     return _hashtag_to_dict(tag)
 
 @app.delete("/api/superadmin/hashtags/{tag_id}")
-async def delete_hashtag(
+def delete_hashtag(
     tag_id: int, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2216,12 +2223,12 @@ async def delete_hashtag(
 
 # ── ІНСТИТУТИ / ФАКУЛЬТЕТИ ──────────────────────────────
 @app.get("/api/structure/institutes")
-async def get_institutes(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_institutes(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     items = db.query(DBInstitute).order_by(DBInstitute.name).all()
     return [{"id": i.id, "name": i.name, "full_name": i.full_name} for i in items]
 
 @app.post("/api/superadmin/structure/institutes")
-async def create_institute(
+def create_institute(
     data: InstituteSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2235,7 +2242,7 @@ async def create_institute(
     return {"id": new_id, "name": obj.name, "full_name": obj.full_name}
 
 @app.put("/api/superadmin/structure/institutes/{item_id}")
-async def update_institute(
+def update_institute(
     item_id: str, data: InstituteSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2249,7 +2256,7 @@ async def update_institute(
     return {"id": obj.id, "name": obj.name, "full_name": obj.full_name}
 
 @app.delete("/api/superadmin/structure/institutes/{item_id}")
-async def delete_institute(
+def delete_institute(
     item_id: str, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2263,7 +2270,7 @@ async def delete_institute(
 
 # ── КАФЕДРИ ──────────────────────────────────────────────
 @app.get("/api/structure/departments")
-async def get_departments(
+def get_departments(
     institute_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2274,7 +2281,7 @@ async def get_departments(
     return [{"id": d.id, "institute_id": d.institute_id, "name": d.name, "full_name": d.full_name} for d in items]
 
 @app.post("/api/superadmin/structure/departments")
-async def create_department(
+def create_department(
     data: DepartmentSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2290,7 +2297,7 @@ async def create_department(
     return {"id": new_id, "institute_id": obj.institute_id, "name": obj.name, "full_name": obj.full_name}
 
 @app.put("/api/superadmin/structure/departments/{item_id}")
-async def update_department(
+def update_department(
     item_id: str, data: DepartmentSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2305,7 +2312,7 @@ async def update_department(
     return {"id": obj.id, "institute_id": obj.institute_id, "name": obj.name, "full_name": obj.full_name}
 
 @app.delete("/api/superadmin/structure/departments/{item_id}")
-async def delete_department(
+def delete_department(
     item_id: str, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2319,7 +2326,7 @@ async def delete_department(
 
 # ── ОПП ──────────────────────────────────────────────────
 @app.get("/api/structure/opps")
-async def get_opps(
+def get_opps(
     department_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2330,7 +2337,7 @@ async def get_opps(
     return [{"id": o.id, "department_id": o.department_id, "name": o.name, "level": o.level, "full_name": o.full_name} for o in items]
 
 @app.post("/api/superadmin/structure/opps")
-async def create_opp(
+def create_opp(
     data: OppSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2346,7 +2353,7 @@ async def create_opp(
     return {"id": new_id, "department_id": obj.department_id, "name": obj.name, "level": obj.level, "full_name": obj.full_name}
 
 @app.put("/api/superadmin/structure/opps/{item_id}")
-async def update_opp(
+def update_opp(
     item_id: str, data: OppSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2362,7 +2369,7 @@ async def update_opp(
     return {"id": obj.id, "department_id": obj.department_id, "name": obj.name, "level": obj.level, "full_name": obj.full_name}
 
 @app.delete("/api/superadmin/structure/opps/{item_id}")
-async def delete_opp(
+def delete_opp(
     item_id: str, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2376,7 +2383,7 @@ async def delete_opp(
 
 # ── НАВЧАЛЬНІ ПЛАНИ ─────────────────────────────────────
 @app.get("/api/structure/study-plans")
-async def get_study_plans(
+def get_study_plans(
     opp_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2387,7 +2394,7 @@ async def get_study_plans(
     return [{"id": p.id, "opp_id": p.opp_id, "name": p.name} for p in items]
 
 @app.post("/api/superadmin/structure/study-plans")
-async def create_study_plan(
+def create_study_plan(
     data: StudyPlanSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2403,7 +2410,7 @@ async def create_study_plan(
     return {"id": new_id, "opp_id": obj.opp_id, "name": obj.name}
 
 @app.put("/api/superadmin/structure/study-plans/{item_id}")
-async def update_study_plan(
+def update_study_plan(
     item_id: str, data: StudyPlanSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2417,7 +2424,7 @@ async def update_study_plan(
     return {"id": obj.id, "opp_id": obj.opp_id, "name": obj.name}
 
 @app.delete("/api/superadmin/structure/study-plans/{item_id}")
-async def delete_study_plan(
+def delete_study_plan(
     item_id: str, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2431,7 +2438,7 @@ async def delete_study_plan(
 
 # ── ГРУПИ ────────────────────────────────────────────────
 @app.get("/api/structure/groups")
-async def get_academic_groups(
+def get_academic_groups(
     study_plan_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2442,7 +2449,7 @@ async def get_academic_groups(
     return [{"id": g.id, "study_plan_id": g.study_plan_id, "name": g.name, "level": g.level} for g in items]
 
 @app.post("/api/superadmin/structure/groups")
-async def create_academic_group(
+def create_academic_group(
     data: AcademicGroupSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2459,7 +2466,7 @@ async def create_academic_group(
     return {"id": new_id, "study_plan_id": obj.study_plan_id, "name": obj.name, "level": obj.level}
 
 @app.put("/api/superadmin/structure/groups/{item_id}")
-async def update_academic_group(
+def update_academic_group(
     item_id: str, data: AcademicGroupSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2474,7 +2481,7 @@ async def update_academic_group(
     return {"id": obj.id, "study_plan_id": obj.study_plan_id, "name": obj.name, "level": obj.level}
 
 @app.delete("/api/superadmin/structure/groups/{item_id}")
-async def delete_academic_group(
+def delete_academic_group(
     item_id: str, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2496,7 +2503,7 @@ UNASSIGNED_DEPT_SUFFIX = "__unassigned"
 UNASSIGNED_DEPT_NAME = "🗂 Без кафедри"
 
 @app.post("/api/superadmin/structure/import-groups")
-async def import_groups(
+def import_groups(
     request: Request, file: UploadFile = File(...),
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2506,7 +2513,7 @@ async def import_groups(
     Кафедра у файлі відсутня — нові ОПП тимчасово потрапляють у службову
     кафедру "Без кафедри" цього інституту, звідки ви самі перенесете їх у потрібну
     (просто відредагуйте ОПП і оберіть кафедру — так само, як завжди)."""
-    content = await file.read()
+    content = file.file.read()
     try:
         df = pd.read_excel(io.BytesIO(content))
     except Exception as e:
@@ -2602,7 +2609,7 @@ async def import_groups(
 
 # ── ПРЕДМЕТИ ─────────────────────────────────────────────
 @app.get("/api/structure/subjects")
-async def get_subjects(
+def get_subjects(
     opp_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2615,7 +2622,7 @@ async def get_subjects(
     return [_subject_to_dict(s) for s in items]
 
 @app.post("/api/superadmin/structure/subjects")
-async def create_subject(
+def create_subject(
     data: SubjectSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2641,7 +2648,7 @@ async def create_subject(
     return _subject_to_dict(obj)
 
 @app.put("/api/superadmin/structure/subjects/{item_id}")
-async def update_subject(
+def update_subject(
     item_id: int, data: SubjectSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2676,7 +2683,7 @@ async def update_subject(
     return _subject_to_dict(obj)
 
 @app.delete("/api/superadmin/structure/subjects/{item_id}")
-async def delete_subject(
+def delete_subject(
     item_id: int, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2690,7 +2697,7 @@ async def delete_subject(
 
 # ── ЧЕРНЕТКИ ПРЕДМЕТІВ (створені імпортом оцінок) ───────
 @app.get("/api/superadmin/structure/subjects/unverified")
-async def get_unverified_subjects(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+def get_unverified_subjects(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
     subs = db.query(DBSubject).filter(DBSubject.is_verified == False).order_by(DBSubject.name).all()
     ids = [x.id for x in subs]
     counts = {}
@@ -2703,7 +2710,7 @@ async def get_unverified_subjects(admin: dict = Depends(require_superadmin), db:
     return [{**_subject_to_dict(x), "opp_name": opp_names.get(x.opp_id), "grades_count": counts.get(x.id, 0)} for x in subs]
 
 @app.post("/api/superadmin/structure/subjects/{item_id}/verify")
-async def verify_subject(
+def verify_subject(
     item_id: int, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2721,7 +2728,7 @@ class SubjectMergeSchema(BaseModel):
     target_id: int
 
 @app.post("/api/superadmin/structure/subjects/{item_id}/merge")
-async def merge_subject_endpoint(
+def merge_subject_endpoint(
     item_id: int, data: SubjectMergeSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2736,7 +2743,7 @@ async def merge_subject_endpoint(
 
 # ── ГОДИНИ ПРЕДМЕТА В МЕЖАХ НАВЧАЛЬНОГО ПЛАНУ ───────────
 @app.get("/api/structure/plan-subject-hours")
-async def get_plan_subject_hours(
+def get_plan_subject_hours(
     study_plan_id: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -2747,7 +2754,7 @@ async def get_plan_subject_hours(
     return [_plan_subject_hours_to_dict(h) for h in items]
 
 @app.put("/api/superadmin/structure/plan-subject-hours")
-async def upsert_plan_subject_hours(
+def upsert_plan_subject_hours(
     data: PlanSubjectHoursSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2783,7 +2790,7 @@ async def upsert_plan_subject_hours(
     return _plan_subject_hours_to_dict(obj)
 
 @app.delete("/api/superadmin/structure/plan-subject-hours/{item_id}")
-async def delete_plan_subject_hours(
+def delete_plan_subject_hours(
     item_id: int, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2798,7 +2805,7 @@ async def delete_plan_subject_hours(
 
 # ── ВИКЛАДАЧІ ────────────────────────────────────────────
 @app.get("/api/structure/teachers")
-async def get_teachers(
+def get_teachers(
     department_id: str = Query(default=None),
     q: str = Query(default=None),
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
@@ -2812,7 +2819,7 @@ async def get_teachers(
     return [_teacher_to_dict(t) for t in items]
 
 @app.post("/api/superadmin/structure/teachers")
-async def create_teacher(
+def create_teacher(
     data: TeacherSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2828,7 +2835,7 @@ async def create_teacher(
     return _teacher_to_dict(obj)
 
 @app.put("/api/superadmin/structure/teachers/{item_id}")
-async def update_teacher(
+def update_teacher(
     item_id: str, data: TeacherSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2844,7 +2851,7 @@ async def update_teacher(
     return _teacher_to_dict(obj)
 
 @app.delete("/api/superadmin/structure/teachers/{item_id}")
-async def delete_teacher(
+def delete_teacher(
     item_id: str, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2864,7 +2871,7 @@ def _norm_dept_name(name: str) -> str:
     return n.lower()
 
 @app.post("/api/superadmin/structure/import-teachers")
-async def import_teachers(
+def import_teachers(
     request: Request, file: UploadFile = File(...),
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -2878,7 +2885,7 @@ async def import_teachers(
     Кафедра з файлу зіставляється з вашою Структурою за повною назвою; якщо збігу
     немає — викладач імпортується без кафедри, а назва потрапляє у список
     'незіставлених кафедр', щоб ви або перейменували, або створили потрібну."""
-    content = await file.read()
+    content = file.file.read()
     try:
         xls = pd.ExcelFile(io.BytesIO(content))
     except Exception as e:
@@ -2973,7 +2980,7 @@ async def import_teachers(
 
 # ── ВИБІР СТУДЕНТОМ ВИБІРКОВОГО ПРЕДМЕТУ ────────────────
 @app.get("/api/student/elective-choices")
-async def get_my_elective_choices(
+def get_my_elective_choices(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Повертає поточні вибори студента по всіх його навчальних планах"""
@@ -2986,7 +2993,7 @@ async def get_my_elective_choices(
     } for c in choices]
 
 @app.get("/api/student/elective-options/{study_plan_id}")
-async def get_elective_options(
+def get_elective_options(
     study_plan_id: str,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -3007,7 +3014,7 @@ async def get_elective_options(
     return slots
 
 @app.post("/api/student/elective-choices")
-async def set_elective_choice(
+def set_elective_choice(
     data: StudentSubjectChoiceSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -3037,7 +3044,7 @@ async def set_elective_choice(
 # 📊 АНАЛІТИКА ЦМЯО
 # =========================================================
 @app.get("/api/cmyo/responses/{survey_id}")
-async def get_survey_responses(
+def get_survey_responses(
     survey_id: str,
     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)
 ):
@@ -3088,7 +3095,7 @@ def _resolve_response_opp(db_session, template, user: dict, opp_ctx_raw):
     return names[0] if len(names) == 1 else None
 
 @app.post("/api/responses")
-async def save_student_response(
+def save_student_response(
     response: StudentResponseSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -3154,7 +3161,7 @@ async def save_student_response(
 # =========================================================
 
 @app.get("/api/student/feathers")
-async def get_feathers_info(
+def get_feathers_info(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Повертає баланс, транзакції та активну тему студента"""
@@ -3190,14 +3197,14 @@ async def get_feathers_info(
     }
 
 @app.get("/api/themes/catalog")
-async def get_themes_catalog(user: dict = Depends(get_current_user)):
+def get_themes_catalog(user: dict = Depends(get_current_user)):
     """Каталог доступних тем"""
     if user.get("role") != "student":
         raise HTTPException(status_code=403, detail="Тільки для студентів")
     return THEMES_CATALOG
 
 @app.post("/api/student/feathers/buy-theme")
-async def buy_theme(
+def buy_theme(
     purchase: ThemePurchaseSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -3235,7 +3242,7 @@ async def buy_theme(
     return {"message": f"Тему «{theme['name']}» успішно придбано! 🎉", "new_balance": wallet.balance}
 
 @app.post("/api/student/feathers/set-theme")
-async def set_active_theme(
+def set_active_theme(
     data: ActiveThemeSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -3281,7 +3288,7 @@ def _consent_status(rec) -> str:
     return "confirmed"
 
 @app.get("/api/me/consent")
-async def get_my_consent(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_my_consent(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     applicable = user.get("role") in CONSENT_ROLES
     rec = db.query(DBUserConsent).filter(DBUserConsent.user_id == user["user_id"]).first()
     status = _consent_status(rec)
@@ -3295,7 +3302,7 @@ async def get_my_consent(user: dict = Depends(get_current_user), db: Session = D
     }
 
 @app.post("/api/me/consent")
-async def accept_my_consent(
+def accept_my_consent(
     data: ConsentAcceptSchema, request: Request,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -3318,7 +3325,7 @@ async def accept_my_consent(
     return {"message": "Дякуємо!"}
 
 @app.get("/api/superadmin/consents")
-async def list_consents(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+def list_consents(admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
     users = db.query(DBUser).filter(DBUser.role.in_(CONSENT_ROLES)).order_by(DBUser.full_name).all()
     recs = {r.user_id: r for r in db.query(DBUserConsent).all()}
     items = []
@@ -3333,7 +3340,7 @@ async def list_consents(admin: dict = Depends(require_superadmin), db: Session =
     return {"version": CONSENT_VERSION, "items": items}
 
 @app.post("/api/superadmin/consents/reset")
-async def reset_consents(
+def reset_consents(
     data: ConsentResetSchema, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -3452,12 +3459,12 @@ def _apply_service_note(db_session, obj, data: "ServiceNoteSchema"):
     obj.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
 
 @app.get("/api/service-notes")
-async def list_service_notes(user: dict = Depends(require_notes_reader), db: Session = Depends(get_db)):
+def list_service_notes(user: dict = Depends(require_notes_reader), db: Session = Depends(get_db)):
     items = db.query(DBServiceNote).order_by(DBServiceNote.date_from.desc(), DBServiceNote.id.desc()).all()
     return {"reasons": SERVICE_NOTE_REASONS, "items": [_note_to_dict(n) for n in items]}
 
 @app.post("/api/service-notes")
-async def create_service_note(
+def create_service_note(
     data: ServiceNoteSchema, request: Request,
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3471,7 +3478,7 @@ async def create_service_note(
     return _note_to_dict(obj)
 
 @app.put("/api/service-notes/{note_id}")
-async def update_service_note(
+def update_service_note(
     note_id: int, data: ServiceNoteSchema, request: Request,
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3486,7 +3493,7 @@ async def update_service_note(
     return _note_to_dict(obj)
 
 @app.delete("/api/service-notes/{note_id}")
-async def delete_service_note(
+def delete_service_note(
     note_id: int, request: Request,
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3500,7 +3507,7 @@ async def delete_service_note(
     return {"message": "Видалено"}
 
 @app.post("/api/service-notes/{note_id}/file")
-async def upload_service_note_file(
+def upload_service_note_file(
     note_id: int, request: Request, file: UploadFile = File(...),
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3510,7 +3517,7 @@ async def upload_service_note_file(
     name = os.path.basename(file.filename or "")
     if not name.lower().endswith(SERVICE_NOTE_EXT):
         raise HTTPException(status_code=400, detail="Дозволені файли: PDF, DOC, DOCX")
-    content = await file.read()
+    content = file.file.read()
     if len(content) > SERVICE_NOTE_MAX_FILE:
         raise HTTPException(status_code=413, detail="Файл завеликий (максимум 5 МБ)")
     if not content:
@@ -3525,7 +3532,7 @@ async def upload_service_note_file(
     return _note_to_dict(obj)
 
 @app.get("/api/service-notes/{note_id}/file")
-async def download_service_note_file(
+def download_service_note_file(
     note_id: int, user: dict = Depends(require_notes_reader), db: Session = Depends(get_db)
 ):
     obj = db.query(DBServiceNote).filter(DBServiceNote.id == note_id).first()
@@ -3538,7 +3545,7 @@ async def download_service_note_file(
     )
 
 @app.delete("/api/service-notes/{note_id}/file")
-async def delete_service_note_file(
+def delete_service_note_file(
     note_id: int, request: Request,
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3610,7 +3617,7 @@ def _norm_reason(text):
     return t[:100]
 
 @app.post("/api/service-notes/import")
-async def import_service_notes(
+def import_service_notes(
     request: Request, file: UploadFile = File(...), dry_run: bool = Query(default=True),
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3618,7 +3625,7 @@ async def import_service_notes(
     Очікувані колонки (за заголовком): НПП/ПП, Дата…, Службові записки, Причина, Змінено в розкладі?,
     Примітки, Посилання на файл. Рядки-заголовки років («2027 н.р.») пропускаються."""
     name = (file.filename or "").lower()
-    content = await file.read()
+    content = file.file.read()
     try:
         if name.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(content), header=None, dtype=object)
@@ -3706,7 +3713,7 @@ async def import_service_notes(
     return {"dry_run": dry_run, "preview": preview, **stats}
 
 @app.post("/api/service-notes/{note_id}/notify")
-async def notify_service_note(
+def notify_service_note(
     note_id: int, data: ServiceNoteNotifySchema, request: Request,
     user: dict = Depends(require_notes_editor), db: Session = Depends(get_db)
 ):
@@ -3741,7 +3748,7 @@ async def notify_service_note(
 # 📢 ОГОЛОШЕННЯ
 # =========================================================
 @app.post("/api/announcements")
-async def create_announcement(
+def create_announcement(
     ann: AnnouncementCreateSchema, request: Request,
     user: dict = Depends(require_announcement_admin), db: Session = Depends(get_db)
 ):
@@ -3760,7 +3767,7 @@ async def create_announcement(
     return {"message": "Оголошення опубліковано!"}
 
 @app.get("/api/announcements")
-async def get_announcements(
+def get_announcements(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     anns = db.query(DBAnnouncement).order_by(DBAnnouncement.id.desc()).all()
@@ -3783,7 +3790,7 @@ async def get_announcements(
     return [a for a in anns if not a.target_groups or (set(a.target_groups) & my_groups)]
 
 @app.put("/api/announcements/{ann_id}")
-async def update_announcement(
+def update_announcement(
     ann_id: int, ann: AnnouncementCreateSchema, request: Request,
     user: dict = Depends(require_announcement_admin), db: Session = Depends(get_db)
 ):
@@ -3806,7 +3813,7 @@ async def update_announcement(
     return {"message": "Оголошення оновлено"}
 
 @app.delete("/api/announcements/{ann_id}")
-async def delete_announcement(
+def delete_announcement(
     ann_id: int, request: Request,
     user: dict = Depends(require_announcement_admin), db: Session = Depends(get_db)
 ):
@@ -3829,7 +3836,7 @@ async def delete_announcement(
 # 📄 ФАЙЛИ (ОПП)
 # =========================================================
 @app.post("/api/upload-opp")
-async def upload_opp(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+def upload_opp(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     if user.get("role") not in ["superadmin", "admin_cmyo"]:
         raise HTTPException(status_code=403, detail="Доступ заборонено")
     os.makedirs("static/uploads", exist_ok=True)
@@ -3838,14 +3845,14 @@ async def upload_opp(file: UploadFile = File(...), user: dict = Depends(get_curr
     return {"message": "ОПП успішно завантажено!"}
 
 @app.get("/api/opp/download")
-async def download_opp(user: dict = Depends(get_current_user)):
+def download_opp(user: dict = Depends(get_current_user)):
     file_path = "static/uploads/current_opp.pdf"
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type="application/pdf", filename="OPP.pdf")
     raise HTTPException(status_code=404, detail="Файл не знайдено")
 
 @app.get("/api/opp")
-async def get_opp(user: dict = Depends(get_current_user)):
+def get_opp(user: dict = Depends(get_current_user)):
     if os.path.exists("static/uploads/current_opp.pdf"):
         return {"url": f"/api/opp/download?t={int(time.time())}"}
     return {"url": None}
@@ -3862,7 +3869,7 @@ DEFAULT_DICTS = {
 }
 
 @app.get("/api/dictionaries")
-async def get_dictionaries(
+def get_dictionaries(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     dict_record = db.query(DBDictionary).first()
@@ -3874,7 +3881,7 @@ async def get_dictionaries(
     return dict_record.data
 
 @app.put("/api/dictionaries")
-async def update_dictionaries(
+def update_dictionaries(
     new_data: dict,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -3892,7 +3899,7 @@ async def update_dictionaries(
 DEFAULT_BOARD_STATE = {"folders": [], "survey_folders": {}}
 
 @app.get("/api/cmyo/board")
-async def get_board_state(
+def get_board_state(
     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)
 ):
     record = db.query(DBBoardState).first()
@@ -3901,7 +3908,7 @@ async def get_board_state(
     return record.state
 
 @app.put("/api/cmyo/board")
-async def save_board_state(
+def save_board_state(
     state: dict,
     user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)
 ):
@@ -3960,7 +3967,7 @@ def _lesson_backfill_teacher_links(db, teachers):
         db.commit()
 
 @app.get("/api/cmyo/lessons")
-async def list_lesson_checks(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def list_lesson_checks(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     subjects = db.query(DBLessonSubject).order_by(DBLessonSubject.name).all()
     groups = db.query(DBLessonGroup).order_by(DBLessonGroup.name).all()
     teachers = db.query(DBLessonTeacher).order_by(DBLessonTeacher.name).all()
@@ -4009,17 +4016,17 @@ def _lesson_catalog_rename(db, model, item_id: int, name: str, label: str):
     return obj
 
 @app.post("/api/cmyo/lessons/subjects")
-async def create_lesson_subject(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def create_lesson_subject(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     o = _lesson_catalog_create(db, DBLessonSubject, data.name, "назву предмета")
     return {"id": o.id, "name": o.name}
 
 @app.put("/api/cmyo/lessons/subjects/{item_id}")
-async def rename_lesson_subject(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def rename_lesson_subject(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     o = _lesson_catalog_rename(db, DBLessonSubject, item_id, data.name, "назву предмета")
     return {"id": o.id, "name": o.name}
 
 @app.delete("/api/cmyo/lessons/subjects/{item_id}")
-async def delete_lesson_subject(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def delete_lesson_subject(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonSubject).filter(DBLessonSubject.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
@@ -4031,17 +4038,17 @@ async def delete_lesson_subject(item_id: int, user: dict = Depends(require_cmyo_
     return {"message": "Видалено"}
 
 @app.post("/api/cmyo/lessons/groups")
-async def create_lesson_group(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def create_lesson_group(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     o = _lesson_catalog_create(db, DBLessonGroup, data.name, "назву групи")
     return {"id": o.id, "name": o.name}
 
 @app.put("/api/cmyo/lessons/groups/{item_id}")
-async def rename_lesson_group(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def rename_lesson_group(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     o = _lesson_catalog_rename(db, DBLessonGroup, item_id, data.name, "назву групи")
     return {"id": o.id, "name": o.name}
 
 @app.delete("/api/cmyo/lessons/groups/{item_id}")
-async def delete_lesson_group(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def delete_lesson_group(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonGroup).filter(DBLessonGroup.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
@@ -4054,12 +4061,12 @@ async def delete_lesson_group(item_id: int, user: dict = Depends(require_cmyo_ad
 
 # ── Викладачі ────────────────────────────────────────────
 @app.post("/api/cmyo/lessons/teachers")
-async def create_lesson_teacher(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def create_lesson_teacher(data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     o = _lesson_catalog_create(db, DBLessonTeacher, data.name, "ПІБ викладача")
     return {"id": o.id, "name": o.name}
 
 @app.put("/api/cmyo/lessons/teachers/{item_id}")
-async def rename_lesson_teacher(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def rename_lesson_teacher(item_id: int, data: LessonNameSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     o = _lesson_catalog_rename(db, DBLessonTeacher, item_id, data.name, "ПІБ викладача")
     # у вже збережених рядках оновлюємо ПІБ, щоб назви не розходились
     db.query(DBLessonCheck).filter(DBLessonCheck.lesson_teacher_id == item_id).update({"teacher_name": o.name})
@@ -4067,7 +4074,7 @@ async def rename_lesson_teacher(item_id: int, data: LessonNameSchema, user: dict
     return {"id": o.id, "name": o.name}
 
 @app.delete("/api/cmyo/lessons/teachers/{item_id}")
-async def delete_lesson_teacher(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def delete_lesson_teacher(item_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
@@ -4132,10 +4139,10 @@ def _parse_npp_departments(content: bytes):
     return people
 
 @app.post("/api/cmyo/lessons/teachers/departments/import")
-async def import_lesson_teacher_departments(file: UploadFile = File(...), user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def import_lesson_teacher_departments(file: UploadFile = File(...), user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     """Проставляє кафедри викладачам зі списку lesson_teachers за збігом «прізвище + ініціали».
     Нових викладачів не створює. Кого не знайдено / неоднозначних — повертає у звіті (їх заповнюють вручну)."""
-    content = await file.read()
+    content = file.file.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Файл завеликий (максимум 5 МБ)")
     people = _parse_npp_departments(content)
@@ -4185,7 +4192,7 @@ class LessonTeacherDeptSchema(BaseModel):
     department: Optional[str] = None
 
 @app.put("/api/cmyo/lessons/teachers/{item_id}/department")
-async def set_lesson_teacher_department(item_id: int, data: LessonTeacherDeptSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def set_lesson_teacher_department(item_id: int, data: LessonTeacherDeptSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
@@ -4205,7 +4212,7 @@ class LessonTeacherNoteSchema(BaseModel):
     note: Optional[str] = None
 
 @app.put("/api/cmyo/lessons/teachers/{item_id}/note")
-async def set_lesson_teacher_note(item_id: int, data: LessonTeacherNoteSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def set_lesson_teacher_note(item_id: int, data: LessonTeacherNoteSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonTeacher).filter(DBLessonTeacher.id == item_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Не знайдено")
@@ -4218,7 +4225,7 @@ async def set_lesson_teacher_note(item_id: int, data: LessonTeacherNoteSchema, u
     return {"id": obj.id, "note": obj.note, "note_at": obj.note_at}
 
 @app.get("/api/cmyo/lessons/teachers/export")
-async def export_lesson_teacher_notes(contains: Optional[str] = Query(default=None), only_notes: bool = Query(default=True),
+def export_lesson_teacher_notes(contains: Optional[str] = Query(default=None), only_notes: bool = Query(default=True),
                                       user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     """Таблиця Excel: викладачі, у яких щось написано в примітці (опційно — лише ті, де примітка містить фрагмент тексту)."""
     import openpyxl
@@ -4331,24 +4338,24 @@ def _lesson_names_from_file(content: bytes, filename: str):
     return [str(r[col]) for r in rows[start:] if len(r) > col]
 
 @app.post("/api/cmyo/lessons/{kind}/bulk")
-async def bulk_lesson_catalog(kind: str, data: LessonBulkSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def bulk_lesson_catalog(kind: str, data: LessonBulkSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     model = LESSON_CATALOGS.get(kind)
     if not model:
         raise HTTPException(status_code=404, detail="Невідомий список")
     return _lesson_catalog_bulk(db, model, data.names)
 
 @app.post("/api/cmyo/lessons/{kind}/import")
-async def import_lesson_catalog(kind: str, file: UploadFile = File(...), user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def import_lesson_catalog(kind: str, file: UploadFile = File(...), user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     model = LESSON_CATALOGS.get(kind)
     if not model:
         raise HTTPException(status_code=404, detail="Невідомий список")
-    content = await file.read()
+    content = file.file.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Файл завеликий (максимум 5 МБ)")
     return _lesson_catalog_bulk(db, model, _lesson_names_from_file(content, file.filename))
 
 @app.get("/api/cmyo/lessons/{kind}")
-async def list_lesson_catalog(kind: str, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def list_lesson_catalog(kind: str, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     model = LESSON_CATALOGS.get(kind)
     if not model:
         raise HTTPException(status_code=404, detail="Невідомий список")
@@ -4407,7 +4414,7 @@ def _lesson_check_response(db, obj):
     return _lesson_check_to_dict(obj, subj_map, grp_map)
 
 @app.post("/api/cmyo/lessons")
-async def create_lesson_check(data: LessonCheckSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def create_lesson_check(data: LessonCheckSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = DBLessonCheck(created_by=user.get("sub"))
     _apply_lesson_check(db, obj, data)
     db.add(obj)
@@ -4416,7 +4423,7 @@ async def create_lesson_check(data: LessonCheckSchema, user: dict = Depends(requ
     return _lesson_check_response(db, obj)
 
 @app.put("/api/cmyo/lessons/{check_id}")
-async def update_lesson_check(check_id: int, data: LessonCheckSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def update_lesson_check(check_id: int, data: LessonCheckSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonCheck).filter(DBLessonCheck.id == check_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Запис не знайдено")
@@ -4426,7 +4433,7 @@ async def update_lesson_check(check_id: int, data: LessonCheckSchema, user: dict
     return _lesson_check_response(db, obj)
 
 @app.delete("/api/cmyo/lessons/{check_id}")
-async def delete_lesson_check(check_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def delete_lesson_check(check_id: int, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     obj = db.query(DBLessonCheck).filter(DBLessonCheck.id == check_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Запис не знайдено")
@@ -5070,24 +5077,24 @@ def _zm_process_report(db, content: bytes, filename: str, user_sub, dry_run: boo
 
 # ── Ендпоїнти завантаження ──────────────────────────────────────
 @app.post("/api/cmyo/schedule/upload")
-async def upload_schedule_archive(file: UploadFile = File(...), dry_run: bool = Query(default=True),
+def upload_schedule_archive(file: UploadFile = File(...), dry_run: bool = Query(default=True),
                                   user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    content = await file.read()
+    content = file.file.read()
     if len(content) > SCHED_MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="Файл завеликий")
     return _sched_process_archive(db, content, file.filename or "", user.get("sub"), dry_run)
 
 @app.post("/api/cmyo/schedule/zoom/upload")
-async def upload_zoom_report(file: UploadFile = File(...), dry_run: bool = Query(default=True),
+def upload_zoom_report(file: UploadFile = File(...), dry_run: bool = Query(default=True),
                              data_until: Optional[str] = Query(default=None),
                              user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
-    content = await file.read()
+    content = file.file.read()
     if len(content) > ZOOM_MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="Файл завеликий")
     return _zm_process_report(db, content, file.filename or "", user.get("sub"), dry_run, data_until)
 
 @app.get("/api/cmyo/schedule/batches")
-async def list_schedule_batches(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def list_schedule_batches(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     rows = db.query(DBLessonSchedBatch).order_by(DBLessonSchedBatch.id.desc()).limit(20).all()
     return [{"id": b.id, "kind": b.kind, "filename": b.filename, "created_at": _sched_fmt_label(b.created_at),
              "created_by": b.created_by, "stats": b.stats or {}} for b in rows]
@@ -5540,7 +5547,7 @@ def _alerts_worker_ensure():
             pass
 
 @app.on_event("startup")
-async def _alerts_worker_startup():
+def _alerts_worker_startup():
     _alerts_worker_ensure()
 
 def _alerts_progress(db, cfg, now: datetime) -> dict:
@@ -5673,7 +5680,7 @@ def _alerts_err_http(e: AlertsApiError):
                          detail=str(e) + (f". Спробуйте за {int(e.retry_after) + 1} с" if e.retry_after is not None else ""))
 
 @app.get("/api/cmyo/schedule/alerts/config")
-async def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def get_alerts_config(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     cfg = _alerts_default_config(db)
     source = (cfg.source if cfg and cfg.source in ALERT_PROVIDERS else "ukrainealarm")
     saved = (cfg.regions if cfg and cfg.regions else [])
@@ -5730,7 +5737,7 @@ async def scan_alerts_locations(uid: str = Query(..., min_length=1, max_length=1
     return res
 
 @app.put("/api/cmyo/schedule/alerts/config")
-async def put_alerts_config(data: AlertConfigSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def put_alerts_config(data: AlertConfigSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     if data.source not in ALERT_PROVIDERS:
         raise HTTPException(status_code=400, detail="Невідоме джерело тривог")
     if not data.regions:
@@ -5797,7 +5804,7 @@ class AlertsRefreshSchema(BaseModel):
     date_to: Optional[str] = None
 
 @app.post("/api/cmyo/schedule/alerts/refresh")
-async def refresh_alerts(data: AlertsRefreshSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def refresh_alerts(data: AlertsRefreshSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     """Перезавантажує свіжі дані. Збережена історія минулих днів не змінюється, тому для ukrainealarm скидаємо лише вчора й сьогодні
     (щоб не витрачати ліміт API на те, що вже є); для alerts.in.ua — місячну історію."""
     d_from = _parse_iso_date(data.date_from, "Від")
@@ -5816,7 +5823,7 @@ async def refresh_alerts(data: AlertsRefreshSchema, user: dict = Depends(require
 
 # ── Історія тривог для вкладки «Тривоги» ─────────────────────────
 @app.get("/api/cmyo/schedule/alerts/history")
-async def alerts_history(date_from: Optional[str] = None, date_to: Optional[str] = None,
+def alerts_history(date_from: Optional[str] = None, date_to: Optional[str] = None,
                          user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     """Усі збережені тривоги за період по днях (за київським часом): тривалість, перетин зі слотами пар, повнота даних."""
     cfg = _alerts_default_config(db)
@@ -6184,7 +6191,7 @@ def _zoom_worker_ensure():
             pass
 
 @app.on_event("startup")
-async def _zoom_worker_startup():
+def _zoom_worker_startup():
     _zoom_worker_ensure()
 
 # ── Вебхуки Zoom ───────────────────────────────────────────────
@@ -6274,7 +6281,7 @@ def _zoom_public_url(request: Request) -> str:
     return base + "/api/zoom/webhook"
 
 @app.get("/api/cmyo/zoom/status")
-async def zoom_status(request: Request, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def zoom_status(request: Request, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     st = _zoom_state(db)
     _zoom_worker_ensure()
     acc, cid, sec = _zoom_creds()
@@ -6345,7 +6352,7 @@ class ZoomSettingsSchema(BaseModel):
     history_from: str
 
 @app.put("/api/cmyo/zoom/settings")
-async def zoom_settings(data: ZoomSettingsSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def zoom_settings(data: ZoomSettingsSchema, user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     try:
         v = datetime.strptime(data.history_from.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
     except ValueError:
@@ -6392,7 +6399,7 @@ def _zoom_live(db, st) -> list:
     return out
 
 @app.get("/api/cmyo/zoom/meetings")
-async def zoom_meetings(date_from: str, date_to: Optional[str] = None, q: Optional[str] = None, only: Optional[str] = None,
+def zoom_meetings(date_from: str, date_to: Optional[str] = None, q: Optional[str] = None, only: Optional[str] = None,
                         user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     """Минулі конференції за період: хто провів, коли, скільки, скільки учасників і до якої пари за розкладом це належить."""
     d_from = _parse_iso_date(date_from, "Від")
@@ -7169,8 +7176,20 @@ async def export_no_data_teachers(date_from: str, date_to: Optional[str] = None,
 # Уся логіка в окремому модулі survey_reports.py (потрібні: pandas, openpyxl, python-docx, matplotlib).
 # =========================================================
 from fastapi import Form as _SrForm
-SURVEY_REPORT_MAX_MB = 25
+SURVEY_REPORT_MAX_MB = int(os.environ.get("SURVEY_REPORT_MAX_MB", "10"))   # на 512 МБ RAM файл 25 МБ роздувається у pandas до сотень МБ
 SURVEY_REPORT_MAX_GROUPS = 80
+
+# На Render Free лише 512 МБ RAM: важкі довідки виконуємо по одній, а після — чистимо пам'ять.
+_REPORT_SLOT = threading.BoundedSemaphore(1)
+
+def _sr_run(fn, *args):
+    if not _REPORT_SLOT.acquire(timeout=3):
+        raise HTTPException(status_code=503, detail="Зараз уже формується інша довідка. Зачекайте хвилину і повторіть.")
+    try:
+        return fn(*args)
+    finally:
+        _REPORT_SLOT.release()
+        gc.collect()
 
 def _sr_module():
     try:
@@ -7179,8 +7198,8 @@ def _sr_module():
     except ImportError as e:
         raise HTTPException(status_code=501, detail=f"Для довідок бракує бібліотеки ({e.name}). Встановіть: pip install matplotlib python-docx openpyxl")
 
-async def _sr_read(file: UploadFile, options: str):
-    data = await file.read()
+def _sr_read(file: UploadFile, options: str):
+    data = file.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Файл порожній")
     if len(data) > SURVEY_REPORT_MAX_MB * 1024 * 1024:
@@ -7192,28 +7211,28 @@ async def _sr_read(file: UploadFile, options: str):
     return data, (opts if isinstance(opts, dict) else {})
 
 @app.post("/api/cmyo/survey-reports/preview")
-async def survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
+def survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
                                  user: dict = Depends(require_cmyo_admin)):
     """Розбір файлу: які колонки — рівень/спеціальність/дата, типи питань, групи (рівень × спеціальність) і кількість відповідей."""
     sr = _sr_module()
-    data, opts = await _sr_read(file, options)
+    data, opts = _sr_read(file, options)
     try:
-        return await run_in_threadpool(sr.analyze, data, file.filename or "", opts)
+        return _sr_run(sr.analyze, data, file.filename or "", opts)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
 
 @app.post("/api/cmyo/survey-reports/generate")
-async def survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
+def survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
                                   user: dict = Depends(require_cmyo_admin)):
     """Одна група → .docx, кілька → .zip з .docx на кожну групу."""
     sr = _sr_module()
-    data, opts = await _sr_read(file, options)
+    data, opts = _sr_read(file, options)
     if len(opts.get("groups") or []) > SURVEY_REPORT_MAX_GROUPS:
         raise HTTPException(status_code=400, detail=f"Забагато груп за раз (максимум {SURVEY_REPORT_MAX_GROUPS})")
     try:
-        fname, body, mime = await run_in_threadpool(sr.generate, data, file.filename or "", opts)
+        fname, body, mime = _sr_run(sr.generate, data, file.filename or "", opts)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -7231,26 +7250,26 @@ def _sr_csk_module():
         raise HTTPException(status_code=501, detail=f"Для довідок ЦСК бракує бібліотеки ({e.name}). Встановіть: pip install matplotlib python-docx openpyxl requests")
 
 @app.post("/api/csk/survey-reports/preview")
-async def csk_survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
+def csk_survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
                                      user: dict = Depends(require_csk_admin)):
     """Розбір файлу: колонка підрозділу/дати, типи питань, підрозділи з кількістю відповідей, період."""
     sr = _sr_csk_module()
-    data, opts = await _sr_read(file, options)
+    data, opts = _sr_read(file, options)
     try:
-        return await run_in_threadpool(sr.analyze_csk, data, file.filename or "", opts)
+        return _sr_run(sr.analyze_csk, data, file.filename or "", opts)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
 
 @app.post("/api/csk/survey-reports/generate")
-async def csk_survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
+def csk_survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
                                       user: dict = Depends(require_csk_admin)):
     """Одна аналітична довідка .docx на весь файл. Текст аналізу, висновків і рекомендацій пише AI (якщо options.ai != false)."""
     sr = _sr_csk_module()
-    data, opts = await _sr_read(file, options)
+    data, opts = _sr_read(file, options)
     try:
-        fname, body, mime = await run_in_threadpool(sr.generate_csk, data, file.filename or "", opts)
+        fname, body, mime = _sr_run(sr.generate_csk, data, file.filename or "", opts)
     except ValueError as e:                      # у т.ч. AIError — повідомлення зрозуміле користувачеві
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -7264,7 +7283,7 @@ class ZoomAccountLinkSchema(BaseModel):
     ignore: bool = False
 
 @app.get("/api/cmyo/schedule/zoom-accounts")
-async def list_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def list_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     teachers = db.query(DBLessonTeacher).order_by(DBLessonTeacher.name).all()
     tname = {t.id: t.name for t in teachers}
     index = _zm_teacher_index(teachers)
@@ -7287,7 +7306,7 @@ async def list_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Sessi
             "teachers_without_account": sorted(without, key=lambda x: x["name"])}
 
 @app.put("/api/cmyo/schedule/zoom-accounts/{account_id}")
-async def link_zoom_account(account_id: int, data: ZoomAccountLinkSchema,
+def link_zoom_account(account_id: int, data: ZoomAccountLinkSchema,
                             user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     a = db.query(DBLessonZoomAccount).filter(DBLessonZoomAccount.id == account_id).first()
     if not a:
@@ -7304,7 +7323,7 @@ async def link_zoom_account(account_id: int, data: ZoomAccountLinkSchema,
     return {"id": a.id, "teacher_id": a.lesson_teacher_id, "status": a.link_status}
 
 @app.post("/api/cmyo/schedule/zoom-accounts/relink")
-async def relink_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
+def relink_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db)):
     """Повторно шукає викладачів для ще не прив'язаних акаунтів (наприклад, після поповнення списку викладачів)."""
     n = _zm_autolink(db, db.query(DBLessonZoomAccount).all(), db.query(DBLessonTeacher).all())
     db.commit()
@@ -7314,7 +7333,7 @@ async def relink_zoom_accounts(user: dict = Depends(require_cmyo_admin), db: Ses
 # 📝 ГЕНЕРАТОР ЗАЯВ ЦСК
 # =========================================================
 @app.get("/api/csk/generator/config")
-async def get_generator_config(user: dict = Depends(require_csk_admin)):
+def get_generator_config(user: dict = Depends(require_csk_admin)):
     try:
         with open('config/config.json', 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -7323,7 +7342,7 @@ async def get_generator_config(user: dict = Depends(require_csk_admin)):
         return {"application_reasons": {}}
 
 @app.get("/api/csk/generator/students")
-async def search_gen_students(
+def search_gen_students(
     q: str = "", db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)
 ):
     if not q: return []
@@ -7342,7 +7361,7 @@ async def search_gen_students(
     return res
 
 @app.get("/api/csk/generator/student/{composite_id}")
-async def get_gen_student_data(
+def get_gen_student_data(
     composite_id: str, db: Session = Depends(get_db), user: dict = Depends(require_csk_admin)
 ):
     parts = composite_id.split("_")
@@ -7388,7 +7407,7 @@ async def get_gen_student_data(
     }
 
 @app.post("/api/csk/generator/generate")
-async def generate_document(data: dict, user: dict = Depends(require_csk_admin)):
+def generate_document(data: dict, user: dict = Depends(require_csk_admin)):
     doc_type = data.get('doc_type')
     if doc_type == 'template_application_lost_doc_graduate':
         lost_doc = data.get('document', '')
@@ -7447,7 +7466,7 @@ async def generate_document(data: dict, user: dict = Depends(require_csk_admin))
 # 📄 ЗАМОВЛЕННЯ ДОВІДОК
 # =========================================================
 @app.post("/api/student/certificates")
-async def create_certificate_request(
+def create_certificate_request(
     req: CertRequestCreateSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
@@ -7459,7 +7478,7 @@ async def create_certificate_request(
     return {"message": "Заявку успішно створено!"}
 
 @app.get("/api/student/certificates")
-async def get_my_certificate_requests(
+def get_my_certificate_requests(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     return db.query(DBCertificateRequest).filter(
@@ -7467,7 +7486,7 @@ async def get_my_certificate_requests(
     ).order_by(DBCertificateRequest.id.desc()).all()
 
 @app.get("/api/csk/certificates")
-async def get_all_certificate_requests(
+def get_all_certificate_requests(
     admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
 ):
     requests = db.query(DBCertificateRequest).order_by(DBCertificateRequest.id.desc()).all()
@@ -7485,7 +7504,7 @@ async def get_all_certificate_requests(
     return result
 
 @app.put("/api/csk/certificates/{req_id}/status")
-async def update_certificate_status(
+def update_certificate_status(
     req_id: int, status_data: CertStatusUpdateSchema, request: Request,
     admin: dict = Depends(require_csk_admin), db: Session = Depends(get_db)
 ):
@@ -7505,7 +7524,7 @@ async def update_certificate_status(
     return {"message": "Статус оновлено!"}
 
 @app.delete("/api/superadmin/certificates/{req_id}")
-async def delete_certificate_request(
+def delete_certificate_request(
     req_id: int, request: Request,
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
 ):
@@ -7521,7 +7540,7 @@ async def delete_certificate_request(
     return {"message": "Заявку видалено"}
 
 @app.get("/api/superadmin/audit")
-async def get_audit_logs(
+def get_audit_logs(
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db),
     limit: int = Query(default=50, le=200), offset: int = Query(default=0),
     action: str = Query(default=None), search: str = Query(default=None),
@@ -7544,7 +7563,7 @@ async def get_audit_logs(
     }
 
 @app.delete("/api/superadmin/audit")
-async def clear_audit_logs(
+def clear_audit_logs(
     admin: dict = Depends(require_superadmin), db: Session = Depends(get_db),
 ):
     deleted = db.query(DBAuditLog).delete()
@@ -7555,7 +7574,7 @@ async def clear_audit_logs(
 # 🏓 PING
 # =========================================================
 @app.get("/api/structure/tree")
-async def get_structure_tree(
+def get_structure_tree(
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """Повертає повне дерево: Інститут → Кафедра (+ викладачі) → ОПП (+ предмети: семестр/форма
@@ -7598,7 +7617,7 @@ async def get_structure_tree(
     return result
 
 @app.get("/api/ping")
-async def ping(db: Session = Depends(get_db)):
+def ping(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
         return {"status": "ok", "db": "awake"}
