@@ -1653,7 +1653,9 @@ def bulk_import_users(
     added, updated = 0, 0
     skipped = []
     for u in users_data:
-        existing = db.query(DBUser).filter(DBUser.email == u.get("email")).first()
+        # пошту порівнюємо без урахування регістру (так само, як це робить вхід через Google)
+        _email_key = (u.get("email") or "").strip().lower()
+        existing = db.query(DBUser).filter(func.lower(DBUser.email) == _email_key).first() if _email_key else None
         normalized_data = _normalize_student_data_groups(db, u.get("student_data"))
         if existing:
             existing.role = u.get("role", existing.role)
@@ -7874,9 +7876,10 @@ def _pr_parse_cohort(v, start_year, level):
     }
 
 
-def _pr_group_name(abbr: str, cohort: dict) -> str:
+def _pr_group_name(abbr: str, cohort: dict, form: str = "denne") -> str:
+    """Імовірна назва групи: абревіатура-рік[ск][м]; для заочної форми — з префіксом «З» (ЗПС-25м)."""
     suffix = ("ск" if cohort["is_short"] else "") + ("м" if cohort["is_master_mark"] else "")
-    return f"{abbr}-{cohort['yy']}{suffix}"
+    return ("З" if form == "zaochne" else "") + f"{abbr}-{cohort['yy']}{suffix}"
 
 
 def _pr_parse_sheet(ws, sheet_name: str, form: str, start_year, warnings: list):
@@ -8110,7 +8113,7 @@ def parse_education_schedule(content: bytes, filename: str = "") -> dict:
                     "course": co["course"], "is_short": co["is_short"], "is_mba": co["is_mba"],
                     "institute": spec["institute"], "program_code": spec["program"], "spec_number": spec["number"],
                     "spec_abbr": spec["abbr"], "spec_label": spec["label"], "subgroups": g["subgroups"],
-                    "group_name": _pr_group_name(spec["abbr"], co), "weeks": row["weeks"], "practice": periods,
+                    "group_name": _pr_group_name(spec["abbr"], co, sh["form"]), "weeks": row["weeks"], "practice": periods,
                     "src_row": row["row"], "src_col": g["col"],
                 })
     if not entries:
@@ -8124,25 +8127,34 @@ def parse_education_schedule(content: bytes, filename: str = "") -> dict:
 
 
 # ---------- ендпоїнти «Практика» ----------
-def _practice_known_group_names(db) -> set:
-    names = set()
+def _practice_known_group_keys(db) -> set:
+    keys = set()
     for model in (DBAcademicGroup, DBLessonGroup):
         try:
-            names |= {_norm(n) for (n,) in db.query(model.name).all() if n}
+            keys |= {_st_group_key(n) for (n,) in db.query(model.name).all() if n}
         except Exception:
             db.rollback()
-    return names
+    return keys
 
-def _practice_entry_to_dict(e, known: set) -> dict:
-    base = e.group_name or ""
+def _practice_entry_group_name(e) -> str:
+    m = _PR_COHORT_RE.match(e.cohort or "")
+    if not m or not e.spec_abbr:
+        return e.group_name or ""
+    suffix = ("ск" if m.group(2) else "") + ("м" if m.group(3) else "")
+    return ("З" if e.form == "zaochne" else "") + f"{e.spec_abbr}-{m.group(1)}{suffix}"
+
+def _practice_entry_to_dict(e, known: set, student_counts: dict) -> dict:
+    base = _practice_entry_group_name(e)
     variants = [base] + [f"{base}-{i}" for i in range(1, (e.subgroups or 1) + 1)]
+    keys = {_st_group_key(v) for v in variants}
     return {
         "id": e.id, "form": e.form, "level": e.level, "cohort": e.cohort, "entry_year": e.entry_year,
         "course": e.course, "is_short": e.is_short, "is_mba": e.is_mba, "institute": e.institute,
         "program_code": e.program_code, "spec_number": e.spec_number, "spec_abbr": e.spec_abbr,
-        "spec_label": e.spec_label, "subgroups": e.subgroups, "group_name": e.group_name,
+        "spec_label": e.spec_label, "subgroups": e.subgroups, "group_name": base,
         "weeks": e.weeks or [], "practice": e.practice or [], "src_row": e.src_row, "src_col": e.src_col,
-        "in_db": [v for v in variants if _norm(v) in known],
+        "in_db": [v for v in variants if _st_group_key(v) in known],
+        "students": sum(student_counts.get(k, 0) for k in keys),
     }
 
 def _practice_schedule_summary(db, sch) -> dict:
@@ -8198,12 +8210,13 @@ def get_practice_schedule(schedule_id: int, user: dict = Depends(require_cmyo_ad
     sch = db.query(DBPracticeSchedule).filter(DBPracticeSchedule.id == schedule_id).first()
     if not sch:
         raise HTTPException(status_code=404, detail="Графік не знайдено")
-    known = _practice_known_group_names(db)
+    known = _practice_known_group_keys(db)
+    student_counts = Counter(_st_group_key(r["group"]) for r in _practice_student_rows(db))
     rows = (db.query(DBPracticeEntry).filter(DBPracticeEntry.schedule_id == sch.id)
             .order_by(DBPracticeEntry.form, DBPracticeEntry.src_row, DBPracticeEntry.id).all())
     out = _practice_schedule_summary(db, sch)
     out.update({"weeks": sch.weeks or {}, "legend": sch.legend or {}, "warnings": sch.warnings or [],
-                "items": [_practice_entry_to_dict(r, known) for r in rows]})
+                "items": [_practice_entry_to_dict(r, known, student_counts) for r in rows]})
     return out
 
 @app.delete("/api/cmyo/practice/schedules/{schedule_id}")
@@ -8215,6 +8228,300 @@ def delete_practice_schedule(schedule_id: int, user: dict = Depends(require_cmyo
     db.delete(sch)
     db.commit()
     return {"ok": True}
+
+# ---------- «Практика»: студенти (список з Excel → кабінети без дублів) ----------
+from fastapi import Form as _PrForm
+import secrets as _pr_secrets
+
+_ST_HEADERS = [   # (ключ, ознаки заголовка після нормалізації: lower, лише літери/цифри)
+    ("surname", ("прізвищ",)), ("first", ("імя",)), ("patr", ("побатьков",)), ("group", ("група",)),
+    ("course", ("курс",)), ("specialty", ("спеціальн",)), ("level", ("рівен",)), ("form", ("форма",)),
+    ("funding", ("бюджет", "фінансув")), ("institute", ("структурн", "підрозділ")),
+    ("email", ("пошт", "mail")), ("status", ("статус",)),
+]
+_ST_LEAVE_WORDS = ("відпуст", "відрахов")
+_ST_UNUSABLE_HASH = None
+
+def _st_hnorm(s) -> str:
+    return re.sub(r"[^0-9a-zа-яіїєґ]", "", _pr_text(s).casefold())
+
+def _st_cell(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, datetime):
+        return ""
+    return _pr_text(v)
+
+def _st_group_key(name) -> str:
+    """Ключ групи для порівняння: регістр, латинські двійники, різні тире, пробіли."""
+    s = _clean(name).translate(_PR_LAT2CYR).casefold()
+    s = re.sub(r"[\u2010-\u2015\u2212]", "-", s)
+    return re.sub(r"\s+", "", s)
+
+def _st_header_map(row):
+    keys, taken = {}, set()
+    for idx, cell in enumerate(row):
+        h = _st_hnorm(cell)
+        if not h:
+            continue
+        for key, marks in _ST_HEADERS:
+            if key not in taken and any((m in h) if key == "email" else h.startswith(m) for m in marks):
+                keys[idx] = key
+                taken.add(key)
+                break
+    return keys
+
+def _st_rows_from_table(table):
+    """table = список рядків (списки значень). Знаходить рядок заголовків і повертає список dict."""
+    for hi, row in enumerate(table[:15]):
+        keys = _st_header_map(row)
+        vals = set(keys.values())
+        if "group" in vals and ("surname" in vals or "email" in vals):
+            out = []
+            for r in table[hi + 1:]:
+                d = {k: _st_cell(r[i]) if i < len(r) else "" for i, k in keys.items()}
+                if any(d.values()):
+                    out.append(d)
+            return out
+    raise HTTPException(status_code=400, detail="Не знайшов рядок заголовків. Потрібні принаймні колонки «Прізвище» (або пошта) та «Група», бажано також: Ім'я, По батькові, Курс, Спеціальність, Рівень, Форма, Бюджет, Структурний підрозділ, Корпоративна пошта, Статус.")
+
+def _st_parse_input(content, filename, text):
+    if text and text.strip():
+        lines = [ln for ln in text.replace("\r", "").split("\n") if ln.strip()]
+        sep = "\t" if "\t" in lines[0] else (";" if ";" in lines[0] else ",")
+        return _st_rows_from_table([ln.split(sep) for ln in lines])
+    if not content:
+        raise HTTPException(status_code=400, detail="Вставте список або виберіть файл")
+    fn = (filename or "").lower()
+    if fn.endswith((".csv", ".txt", ".tsv")):
+        for enc in ("utf-8-sig", "cp1251"):
+            try:
+                return _st_parse_input(None, "", content.decode(enc))
+            except UnicodeDecodeError:
+                continue
+        raise HTTPException(status_code=400, detail="Невідоме кодування файлу")
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл (потрібен .xlsx): {e}")
+    last_err = None
+    for ws in wb.worksheets:
+        try:
+            return _st_rows_from_table([list(r) for r in ws.iter_rows(values_only=True)])
+        except HTTPException as e:
+            last_err = e
+    raise last_err
+
+def _st_full_name(r) -> str:
+    return _clean(" ".join(x for x in (r.get("surname"), r.get("first"), r.get("patr")) if x))
+
+def _st_entry_from_row(r, group_map, inst_map):
+    entry = {}
+    for src, dst in (("group", "Група"), ("specialty", "Спеціальність"), ("level", "Рівень"), ("course", "Курс"),
+                     ("form", "Форма"), ("funding", "Фінансування"), ("institute", "Підрозділ"), ("status", "Статус")):
+        v = _clean(r.get(src))
+        if v:
+            entry[dst] = v
+    if entry.get("Курс"):
+        m = re.search(r"\d+", entry["Курс"])
+        if m:
+            entry["Курс"] = str(int(m.group()))
+    g = group_map.get(_st_group_key(entry.get("Група")))
+    if g:
+        entry["Група"], entry["_group_id"] = g
+    inst = inst_map.get(_norm(entry.get("Підрозділ")))
+    if inst:
+        entry["_institute"] = inst
+    return entry
+
+def _st_merge_entry(entries: list, new: dict) -> str:
+    """Оновлює відповідний запис «навчання» або додає новий. Повертає 'same' | 'updated' | 'added'."""
+    target = None
+    kg = _st_group_key(new.get("Група"))
+    if kg:
+        target = next((e for e in entries if isinstance(e, dict) and _st_group_key(e.get("Група")) == kg), None)
+    if target is None and new.get("Спеціальність"):
+        ks, kl = _st_group_key(new.get("Спеціальність")), _st_group_key(new.get("Рівень"))
+        target = next((e for e in entries if isinstance(e, dict) and _st_group_key(e.get("Спеціальність")) == ks
+                       and (not kl or not e.get("Рівень") or _st_group_key(e.get("Рівень")) == kl)), None)
+    if target is None:
+        entries.append(dict(new))
+        return "added"
+    changed = False
+    for k, v in new.items():
+        if target.get(k) != v:
+            target[k] = v
+            changed = True
+    return "updated" if changed else "same"
+
+def _st_context(db):
+    group_map = {}
+    for gid, gname in db.query(DBAcademicGroup.id, DBAcademicGroup.name).all():
+        group_map[_st_group_key(gname)] = (gname, gid)
+    inst_map = {}
+    for iname, ifull in db.query(DBInstitute.name, DBInstitute.full_name).all():
+        for t in (iname, ifull):
+            if t:
+                inst_map[_norm(t)] = iname
+    return group_map, inst_map
+
+def _st_flatten(u) -> list:
+    sd = _student_data_dict(u.student_data)
+    out = []
+    for e in (sd.get("навчання") or []):
+        if isinstance(e, dict):
+            out.append({"user_id": u.id, "email": u.email, "full_name": u.full_name or "", "group": e.get("Група") or "",
+                        "specialty": e.get("Спеціальність") or "", "level": e.get("Рівень") or "", "course": str(e.get("Курс") or ""),
+                        "form": e.get("Форма") or "", "funding": e.get("Фінансування") or "",
+                        "institute": e.get("_institute") or e.get("Підрозділ") or "", "status": e.get("Статус") or "",
+                        "group_known": bool(e.get("_group_id"))})
+    return out
+
+def _practice_student_rows(db) -> list:
+    rows = []
+    for u in db.query(DBUser).filter(DBUser.role == "student").all():
+        rows.extend(_st_flatten(u))
+    return rows
+
+def _st_plan(db, rows: list, skip_leave_new: bool) -> dict:
+    group_map, inst_map = _st_context(db)
+    report = {"rows_total": len(rows), "no_email": [], "bad_email": [], "email_conflicts": [], "duplicates_in_file": 0,
+              "role_conflicts": [], "leave_not_created": [], "unknown_groups": {}, "sample": []}
+    people, order = {}, []
+    for i, r in enumerate(rows, 1):
+        name = _st_full_name(r)
+        label = f"{name or '—'} ({r.get('group') or 'без групи'})"
+        email = (r.get("email") or "").strip().lower()
+        if not email:
+            report["no_email"].append(label); continue
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            report["bad_email"].append(f"{label}: {email}"); continue
+        entry = _st_entry_from_row(r, group_map, inst_map)
+        if not entry.get("Група"):
+            report["no_email"].append(f"{label}: порожня група"); continue
+        p = people.get(email)
+        if p is None:
+            p = people[email] = {"email": email, "name": name, "entries": []}
+            order.append(email)
+        elif name and p["name"] and _norm(name) != _norm(p["name"]):
+            report["email_conflicts"].append(f"{email}: «{p['name']}» і «{name}»")
+            continue
+        if any(_st_group_key(e.get("Група")) == _st_group_key(entry.get("Група")) and e.get("Спеціальність") == entry.get("Спеціальність") for e in p["entries"]):
+            report["duplicates_in_file"] += 1
+            continue
+        p["entries"].append(entry)
+        if not entry.get("_group_id"):
+            report["unknown_groups"][entry["Група"]] = report["unknown_groups"].get(entry["Група"], 0) + 1
+
+    existing = {}
+    emails = list(people.keys())
+    for k in range(0, len(emails), 500):
+        for u in db.query(DBUser).filter(func.lower(DBUser.email).in_(emails[k:k + 500])).all():
+            existing[u.email.lower()] = u
+
+    ops, stats = [], {"new": 0, "updated": 0, "unchanged": 0}
+    for email in order:
+        p = people[email]
+        u = existing.get(email)
+        if u is not None and u.role != "student":
+            report["role_conflicts"].append(f"{email} (роль «{u.role}»)"); continue
+        if u is None:
+            leave = any(w in (e.get("Статус") or "").casefold() for e in p["entries"] for w in _ST_LEAVE_WORDS)
+            if skip_leave_new and leave and all(any(w in (e.get("Статус") or "").casefold() for w in _ST_LEAVE_WORDS) for e in p["entries"]):
+                report["leave_not_created"].append(f"{p['name']} ({email})"); continue
+            stats["new"] += 1
+            ops.append(("new", p, None))
+            if len(report["sample"]) < 12:
+                report["sample"].append({"email": email, "name": p["name"], "action": "new", "groups": [e.get("Група") for e in p["entries"]]})
+        else:
+            sd = _student_data_dict(u.student_data)
+            studies = [dict(e) for e in (sd.get("навчання") or []) if isinstance(e, dict)]
+            before = json.dumps(studies, ensure_ascii=False, sort_keys=True)
+            res = [_st_merge_entry(studies, e) for e in p["entries"]]
+            changed = json.dumps(studies, ensure_ascii=False, sort_keys=True) != before
+            if changed:
+                stats["updated"] += 1
+                ops.append(("update", p, (u, sd, studies)))
+                if len(report["sample"]) < 12:
+                    report["sample"].append({"email": email, "name": u.full_name or p["name"], "action": "updated", "groups": [e.get("Група") for e in p["entries"]]})
+            else:
+                stats["unchanged"] += 1
+    keys = list(group_map.keys())
+    unknown = []
+    for g, n in sorted(report["unknown_groups"].items(), key=lambda x: -x[1]):
+        close = difflib.get_close_matches(_st_group_key(g), keys, n=1, cutoff=0.8)
+        unknown.append({"name": g, "count": n, "maybe": group_map[close[0]][0] if close else None})
+    report["unknown_groups"] = unknown
+    report["people"] = len(people)
+    report.update(stats)
+    return {"report": report, "ops": ops}
+
+@app.post("/api/cmyo/practice/students/import")
+def import_practice_students(
+    request: Request,
+    file: UploadFile = File(None), text: str = _PrForm(None),
+    apply: bool = _PrForm(False), skip_leave_new: bool = _PrForm(True),
+    admin: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db),
+):
+    content = file.file.read() if file is not None else None
+    if content and len(content) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Файл завеликий (максимум 15 МБ)")
+    rows = _st_parse_input(content, getattr(file, "filename", "") if file is not None else "", text)
+    if len(rows) > 30000:
+        raise HTTPException(status_code=400, detail="Забагато рядків за один раз (максимум 30 000)")
+    plan = _st_plan(db, rows, skip_leave_new)
+    rep = plan["report"]
+    rep["applied"] = False
+    if apply:
+        global _ST_UNUSABLE_HASH
+        if _ST_UNUSABLE_HASH is None:   # один «непридатний» хеш на всіх: вхід студентів — через Google, пароля ніхто не знає
+            _ST_UNUSABLE_HASH = pwd_context.hash(_pr_secrets.token_urlsafe(32))
+        used_ids = {i for (i,) in db.query(DBUser.id).all()}
+        for kind, p, extra in plan["ops"]:
+            if kind == "new":
+                uid = str(uuid.uuid4())[:8]
+                while uid in used_ids:
+                    uid = str(uuid.uuid4())[:8]
+                used_ids.add(uid)
+                db.add(DBUser(id=uid, email=p["email"], hashed_password=_ST_UNUSABLE_HASH, role="student",
+                              full_name=p["name"], student_data={"навчання": p["entries"]}))
+            else:
+                u, sd, studies = extra
+                sd = dict(sd)
+                sd["навчання"] = studies
+                u.student_data = sd
+                if not u.full_name and p["name"]:
+                    u.full_name = p["name"]
+        write_audit(db, request, action="bulk_import", user=admin, content_type="Users | Користувач",
+                    object_repr="Практика: список студентів",
+                    details={"added": rep["new"], "updated": rep["updated"], "unchanged": rep["unchanged"],
+                             "unknown_groups": len(rep["unknown_groups"])})
+        db.commit()
+        rep["applied"] = True
+    return rep
+
+@app.get("/api/cmyo/practice/students")
+def list_practice_students(
+    q: str = "", group: str = "", course: str = "", form: str = "", institute: str = "", status: str = "",
+    level: str = "", offset: int = 0, limit: int = 200,
+    admin: dict = Depends(require_cmyo_admin), db: Session = Depends(get_db),
+):
+    rows = _practice_student_rows(db)
+    def facet(key):
+        c = Counter(r[key] for r in rows if r[key])
+        return [{"value": k, "count": n} for k, n in sorted(c.items(), key=lambda x: (x[0] if key != "course" else x[0].zfill(3)))]
+    facets = {k: facet(k) for k in ("group", "course", "form", "institute", "status", "level")}
+    qq = q.strip().lower()
+    sel = [r for r in rows if (not group or r["group"] == group) and (not course or r["course"] == course)
+           and (not form or r["form"] == form) and (not institute or r["institute"] == institute)
+           and (not status or r["status"] == status) and (not level or r["level"] == level)
+           and (not qq or qq in f"{r['full_name']} {r['email']} {r['group']} {r['specialty']}".lower())]
+    sel.sort(key=lambda r: (r["group"], r["full_name"]))
+    limit = max(1, min(limit, 1000))
+    return {"total": len(sel), "people": len({r["user_id"] for r in rows}), "entries": len(rows),
+            "unknown_group_entries": sum(1 for r in rows if not r["group_known"]),
+            "facets": facets, "items": sel[offset:offset + limit]}
 
 @app.get("/api/ping")
 def ping(db: Session = Depends(get_db)):
