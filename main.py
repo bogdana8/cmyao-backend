@@ -2543,6 +2543,30 @@ GROUP_IMPORT_LEVEL_MAP = {
 UNASSIGNED_DEPT_SUFFIX = "__unassigned"
 UNASSIGNED_DEPT_NAME = "🗂 Без кафедри"
 
+_GRP_NAME_RE = re.compile(r"^(?P<abbr>.+?)-(?P<yy>\d{2})(?P<tail>(?:ск|м|дф)?)(?:-(?P<sub>\d+))?$", re.IGNORECASE)
+_GRP_SUB_BEFORE_YEAR_RE = re.compile(r"^(?P<abbr>.+?)-(?P<sub>\d)$")   # «ПС-2» + «-25» → підгрупа перед роком
+
+def _import_struct_names(group_name: str, is_denna: bool, level: str):
+    """Назви ОПП і плану за вашим зразком.
+       Група:  [З]абревіатура-[підгрупа-]рік[ск|м|ДФ]   (З на початку = заочна; ск = скорочений термін після коледжу;
+               м = магістр; ДФ = доктор філософії; підгрупа інколи — ПС-23-1)
+       ОПП:    абревіатура-рік-Б|М|ДФ                    (МКЖ-25-Б)  — спільна для «26» і «26ск»
+       План:   абревіатура-рік-Б|М|ДФ-Д|З                (МКЖ-25-Б-Д) — ОДИН на ОПП і форму; «26» і «26ск» у ньому разом,
+               а відмінність між ними — предмети різних курсів (семестрів).
+       Повертає (опп, план) або None, якщо назва групи не схожа на шаблон."""
+    m = _GRP_NAME_RE.match((group_name or "").strip())
+    if not m:
+        return None
+    abbr = m.group("abbr")
+    sm = _GRP_SUB_BEFORE_YEAR_RE.match(abbr)
+    if sm:                                  # підгрупа стоїть перед роком: ПС-2-25
+        abbr = sm.group("abbr")
+    if not is_denna and len(abbr) > 1 and abbr[0] in ("З", "з"):
+        abbr = abbr[1:]
+    yy = m.group("yy")
+    lvl = {"bachelor": "Б", "master": "М"}.get(level, "ДФ")
+    return f"{abbr}-{yy}-{lvl}", f"{abbr}-{yy}-{lvl}-{'Д' if is_denna else 'З'}"
+
 @app.post("/api/superadmin/structure/import-groups")
 def import_groups(
     request: Request, file: UploadFile = File(...),
@@ -2568,7 +2592,11 @@ def import_groups(
     stats = {
         "institutes_created": 0, "opps_created": 0, "plans_created": 0,
         "groups_created": 0, "groups_updated": 0, "rows_skipped": 0, "errors": [],
+        "groups_matched_loosely": [], "unparsed_group_names": [], "groups_already_exist": 0,
     }
+    # Існуючі групи шукаємо за «м'яким» ключем (регістр, латинські двійники літер, різні тире, пробіли),
+    # щоб «KH-23» / «кн-23» / «КН – 23» не породжували другу групу поряд із «КН-23».
+    groups_by_key = {_st_group_key(g.name): g for g in db.query(DBAcademicGroup).all()}
 
     for idx, row in df.iterrows():
         try:
@@ -2586,6 +2614,30 @@ def import_groups(
                 continue
 
             level = GROUP_IMPORT_LEVEL_MAP.get(level_raw) or detect_level_from_group_name(group_name)
+
+            # Група вже є в системі (створена вручну або попереднім імпортом) — її розміщення в ОПП/плані
+            # НЕ чіпаємо: у вас бувають винятки (напр. «26ск» вчиться за планом іншого набору), і повторний
+            # імпорт не повинен їх скасовувати. Назву шукаємо «м'яко» (регістр, латиниця, тире, пробіли).
+            gkey = _st_group_key(group_name)
+            existing_group = groups_by_key.get(gkey)
+            if existing_group:
+                if existing_group.name != group_name:
+                    stats["groups_matched_loosely"].append(f"{group_name} ≈ {existing_group.name} (у базі)")
+                if not existing_group.level:
+                    existing_group.level = level
+                    stats["groups_updated"] += 1
+                stats["groups_already_exist"] += 1
+                continue
+
+            # Назви ОПП/плану — за вашим зразком (див. _import_struct_names). Назву програми зі файлу
+            # зберігаємо як повну назву ОПП. Якщо назва групи не схожа на шаблон — стара схема (ОПП = програма).
+            program_title = opp_name
+            struct = _import_struct_names(group_name, is_denna, level)
+            plan_name_override = None
+            if struct:
+                opp_name, plan_name_override = struct
+            else:
+                stats["unparsed_group_names"].append(group_name)
 
             # 1) Інститут
             inst = db.query(DBInstitute).filter(DBInstitute.name == inst_short).first()
@@ -2610,17 +2662,20 @@ def import_groups(
             # 3) ОПП — шукаємо серед УСІХ кафедр цього інституту (щоб не плодити дублі
             #    після того, як ви вручну перенесли ОПП у справжню кафедру)
             opp = db.query(DBOpp).join(DBDepartment, DBOpp.department_id == DBDepartment.id).filter(
-                DBDepartment.institute_id == inst.id, DBOpp.name == opp_name
+                DBDepartment.institute_id == inst.id, DBOpp.name == opp_name, DBOpp.level == level
             ).first()
             if not opp:
-                opp = DBOpp(id=str(uuid.uuid4())[:8], department_id=placeholder_dept.id, name=opp_name, level=level)
+                opp = DBOpp(id=str(uuid.uuid4())[:8], department_id=placeholder_dept.id, name=opp_name, level=level,
+                            full_name=program_title)
                 db.add(opp)
                 db.flush()
                 stats["opps_created"] += 1
+            elif not opp.full_name:
+                opp.full_name = program_title
 
             # 4) Навчальний план — окремо для денної/заочної форми цієї ОПП
             form_label = "Денна" if is_denna else "Заочна"
-            plan_name = f"{opp_name} — {form_label}"
+            plan_name = plan_name_override or f"{opp_name} — {form_label}"
             plan = db.query(DBStudyPlan).filter(DBStudyPlan.opp_id == opp.id, DBStudyPlan.name == plan_name).first()
             if not plan:
                 plan = DBStudyPlan(id=str(uuid.uuid4())[:8], opp_id=opp.id, name=plan_name)
@@ -2628,16 +2683,11 @@ def import_groups(
                 db.flush()
                 stats["plans_created"] += 1
 
-            # 5) Група — назва унікальна в усій системі (щоб ЦСК/ЦМЯО завжди бачили ту саму групу)
-            existing_group = db.query(DBAcademicGroup).filter(DBAcademicGroup.name == group_name).first()
-            if existing_group:
-                if existing_group.study_plan_id != plan.id or existing_group.level != level:
-                    existing_group.study_plan_id = plan.id
-                    existing_group.level = level
-                    stats["groups_updated"] += 1
-            else:
-                db.add(DBAcademicGroup(id=str(uuid.uuid4())[:8], study_plan_id=plan.id, name=group_name, level=level))
-                stats["groups_created"] += 1
+            # 5) Нова група — назва унікальна в усій системі (щоб ЦСК/ЦМЯО завжди бачили ту саму групу)
+            new_group = DBAcademicGroup(id=str(uuid.uuid4())[:8], study_plan_id=plan.id, name=group_name, level=level)
+            db.add(new_group)
+            groups_by_key[gkey] = new_group
+            stats["groups_created"] += 1
 
         except Exception as e:
             stats["rows_skipped"] += 1
@@ -7872,7 +7922,7 @@ def _pr_parse_cohort(v, start_year, level):
     return {
         "label": t, "yy": m.group(1), "entry_year": entry_year, "is_short": bool(m.group(2)),
         "is_master_mark": is_master, "is_mba": "мба" in tail.casefold(),
-        "course": (start_year - entry_year + 1) if start_year else None,
+        "course": (start_year - entry_year + (2 if m.group(2) else 1)) if start_year else None,   # «ск» вступають одразу на 2-й курс
     }
 
 
@@ -8217,6 +8267,14 @@ def get_practice_schedule(schedule_id: int, user: dict = Depends(require_cmyo_ad
     out = _practice_schedule_summary(db, sch)
     out.update({"weeks": sch.weeks or {}, "legend": sch.legend or {}, "warnings": sch.warnings or [],
                 "items": [_practice_entry_to_dict(r, known, student_counts) for r in rows]})
+    try:   # курс рахуємо від навчального року графіка; «ск» (після коледжу) вступають одразу на 2-й курс
+        _sy = int((sch.academic_year or "")[:4])
+    except ValueError:
+        _sy = None
+    if _sy:
+        for it in out["items"]:
+            if it["entry_year"]:
+                it["course"] = _sy - it["entry_year"] + (2 if it["is_short"] else 1)
     return out
 
 @app.delete("/api/cmyo/practice/schedules/{schedule_id}")
