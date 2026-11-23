@@ -7809,35 +7809,44 @@ def get_structure_tree(
 ):
     """Повертає повне дерево: Інститут → Кафедра (+ викладачі) → ОПП (+ предмети: семестр/форма
     контролю) → Навчальний план (+ групи, + години предметів у цьому плані)."""
+    # Раніше тут був запит на кожну кафедру/ОПП/план (700+ запитів на 300 груп). Тепер — по одному запиту
+    # на таблицю, а дерево збираємо в пам'яті (порядок сортування лишається тим самим).
+    def _by(rows, key):
+        out = defaultdict(list)
+        for r in rows:
+            out[key(r)].append(r)
+        return out
+
     institutes = db.query(DBInstitute).order_by(DBInstitute.name).all()
+    depts_by_inst = _by(db.query(DBDepartment).order_by(DBDepartment.name).all(), lambda d: d.institute_id)
+    teachers_by_dept = _by(db.query(DBTeacher).order_by(DBTeacher.full_name).all(), lambda t: t.department_id)
+    opps_by_dept = _by(db.query(DBOpp).order_by(DBOpp.name).all(), lambda o: o.department_id)
+    subjects_by_opp = _by(db.query(DBSubject).order_by(DBSubject.semester, DBSubject.name).all(), lambda x: x.opp_id)
+    plans_by_opp = _by(db.query(DBStudyPlan).order_by(DBStudyPlan.name).all(), lambda p: p.opp_id)
+    groups_by_plan = _by(db.query(DBAcademicGroup).order_by(DBAcademicGroup.name).all(), lambda g: g.study_plan_id)
+    hours_by_plan = _by(db.query(DBPlanSubjectHours).all(), lambda h: h.study_plan_id)
+
     result = []
     for inst in institutes:
-        departments = db.query(DBDepartment).filter(DBDepartment.institute_id == inst.id).order_by(DBDepartment.name).all()
         dept_list = []
-        for dept in departments:
-            teachers = db.query(DBTeacher).filter(DBTeacher.department_id == dept.id).order_by(DBTeacher.full_name).all()
-            opps = db.query(DBOpp).filter(DBOpp.department_id == dept.id).order_by(DBOpp.name).all()
+        for dept in depts_by_inst.get(inst.id, []):
             opp_list = []
-            for opp in opps:
-                subjects = db.query(DBSubject).filter(DBSubject.opp_id == opp.id).order_by(DBSubject.semester, DBSubject.name).all()
-                plans = db.query(DBStudyPlan).filter(DBStudyPlan.opp_id == opp.id).order_by(DBStudyPlan.name).all()
+            for opp in opps_by_dept.get(dept.id, []):
                 plan_list = []
-                for plan in plans:
-                    groups = db.query(DBAcademicGroup).filter(DBAcademicGroup.study_plan_id == plan.id).order_by(DBAcademicGroup.name).all()
-                    hours_rows = db.query(DBPlanSubjectHours).filter(DBPlanSubjectHours.study_plan_id == plan.id).all()
+                for plan in plans_by_opp.get(opp.id, []):
                     plan_list.append({
                         "id": plan.id, "name": plan.name,
-                        "groups": [{"id": g.id, "name": g.name, "level": g.level} for g in groups],
-                        "subject_hours": [_plan_subject_hours_to_dict(h) for h in hours_rows],
+                        "groups": [{"id": g.id, "name": g.name, "level": g.level} for g in groups_by_plan.get(plan.id, [])],
+                        "subject_hours": [_plan_subject_hours_to_dict(h) for h in hours_by_plan.get(plan.id, [])],
                     })
                 opp_list.append({
                     "id": opp.id, "name": opp.name, "level": opp.level, "full_name": opp.full_name,
-                    "subjects": [_subject_to_dict(s) for s in subjects],
+                    "subjects": [_subject_to_dict(x) for x in subjects_by_opp.get(opp.id, [])],
                     "plans": plan_list
                 })
             dept_list.append({
                 "id": dept.id, "name": dept.name, "full_name": dept.full_name,
-                "teachers": [_teacher_to_dict(t) for t in teachers],
+                "teachers": [_teacher_to_dict(t) for t in teachers_by_dept.get(dept.id, [])],
                 "opps": opp_list
             })
         result.append({
