@@ -436,7 +436,7 @@ class DBStudentSubjectChoice(Base):
 # =========================================================
 CONSENT_ROLES = ("student", "teacher")
 CONSENT_VERSION = 1   # збільшіть число — і всі побачать повідомлення знову
-CONSENT_LOCATIONS = {"city": "У місті", "ukraine": "В Україні", "abroad": "За кордоном"}
+CONSENT_LOCATIONS = {"In Kryvyi Rih": "В Кривому Розі", "ukraine": "В Україні", "abroad": "За кордоном"}
 
 class DBUserConsent(Base):
     """Підтвердження ознайомлення з повідомленням про персональні дані + місце перебування"""
@@ -728,6 +728,42 @@ class DBPracticeEntry(Base):
     practice     = Column(JSON, default=list)                     # періоди практики (код «П»)
     src_row      = Column(Integer, nullable=True)
     src_col      = Column(String, nullable=True)
+
+# =========================================================
+# 💬 ЧАТ СТУДЕНТІВ — ТАБЛИЦІ (ізольовані: без зовнішніх ключів, видаляються через DROP TABLE)
+# =========================================================
+class DBChatMessage(Base):
+    __tablename__ = "student_chat_messages"
+    id            = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id       = Column(String, nullable=False, index=True)   # справжній автор (бачить лише адмін)
+    nickname      = Column(String, nullable=False)
+    faculty_tag   = Column(String, nullable=True)                # «3 курс · ІПЗ-23-1»
+    text          = Column(String, nullable=False)
+    reports_count = Column(Integer, nullable=False, default=0)
+    is_hidden     = Column(Boolean, nullable=False, default=False)
+    hidden_by     = Column(String, nullable=True)                # auto | admin
+    reviewed      = Column(Boolean, nullable=False, default=False)  # адмін вже розглянув скарги
+    created_at    = Column(Float, nullable=False, index=True)    # unix-час
+
+class DBChatReport(Base):
+    __tablename__ = "student_chat_reports"
+    __table_args__ = (UniqueConstraint("message_id", "reporter_id", name="uq_chat_report_once"),)
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    message_id  = Column(Integer, nullable=False, index=True)
+    reporter_id = Column(String, nullable=False)
+    created_at  = Column(Float, nullable=False)
+
+class DBChatMute(Base):
+    __tablename__ = "student_chat_mutes"
+    user_id    = Column(String, primary_key=True)
+    until      = Column(Float, nullable=False)                   # unix-час; 4102444800 = назавжди
+    reason     = Column(String, nullable=True)
+    created_at = Column(Float, nullable=False)
+
+class DBChatSetting(Base):
+    __tablename__ = "student_chat_settings"
+    key   = Column(String, primary_key=True)
+    value = Column(JSON, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -8597,3 +8633,382 @@ def ping(db: Session = Depends(get_db)):
         return {"status": "ok", "db": "awake"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+
+# =========================================================
+# 💬 ЧАТ СТУДЕНТІВ (повільний, публічний, напіванонімний)
+# =========================================================
+# Рубильник: SuperAdmin → «Чат студентів» → перемикач (змінна enabled у БД, без деплою).
+# Повне видалення фічі: прибрати цей блок + 4 моделі DBChat* вище + DROP TABLE student_chat_*.
+CHAT_ROLES = ("student", "superadmin", "admin_cmyo", "admin_csk")
+CHAT_MAX_LEN = 500
+CHAT_FOREVER = 4102444800.0
+CHAT_DEFAULTS = {"enabled": True, "report_threshold": 3, "cooldown": 10, "ttl_days": 7, "extra_words": []}
+CHAT_REJECT_TEXT = "Повідомлення не пройшло перевірку на ввічливість"
+
+_CHAT_ADJ_M = ["Сонний", "Мудрий", "Веселий", "Тихий", "Сміливий", "Хитрий", "Добрий", "Швидкий",
+               "Кмітливий", "Спокійний", "Допитливий", "Задумливий", "Бадьорий", "Цікавий", "Лінивий", "Відважний"]
+_CHAT_NOUN_M = ["Гусак", "Їжак", "Борсук", "Ведмідь", "Кіт", "Лис", "Вовк", "Бобер",
+                "Орел", "Пінгвін", "Сокіл", "Тхір", "Хом'як", "Єнот", "Дельфін", "Зубр"]
+_CHAT_ADJ_F = ["Сонна", "Мудра", "Весела", "Тиха", "Смілива", "Хитра", "Добра", "Швидка",
+               "Кмітлива", "Спокійна", "Допитлива", "Задумлива", "Бадьора", "Цікава", "Лінива", "Відважна"]
+_CHAT_NOUN_F = ["Сова", "Лисиця", "Білка", "Видра", "Чайка", "Панда", "Лань", "Зебра",
+                "Зозуля", "Черепаха", "Бджола", "Рись", "Ластівка", "Горлиця", "Мураха", "Кішка"]
+
+_CHAT_LOOKALIKE = str.maketrans({"a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "x": "х", "y": "у", "i": "і",
+                                 "k": "к", "m": "м", "t": "т", "ё": "е", "є": "е", "ы": "и", "э": "е", "ї": "і",
+                                 "ґ": "г", "ъ": "", "'": "", "’": "", "ʼ": ""})
+
+def _chat_norm(s: str) -> str:
+    return (s or "").lower().translate(_CHAT_LOOKALIKE)
+
+# Корені жорсткого мату / образ (у нормалізованому вигляді). Перевіряються з початку слова
+# (з типовими префіксами) — щоб не ловити «Лебанон», «рубля» тощо. Свої слова додає адмін у вкладці чату.
+_CHAT_ROOTS = [_chat_norm(w) for w in (
+    "хуй", "хуя", "хує", "хуї", "пізд", "пизд", "їб", "єб", "еб", "іб", "блят", "бляд", "мудак", "мудил",
+    "гандон", "залуп", "підор", "підар", "пидор", "пидар", "шлюх", "курв", "сука", "суки", "суку", "сучк", "сучар",
+)]
+_CHAT_PREFIX = r"(?:на|по|за|у|ви|від|ото|роз|раз|до|про|під|при|з|с|об|пере|ні|не|а|о)?"
+_CHAT_BAD_RE = re.compile(r"^" + _CHAT_PREFIX + r"(?:" + "|".join(sorted(set(_CHAT_ROOTS), key=len, reverse=True)) + r")")
+_CHAT_SQUEEZE_ROOTS = [_chat_norm(w) for w in ("хуй", "пізд", "пизд", "блят", "бляд")]
+_CHAT_LINK_RE = re.compile(
+    r"(https?://|www\.|t\.me|@\w|\b[\w-]+\.(?:com|ua|net|org|me|ru|io|edu|gov|info|xyz|ly|gg|su|by|biz|co|tv|cc)\b)", re.I)
+
+def _chat_is_rude(text: str, extra_words) -> bool:
+    n = _chat_norm(text)
+    tokens = re.findall(r"[а-яіa-z]+", n)
+    if any(_CHAT_BAD_RE.match(t) for t in tokens):
+        return True
+    squeezed = "".join(tokens)
+    if any(r in squeezed for r in _CHAT_SQUEEZE_ROOTS):
+        return True
+    extras = [_chat_norm(w).strip() for w in (extra_words or []) if str(w).strip()]
+    return any(t.startswith(w) for t in tokens for w in extras if w)
+
+def _chat_settings(db: Session) -> dict:
+    s = dict(CHAT_DEFAULTS)
+    for r in db.query(DBChatSetting).all():
+        if r.key in CHAT_DEFAULTS and r.value is not None:
+            s[r.key] = r.value
+    return s
+
+def _chat_set(db: Session, key: str, value):
+    row = db.query(DBChatSetting).filter(DBChatSetting.key == key).first()
+    if row:
+        row.value = value
+    else:
+        db.add(DBChatSetting(key=key, value=value))
+
+def _chat_nickname(user_id: str, role: str) -> str:
+    if role != "student":
+        return "Адміністрація"
+    h = int(hashlib.sha256(f"{SECRET_KEY}:{user_id}".encode()).hexdigest(), 16)
+    if h % 2 == 0:
+        adj, noun = _CHAT_ADJ_M, _CHAT_NOUN_M
+    else:
+        adj, noun = _CHAT_ADJ_F, _CHAT_NOUN_F
+    return f"{adj[(h >> 8) % len(adj)]} {noun[(h >> 16) % len(noun)]} {10 + (h >> 24) % 90}"
+
+def _chat_tag(db_user) -> Optional[str]:
+    if not db_user or db_user.role != "student":
+        return None
+    sd = db_user.student_data
+    if isinstance(sd, str):
+        try: sd = json.loads(sd)
+        except Exception: sd = {}
+    studies = (sd or {}).get("навчання") or [] if isinstance(sd, dict) else []
+    st = next((x for x in studies if isinstance(x, dict)), None)
+    if not st:
+        return None
+    parts = []
+    m = re.search(r"\d+", str(st.get("Курс") or ""))
+    if m: parts.append(f"{int(m.group())} курс")
+    if st.get("Група"): parts.append(str(st["Група"]).strip())
+    return " · ".join(parts) or None
+
+def _chat_active_mute(db: Session, user_id: str):
+    m = db.query(DBChatMute).filter(DBChatMute.user_id == user_id).first()
+    if m and m.until > time.time():
+        return m
+    if m:   # термін минув — прибираємо
+        db.delete(m); db.commit()
+    return None
+
+_chat_last_cleanup = 0.0
+def _chat_cleanup(db: Session, ttl_days: int):
+    """Живий ефір: старе (за ttl_days) і все, що понад 2000 останніх, видаляється. Не частіше за раз на 5 хв."""
+    global _chat_last_cleanup
+    now = time.time()
+    if now - _chat_last_cleanup < 300:
+        return
+    _chat_last_cleanup = now
+    try:
+        old = [r[0] for r in db.query(DBChatMessage.id).filter(DBChatMessage.created_at < now - max(1, int(ttl_days)) * 86400).all()]
+        edge = db.query(DBChatMessage.id).order_by(DBChatMessage.id.desc()).offset(2000).first()
+        if edge:
+            old += [r[0] for r in db.query(DBChatMessage.id).filter(DBChatMessage.id <= edge[0]).all()]
+        old = list(set(old))
+        for i in range(0, len(old), 500):
+            part = old[i:i + 500]
+            db.query(DBChatReport).filter(DBChatReport.message_id.in_(part)).delete(synchronize_session=False)
+            db.query(DBChatMessage).filter(DBChatMessage.id.in_(part)).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+def require_chat_user(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") not in CHAT_ROLES:
+        raise HTTPException(status_code=403, detail="Чат доступний лише студентам")
+    return user
+
+class ChatSendSchema(BaseModel):
+    text: str
+
+class ChatMuteSchema(BaseModel):
+    user_id: str
+    hours: Optional[float] = None          # None = назавжди
+    reason: Optional[str] = None
+    hide_messages: bool = False
+
+class ChatSettingsSchema(BaseModel):
+    enabled: Optional[bool] = None
+    report_threshold: Optional[int] = None
+    cooldown: Optional[int] = None
+    ttl_days: Optional[int] = None
+    extra_words: Optional[List[str]] = None
+
+def _chat_public(m: DBChatMessage, me: str, reported: set) -> dict:
+    return {
+        "id": m.id, "nickname": m.nickname, "tag": m.faculty_tag, "text": m.text,
+        "created_at": m.created_at, "is_mine": m.user_id == me,
+        "is_staff": m.nickname == "Адміністрація", "reported": m.id in reported,
+    }
+
+# ---------- Студенти ----------
+@app.get("/api/chat/status")
+def chat_status(user: dict = Depends(require_chat_user), db: Session = Depends(get_db)):
+    s = _chat_settings(db)
+    mute = _chat_active_mute(db, user["user_id"])
+    return {
+        "enabled": bool(s["enabled"]), "cooldown": int(s["cooldown"]), "max_len": CHAT_MAX_LEN,
+        "muted_until": (None if not mute or mute.until >= CHAT_FOREVER else mute.until),
+        "muted": bool(mute), "muted_reason": mute.reason if mute else None,
+    }
+
+@app.get("/api/chat/messages")
+def chat_messages(limit: int = 80, user: dict = Depends(require_chat_user), db: Session = Depends(get_db)):
+    s = _chat_settings(db)
+    if not s["enabled"]:
+        return {"enabled": False, "messages": []}
+    limit = max(1, min(limit, 150))
+    rows = db.query(DBChatMessage).filter(DBChatMessage.is_hidden == False)\
+        .order_by(DBChatMessage.id.desc()).limit(limit).all()   # noqa: E712
+    rows.reverse()
+    ids = [m.id for m in rows]
+    reported = {r[0] for r in db.query(DBChatReport.message_id).filter(
+        DBChatReport.reporter_id == user["user_id"], DBChatReport.message_id.in_(ids)).all()} if ids else set()
+    return {"enabled": True, "messages": [_chat_public(m, user["user_id"], reported) for m in rows]}
+
+@app.post("/api/chat/messages")
+def chat_send(data: ChatSendSchema, user: dict = Depends(require_chat_user), db: Session = Depends(get_db)):
+    s = _chat_settings(db)
+    if not s["enabled"]:
+        raise HTTPException(status_code=403, detail="Чат тимчасово вимкнено")
+    uid = user["user_id"]
+    mute = _chat_active_mute(db, uid)
+    if mute:
+        raise HTTPException(status_code=403, detail="Вам обмежено доступ до чату" + (f": {mute.reason}" if mute.reason else ""))
+
+    text_ = re.sub(r"[ \t]+", " ", (data.text or "").replace("\r", "")).strip()
+    text_ = re.sub(r"\n{3,}", "\n\n", text_)
+    if not text_:
+        raise HTTPException(status_code=400, detail="Порожнє повідомлення")
+    if len(text_) > CHAT_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"Максимум {CHAT_MAX_LEN} символів")
+    if _CHAT_LINK_RE.search(text_):
+        raise HTTPException(status_code=400, detail="Посилання, пошти та @згадки у чаті заборонені")
+    if _chat_is_rude(text_, s["extra_words"]):
+        raise HTTPException(status_code=400, detail=CHAT_REJECT_TEXT)
+
+    now = time.time()
+    last = db.query(DBChatMessage).filter(DBChatMessage.user_id == uid).order_by(DBChatMessage.id.desc()).first()
+    if last:
+        wait = int(s["cooldown"]) - (now - last.created_at)
+        if wait > 0:
+            raise HTTPException(status_code=429, detail=f"Зачекайте ще {int(wait) + 1} с перед наступним повідомленням")
+        if last.text == text_ and now - last.created_at < 120:
+            raise HTTPException(status_code=400, detail="Таке повідомлення вже щойно було надіслано")
+
+    db_user = db.query(DBUser).filter(DBUser.id == uid).first()
+    msg = DBChatMessage(
+        user_id=uid, nickname=_chat_nickname(uid, user.get("role")),
+        faculty_tag=_chat_tag(db_user), text=text_, created_at=now,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    _chat_cleanup(db, s["ttl_days"])
+    return _chat_public(msg, uid, set())
+
+@app.post("/api/chat/messages/{msg_id}/report")
+def chat_report(msg_id: int, user: dict = Depends(require_chat_user), db: Session = Depends(get_db)):
+    s = _chat_settings(db)
+    msg = db.query(DBChatMessage).filter(DBChatMessage.id == msg_id).first()
+    if not msg or msg.is_hidden:
+        raise HTTPException(status_code=404, detail="Повідомлення не знайдено")
+    if msg.user_id == user["user_id"]:
+        raise HTTPException(status_code=400, detail="Не можна поскаржитись на власне повідомлення")
+    if db.query(DBChatReport).filter(DBChatReport.message_id == msg_id, DBChatReport.reporter_id == user["user_id"]).first():
+        return {"message": "Ви вже скаржились на це повідомлення", "hidden": False}
+    db.add(DBChatReport(message_id=msg_id, reporter_id=user["user_id"], created_at=time.time()))
+    msg.reports_count = (msg.reports_count or 0) + 1
+    hidden = False
+    if msg.reports_count >= int(s["report_threshold"]) and not msg.reviewed:
+        msg.is_hidden, msg.hidden_by, hidden = True, "auto", True
+    db.commit()
+    return {"message": "Дякуємо, скаргу прийнято", "hidden": hidden}
+
+# ---------- Адмін ----------
+def _chat_stats(db: Session) -> dict:
+    now = time.time()
+    day = now - 86400
+    return {
+        "total": db.query(func.count(DBChatMessage.id)).scalar() or 0,
+        "last_24h": db.query(func.count(DBChatMessage.id)).filter(DBChatMessage.created_at > day).scalar() or 0,
+        "authors_24h": db.query(func.count(func.distinct(DBChatMessage.user_id))).filter(DBChatMessage.created_at > day).scalar() or 0,
+        "pending": db.query(func.count(DBChatMessage.id)).filter(
+            DBChatMessage.is_hidden == True, DBChatMessage.hidden_by == "auto", DBChatMessage.reviewed == False).scalar() or 0,  # noqa: E712
+        "muted": db.query(func.count(DBChatMute.user_id)).filter(DBChatMute.until > now).scalar() or 0,
+    }
+
+@app.get("/api/superadmin/chat")
+def chat_admin_overview(
+    view: str = "all", q: str = "", limit: int = 200,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    """view: all | reported (є скарги) | pending (сховані автоматично, чекають розгляду) | hidden"""
+    qry = db.query(DBChatMessage)
+    if view == "reported":
+        qry = qry.filter(DBChatMessage.reports_count > 0)
+    elif view == "pending":
+        qry = qry.filter(DBChatMessage.is_hidden == True, DBChatMessage.hidden_by == "auto", DBChatMessage.reviewed == False)  # noqa: E712
+    elif view == "hidden":
+        qry = qry.filter(DBChatMessage.is_hidden == True)  # noqa: E712
+    rows = qry.order_by(DBChatMessage.id.desc()).limit(max(1, min(limit, 500))).all()
+
+    now = time.time()
+    muted = {m.user_id: m for m in db.query(DBChatMute).filter(DBChatMute.until > now).all()}
+    uids = {m.user_id for m in rows} | set(muted)
+    users = {u.id: u for u in db.query(DBUser).filter(DBUser.id.in_(uids)).all()} if uids else {}
+
+    qq = q.strip().lower()
+    items = []
+    for m in rows:
+        u = users.get(m.user_id)
+        if qq and qq not in f"{m.text} {m.nickname} {(u.full_name if u else '') or ''} {(u.email if u else '') or ''}".lower():
+            continue
+        mu = muted.get(m.user_id)
+        items.append({
+            "id": m.id, "user_id": m.user_id,
+            "full_name": u.full_name if u else None, "email": u.email if u else None, "role": u.role if u else None,
+            "nickname": m.nickname, "tag": m.faculty_tag, "text": m.text, "created_at": m.created_at,
+            "reports_count": m.reports_count or 0, "is_hidden": bool(m.is_hidden), "hidden_by": m.hidden_by,
+            "reviewed": bool(m.reviewed), "muted": bool(mu),
+        })
+    mutes = [{
+        "user_id": uid, "full_name": users[uid].full_name if uid in users else None,
+        "email": users[uid].email if uid in users else None, "until": (None if m.until >= CHAT_FOREVER else m.until),
+        "reason": m.reason,
+    } for uid, m in muted.items()]
+    return {"items": items, "mutes": mutes, "stats": _chat_stats(db), "settings": _chat_settings(db)}
+
+@app.put("/api/superadmin/chat/settings")
+def chat_admin_settings(
+    data: ChatSettingsSchema, request: Request,
+    admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)
+):
+    changes = {}
+    if data.enabled is not None:
+        changes["enabled"] = bool(data.enabled)
+    if data.report_threshold is not None:
+        changes["report_threshold"] = max(1, min(int(data.report_threshold), 50))
+    if data.cooldown is not None:
+        changes["cooldown"] = max(0, min(int(data.cooldown), 300))
+    if data.ttl_days is not None:
+        changes["ttl_days"] = max(1, min(int(data.ttl_days), 90))
+    if data.extra_words is not None:
+        changes["extra_words"] = [w.strip()[:40] for w in data.extra_words if w and w.strip()][:300]
+    for k, v in changes.items():
+        _chat_set(db, k, v)
+    write_audit(db, request, action="update", user=admin, content_type="Chat | Налаштування",
+                object_repr="Чат студентів", details={k: v for k, v in changes.items() if k != "extra_words"})
+    db.commit()
+    return {"settings": _chat_settings(db)}
+
+def _chat_get_msg(db: Session, msg_id: int) -> DBChatMessage:
+    m = db.query(DBChatMessage).filter(DBChatMessage.id == msg_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Повідомлення не знайдено")
+    return m
+
+@app.post("/api/superadmin/chat/messages/{msg_id}/hide")
+def chat_admin_hide(msg_id: int, request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    m = _chat_get_msg(db, msg_id)
+    m.is_hidden, m.hidden_by, m.reviewed = True, "admin", True
+    write_audit(db, request, action="update", user=admin, content_type="Chat | Повідомлення", object_id=msg_id, object_repr="Приховано")
+    db.commit()
+    return {"message": "Приховано"}
+
+@app.post("/api/superadmin/chat/messages/{msg_id}/restore")
+def chat_admin_restore(msg_id: int, request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    m = _chat_get_msg(db, msg_id)
+    m.is_hidden, m.hidden_by, m.reviewed = False, None, True   # reviewed — щоб скарги більше не ховали його автоматично
+    write_audit(db, request, action="update", user=admin, content_type="Chat | Повідомлення", object_id=msg_id, object_repr="Повернуто в чат")
+    db.commit()
+    return {"message": "Повернуто в чат"}
+
+@app.delete("/api/superadmin/chat/messages/{msg_id}")
+def chat_admin_delete(msg_id: int, request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    m = _chat_get_msg(db, msg_id)
+    db.query(DBChatReport).filter(DBChatReport.message_id == msg_id).delete(synchronize_session=False)
+    db.delete(m)
+    write_audit(db, request, action="delete", user=admin, content_type="Chat | Повідомлення", object_id=msg_id, object_repr=m.nickname)
+    db.commit()
+    return {"message": "Видалено"}
+
+@app.post("/api/superadmin/chat/mute")
+def chat_admin_mute(data: ChatMuteSchema, request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    target = db.query(DBUser).filter(DBUser.id == data.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Користувача не знайдено")
+    now = time.time()
+    until = CHAT_FOREVER if not data.hours else now + float(data.hours) * 3600
+    row = db.query(DBChatMute).filter(DBChatMute.user_id == data.user_id).first()
+    if row:
+        row.until, row.reason, row.created_at = until, (data.reason or None), now
+    else:
+        db.add(DBChatMute(user_id=data.user_id, until=until, reason=(data.reason or None), created_at=now))
+    hidden = 0
+    if data.hide_messages:
+        for m in db.query(DBChatMessage).filter(DBChatMessage.user_id == data.user_id).all():
+            m.is_hidden, m.hidden_by, m.reviewed = True, "admin", True
+            hidden += 1
+    write_audit(db, request, action="update", user=admin, content_type="Chat | Мут", object_id=data.user_id,
+                object_repr=target.email, details={"hours": data.hours, "reason": data.reason, "hidden": hidden})
+    db.commit()
+    return {"message": "Мут встановлено" + (f", приховано повідомлень: {hidden}" if hidden else "")}
+
+@app.delete("/api/superadmin/chat/mute/{user_id}")
+def chat_admin_unmute(user_id: str, request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    db.query(DBChatMute).filter(DBChatMute.user_id == user_id).delete(synchronize_session=False)
+    write_audit(db, request, action="update", user=admin, content_type="Chat | Мут", object_id=user_id, object_repr="Мут знято")
+    db.commit()
+    return {"message": "Мут знято"}
+
+@app.post("/api/superadmin/chat/clear")
+def chat_admin_clear(request: Request, admin: dict = Depends(require_superadmin), db: Session = Depends(get_db)):
+    n = db.query(DBChatMessage).delete(synchronize_session=False)
+    db.query(DBChatReport).delete(synchronize_session=False)
+    write_audit(db, request, action="delete", user=admin, content_type="Chat | Очищення", object_repr="Чат студентів", details={"deleted": n})
+    db.commit()
+    return {"message": f"Чат очищено ({n} повідомлень)"}
