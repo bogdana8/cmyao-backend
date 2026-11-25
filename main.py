@@ -274,12 +274,12 @@ class DBFeathersTransaction(Base):
     id          = Column(Integer, primary_key=True, index=True, autoincrement=True)
     student_id  = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     amount      = Column(Integer, nullable=False)   # + нарахування, - списання
-    reason      = Column(String, nullable=True)     # "Опитування: Назва" / "Куплена тема: ..."
+    reason      = Column(String, nullable=True)     # "Опитування: Назва" / "Обмін на тему: ..."
     survey_id   = Column(String, nullable=True)
     created_at  = Column(String, default=lambda: datetime.now().strftime("%d.%m.%Y %H:%M"))
 
 class DBOwnedTheme(Base):
-    """Придбані студентом теми"""
+    """Відкриті (обміняні) студентом теми"""
     __tablename__ = "owned_themes"
     id         = Column(Integer, primary_key=True, index=True, autoincrement=True)
     student_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -436,7 +436,17 @@ class DBStudentSubjectChoice(Base):
 # =========================================================
 CONSENT_ROLES = ("student", "teacher")
 CONSENT_VERSION = 1   # збільшіть число — і всі побачать повідомлення знову
-CONSENT_LOCATIONS = {"In Kryvyi Rih": "В Кривому Розі", "ukraine": "В Україні", "abroad": "За кордоном"}
+CONSENT_LOCATIONS = {"city": "В Кривому Розі", "ukraine": "В Україні", "abroad": "За кордоном"}
+# Старі/помилкові ключі міста → «city» (щоб не ламалися вибір на екрані згоди та вже збережені відповіді)
+_CONSENT_LOCATION_ALIASES = {"in kryvyi rih": "city", "kryvyi rih": "city", "kryvyi_rih": "city", "kryvyirih": "city",
+                             "в кривому розі": "city", "у місті": "city", "місто": "city", "krivoy_rog": "city"}
+
+def _consent_location(v):
+    """Нормалізує значення місця перебування до city | ukraine | abroad (None, якщо невідоме)."""
+    s = (v or "").strip()
+    if s in CONSENT_LOCATIONS:
+        return s
+    return _CONSENT_LOCATION_ALIASES.get(s.casefold())
 
 class DBUserConsent(Base):
     """Підтвердження ознайомлення з повідомленням про персональні дані + місце перебування"""
@@ -445,7 +455,7 @@ class DBUserConsent(Base):
     user_id        = Column(String, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
     version        = Column(Integer, default=0)
     accepted_at    = Column(String, nullable=True)
-    location       = Column(String, nullable=True)      # city | ukraine | abroad
+    location       = Column(String, nullable=True)      # city (В Кривому Розі) | ukraine | abroad
     reset_required = Column(Boolean, default=False)     # суперадмін вимагає показати знову
 
 # =========================================================
@@ -1372,92 +1382,89 @@ def write_audit(
 # =========================================================
 
 # Каталог тем (статичний, розширюйте за потребою)
+# Каталог тем. УВАГА: palette / preview_gradient НІКОЛИ не віддаються студенту, який тему ще не відкрив
+# (див. /api/themes/catalog і /api/student/feathers/theme-css) — вигляд закритих тем видно лише тут, на сервері.
+THEME_LOCKED_DESC = "Вигляд відкриється після обміну"
 THEMES_CATALOG = [
     {
-        "id": "theme_sakura",
-        "name": "Сакура",
-        "description": "Рожево-ніжний градієнт з пелюстками сакури",
-        "price": 50,
+        "id": "theme_sakura", "name": "Сакура", "price": 50,
+        "description": "Рожево-ніжний вигляд із пелюстками сакури",
         "preview_gradient": "linear-gradient(135deg, #fbc2eb 0%, #a18cd1 100%)",
-        "css_vars": {
-            "--bg-gradient": "linear-gradient(135deg, #2d1b2e 0%, #3d1f3f 50%, #1a0f2e 100%)",
-            "--accent": "#e879f9",
-            "--accent-bg": "rgba(232,121,249,0.15)",
-            "--accent-border": "rgba(232,121,249,0.3)",
-            "--accent-text": "#f5d0fe",
-        }
+        "palette": {
+            "light": {"bg": "#fbf1f6", "card": "#ffffff", "line": "#f1d9e6", "v": "#c93a98", "v2": "#fde4f1", "lime": "#ffb3d9", "side": "#3b1330",
+                      "grad": "linear-gradient(160deg, #fdeef6 0%, #f3e4fb 100%)"},
+            "dark":  {"bg": "#1d1020", "card": "#2a1830", "line": "#43284a", "v": "#d04fb0", "v2": "#43224a", "lime": "#ffb3d9", "side": "#12070f",
+                      "grad": "linear-gradient(160deg, #281230 0%, #1a0f2e 100%)"},
+        },
     },
     {
-        "id": "theme_ocean",
-        "name": "Океан",
+        "id": "theme_ocean", "name": "Океан", "price": 60,
         "description": "Глибокі відтінки моря та бірюзові хвилі",
-        "price": 60,
         "preview_gradient": "linear-gradient(135deg, #0f3460 0%, #16213e 50%, #0d7377 100%)",
-        "css_vars": {
-            "--bg-gradient": "linear-gradient(135deg, #0d1b2a 0%, #0f3460 50%, #0d4f6e 100%)",
-            "--accent": "#06b6d4",
-            "--accent-bg": "rgba(6,182,212,0.15)",
-            "--accent-border": "rgba(6,182,212,0.3)",
-            "--accent-text": "#a5f3fc",
-        }
+        "palette": {
+            "light": {"bg": "#eef7fa", "card": "#ffffff", "line": "#d4e8ee", "v": "#0b7a97", "v2": "#d9f1f7", "lime": "#7be0d6", "side": "#0b2a3a",
+                      "grad": "linear-gradient(160deg, #e8f6fa 0%, #dcedf7 100%)"},
+            "dark":  {"bg": "#0b1824", "card": "#12263a", "line": "#1f3a52", "v": "#1596b5", "v2": "#153b52", "lime": "#5eead4", "side": "#06101a",
+                      "grad": "linear-gradient(160deg, #0d1b2a 0%, #0f3460 100%)"},
+        },
     },
     {
-        "id": "theme_forest",
-        "name": "Ліс",
-        "description": "Темно-зелений з нотками смарагду та моху",
-        "price": 55,
+        "id": "theme_forest", "name": "Ліс", "price": 55,
+        "description": "Смарагдові та мохові відтінки",
         "preview_gradient": "linear-gradient(135deg, #134e5e 0%, #1a3a2a 50%, #2d5a27 100%)",
-        "css_vars": {
-            "--bg-gradient": "linear-gradient(135deg, #0d2818 0%, #1a3a2a 50%, #0f3d24 100%)",
-            "--accent": "#4ade80",
-            "--accent-bg": "rgba(74,222,128,0.15)",
-            "--accent-border": "rgba(74,222,128,0.3)",
-            "--accent-text": "#bbf7d0",
-        }
+        "palette": {
+            "light": {"bg": "#f0f6ef", "card": "#ffffff", "line": "#d9e7d6", "v": "#2b8a49", "v2": "#def3df", "lime": "#a7e66a", "side": "#14301f",
+                      "grad": "linear-gradient(160deg, #eef7ec 0%, #e2f0df 100%)"},
+            "dark":  {"bg": "#0e1a13", "card": "#15261b", "line": "#24402d", "v": "#2f9e5b", "v2": "#1b3d28", "lime": "#bef264", "side": "#07110b",
+                      "grad": "linear-gradient(160deg, #0d2818 0%, #0f3d24 100%)"},
+        },
     },
     {
-        "id": "theme_sunset",
-        "name": "Захід сонця",
+        "id": "theme_sunset", "name": "Захід сонця", "price": 65,
         "description": "Теплі відтінки помаранчевого та золотого",
-        "price": 65,
         "preview_gradient": "linear-gradient(135deg, #f83600 0%, #f9d423 100%)",
-        "css_vars": {
-            "--bg-gradient": "linear-gradient(135deg, #2d1200 0%, #4a1a00 50%, #3d2000 100%)",
-            "--accent": "#fb923c",
-            "--accent-bg": "rgba(251,146,60,0.15)",
-            "--accent-border": "rgba(251,146,60,0.3)",
-            "--accent-text": "#fed7aa",
-        }
+        "palette": {
+            "light": {"bg": "#fdf3ea", "card": "#ffffff", "line": "#f4dfcb", "v": "#d0491a", "v2": "#ffe6d3", "lime": "#ffd166", "side": "#3a1a0a",
+                      "grad": "linear-gradient(160deg, #fff1e3 0%, #fde7c8 100%)"},
+            "dark":  {"bg": "#1f120a", "card": "#2c1a0f", "line": "#4a2e1b", "v": "#e0661f", "v2": "#4a2a14", "lime": "#fcd34d", "side": "#120a05",
+                      "grad": "linear-gradient(160deg, #2d1200 0%, #3d2000 100%)"},
+        },
     },
     {
-        "id": "theme_midnight",
-        "name": "Північ",
-        "description": "Чорний космос із сріблястими акцентами",
-        "price": 80,
-        "preview_gradient": "linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%)",
-        "css_vars": {
-            "--bg-gradient": "linear-gradient(135deg, #050507 0%, #0f0c29 50%, #1a1040 100%)",
-            "--accent": "#e2e8f0",
-            "--accent-bg": "rgba(226,232,240,0.1)",
-            "--accent-border": "rgba(226,232,240,0.25)",
-            "--accent-text": "#f8fafc",
-        }
+        "id": "theme_midnight", "name": "Північ", "price": 80,
+        "description": "Чорний космос зі сріблястими акцентами",
+        "preview_gradient": "linear-gradient(135deg, #000000 0%, #0f111c 50%, #6f7fe0 100%)",
+        "palette": {
+            "light": {"bg": "#eef0f6", "card": "#ffffff", "line": "#d9dce8", "v": "#3f4a7a", "v2": "#e3e6f3", "lime": "#c9d1ff", "side": "#0a0d1a",
+                      "grad": "linear-gradient(160deg, #eceef6 0%, #e0e3f0 100%)"},
+            "dark":  {"bg": "#07080f", "card": "#0f111c", "line": "#1e2133", "v": "#6f7fe0", "v2": "#1a1d33", "lime": "#cbd5e1", "side": "#000000",
+                      "grad": "linear-gradient(160deg, #05060c 0%, #101328 100%)"},
+        },
     },
     {
-        "id": "theme_rose_gold",
-        "name": "Рожеве золото",
-        "description": "Елегантний рожево-золотий градієнт",
-        "price": 90,
-        "preview_gradient": "linear-gradient(135deg, #b76e79 0%, #c9956c 50%, #f2c27a 100%)",
-        "css_vars": {
-            "--bg-gradient": "linear-gradient(135deg, #2d1018 0%, #3d1a10 50%, #2a1500 100%)",
-            "--accent": "#f9a8d4",
-            "--accent-bg": "rgba(249,168,212,0.15)",
-            "--accent-border": "rgba(249,168,212,0.3)",
-            "--accent-text": "#fce7f3",
-        }
+        "id": "theme_rose_gold", "name": "Рожеве золото", "price": 90,
+        "description": "Благородний рожево-золотий відтінок",
+        "preview_gradient": "linear-gradient(135deg, #b76e79 0%, #f2c6a0 100%)",
+        "palette": {
+            "light": {"bg": "#fbf0ee", "card": "#ffffff", "line": "#f0d9d4", "v": "#a5505c", "v2": "#f9e1e0", "lime": "#f2c6a0", "side": "#3a1f24",
+                      "grad": "linear-gradient(160deg, #fcefec 0%, #f8e3d8 100%)"},
+            "dark":  {"bg": "#1e1416", "card": "#2b1c1f", "line": "#47302f", "v": "#c9707b", "v2": "#47272c", "lime": "#f2c6a0", "side": "#110a0b",
+                      "grad": "linear-gradient(160deg, #2a181c 0%, #35211f 100%)"},
+        },
     },
 ]
+
+def build_theme_css(theme: dict) -> str:
+    """CSS палітри теми для кабінету: лише для власника (світла й темна версії, ті самі селектори, що в cabinet.css)."""
+    sel = f'.cab-root[data-cab-theme="{theme["id"]}"]'
+    def block(mode: str) -> str:
+        p = theme["palette"][mode]
+        return (f"--bg:{p['bg']};--card:{p['card']};--line:{p['line']};--v:{p['v']};--T:{p['v']};--v2:{p['v2']};"
+                f"--lime:{p['lime']};--side:{p['side']};background-image:{p['grad']}")
+    dark = block("dark")
+    return (f"{sel}{{{block('light')}}}\n"
+            f"@media (prefers-color-scheme: dark){{:root:not([data-theme=\"light\"]):not(.light) {sel}{{{dark}}}}}\n"
+            f":root[data-theme=\"dark\"] {sel},:root.dark {sel},body.dark {sel}{{{dark}}}\n")
 
 # =========================================================
 # 🏛️ ДОПОМІЖНІ ФУНКЦІЇ АКАДЕМІЧНОЇ СТРУКТУРИ
@@ -3318,24 +3325,44 @@ def get_feathers_info(
         "active_theme_id": active_theme_id,
         "transactions": [{
             "amount": t.amount,
-            "reason": t.reason,
+            "reason": (t.reason or "").replace("Куплена тема:", "Обмін на тему:"),
             "created_at": t.created_at
         } for t in transactions]
     }
 
 @app.get("/api/themes/catalog")
-def get_themes_catalog(user: dict = Depends(get_current_user)):
-    """Каталог доступних тем"""
+def get_themes_catalog(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Каталог тем в обміннику. Вигляд (preview_gradient, опис) — лише для вже відкритих тем."""
     if user.get("role") != "student":
         raise HTTPException(status_code=403, detail="Тільки для студентів")
-    return THEMES_CATALOG
+    owned = {o.theme_id for o in db.query(DBOwnedTheme).filter(DBOwnedTheme.student_id == user["user_id"]).all()}
+    return [{
+        "id": t["id"], "name": t["name"], "price": t["price"], "owned": t["id"] in owned,
+        "description": t["description"] if t["id"] in owned else THEME_LOCKED_DESC,
+        "preview_gradient": t["preview_gradient"] if t["id"] in owned else None,
+    } for t in THEMES_CATALOG]
+
+@app.get("/api/student/feathers/theme-css")
+def get_active_theme_css(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """CSS активної теми студента. Віддається лише якщо тема відкрита (власність перевіряється на сервері)."""
+    if user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="Тільки для студентів")
+    active = db.query(DBActiveTheme).filter(DBActiveTheme.student_id == user["user_id"]).first()
+    if not active or active.theme_id == "default":
+        return {"theme_id": None, "css": ""}
+    theme = next((t for t in THEMES_CATALOG if t["id"] == active.theme_id), None)
+    has = db.query(DBOwnedTheme).filter(DBOwnedTheme.student_id == user["user_id"],
+                                        DBOwnedTheme.theme_id == active.theme_id).first()
+    if not theme or not has:
+        return {"theme_id": None, "css": ""}
+    return {"theme_id": theme["id"], "css": build_theme_css(theme)}
 
 @app.post("/api/student/feathers/buy-theme")
 def buy_theme(
     purchase: ThemePurchaseSchema,
     user: dict = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Купівля теми за пер'я"""
+    """Обмін пір'їв на тему."""
     if user.get("role") != "student":
         raise HTTPException(status_code=403, detail="Тільки для студентів")
 
@@ -3343,30 +3370,26 @@ def buy_theme(
     if not theme:
         raise HTTPException(status_code=404, detail="Тему не знайдено")
 
-    # Перевіряємо — можливо вже куплено
-    already_owned = db.query(DBOwnedTheme).filter(
-        DBOwnedTheme.student_id == user["user_id"],
-        DBOwnedTheme.theme_id == purchase.theme_id
-    ).first()
-    if already_owned:
-        raise HTTPException(status_code=409, detail="Ця тема вже придбана")
-
     wallet = get_or_create_wallet(db, user["user_id"])
-    if wallet.balance < theme["price"]:
-        raise HTTPException(
-            status_code=402,
-            detail=f"Недостатньо пер'їв. Потрібно {theme['price']}, у вас {wallet.balance}"
-        )
+    # блокуємо рядок гаманця: паралельні запити одного студента виконуються по черзі (без подвійного списання)
+    wallet = db.query(DBFeathersWallet).filter(DBFeathersWallet.id == wallet.id).with_for_update().first()
+
+    if db.query(DBOwnedTheme).filter(DBOwnedTheme.student_id == user["user_id"],
+                                     DBOwnedTheme.theme_id == purchase.theme_id).first():
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Цю тему вже обміняно")
+    if (wallet.balance or 0) < theme["price"]:
+        have = wallet.balance or 0
+        db.rollback()
+        raise HTTPException(status_code=402, detail=f"Не вистачає пір'їв. Потрібно {theme['price']}, у вас {have}")
 
     wallet.balance -= theme["price"]
     db.add(DBFeathersTransaction(
-        student_id=user["user_id"],
-        amount=-theme["price"],
-        reason=f"Куплена тема: {theme['name']}",
+        student_id=user["user_id"], amount=-theme["price"], reason=f"Обмін на тему: {theme['name']}",
     ))
     db.add(DBOwnedTheme(student_id=user["user_id"], theme_id=purchase.theme_id))
     db.commit()
-    return {"message": f"Тему «{theme['name']}» успішно придбано! 🎉", "new_balance": wallet.balance}
+    return {"message": f"Обмін виконано: тема «{theme['name']}» тепер ваша 🎉", "new_balance": wallet.balance}
 
 @app.post("/api/student/feathers/set-theme")
 def set_active_theme(
@@ -3384,7 +3407,7 @@ def set_active_theme(
             DBOwnedTheme.theme_id == data.theme_id
         ).first()
         if not owned:
-            raise HTTPException(status_code=403, detail="Ця тема не придбана")
+            raise HTTPException(status_code=403, detail="Ця тема ще не відкрита — спершу обміняйте на неї пір'я")
 
     active = db.query(DBActiveTheme).filter(
         DBActiveTheme.student_id == user["user_id"]
@@ -3423,9 +3446,10 @@ def get_my_consent(user: dict = Depends(get_current_user), db: Session = Depends
         "applicable": applicable,
         "required": applicable and status != "confirmed",
         "status": status,
-        "location": rec.location if rec else None,
+        "location": (_consent_location(rec.location) or rec.location) if rec else None,
         "accepted_at": rec.accepted_at if rec else None,
         "version": CONSENT_VERSION,
+        "locations": CONSENT_LOCATIONS,
     }
 
 @app.post("/api/me/consent")
@@ -3435,7 +3459,8 @@ def accept_my_consent(
 ):
     if user.get("role") not in CONSENT_ROLES:
         raise HTTPException(status_code=403, detail="Для вашої ролі підтвердження не потрібне")
-    if data.location not in CONSENT_LOCATIONS:
+    loc = _consent_location(data.location)
+    if loc is None:
         raise HTTPException(status_code=400, detail="Оберіть, де ви перебуваєте")
     rec = db.query(DBUserConsent).filter(DBUserConsent.user_id == user["user_id"]).first()
     if not rec:
@@ -3443,11 +3468,11 @@ def accept_my_consent(
         db.add(rec)
     rec.version = CONSENT_VERSION
     rec.accepted_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-    rec.location = data.location
+    rec.location = loc
     rec.reset_required = False
     write_audit(db, request, action="update", user=user, content_type="Consent | Згода",
         object_id=user["user_id"], object_repr=user.get("sub"),
-        details={"location": data.location, "version": CONSENT_VERSION})
+        details={"location": loc, "version": CONSENT_VERSION})
     db.commit()
     return {"message": "Дякуємо!"}
 
@@ -3462,7 +3487,7 @@ def list_consents(admin: dict = Depends(require_superadmin), db: Session = Depen
             "user_id": u.id, "full_name": u.full_name, "email": u.email, "role": u.role,
             "status": _consent_status(r),
             "accepted_at": r.accepted_at if r else None,
-            "location": r.location if r else None,
+            "location": (_consent_location(r.location) or r.location) if r else None,
         })
     return {"version": CONSENT_VERSION, "items": items}
 
