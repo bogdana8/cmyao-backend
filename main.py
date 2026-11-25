@@ -9012,3 +9012,79 @@ def chat_admin_clear(request: Request, admin: dict = Depends(require_superadmin)
     write_audit(db, request, action="delete", user=admin, content_type="Chat | Очищення", object_repr="Чат студентів", details={"deleted": n})
     db.commit()
     return {"message": f"Чат очищено ({n} повідомлень)"}
+
+
+# =========================================================
+# 🗓️ ГРАФІК ОСВІТНЬОГО ПРОЦЕСУ — для кабінету студента
+# Джерело: графік, який ЦМЯО завантажило у «Практика → Графік освітнього процесу».
+# Студент бачить рядки свого року вступу × спеціальності (збіг за назвою групи, у т.ч. підгрупи -1/-2).
+# =========================================================
+_PLAN_KIND_WORDS = (("сесі", "S"), ("практик", "P"), ("канікул", "K"), ("атестац", "A"), ("кваліфікац", "A"),
+                    ("дипломн", "A"), ("захист", "A"), ("теоретичн", "T"), ("навчан", "T"), ("аудитор", "T"))
+_PLAN_KIND_BY_CODE = {"С": "S", "П": "P", "К": "K", "Ат": "A"}
+
+def _plan_kind(base: str, legend_text: str) -> str:
+    """Код тижня → один із 5 типів кабінету студента: T навчання, S сесія, P практика, K канікули, A атестація."""
+    low = (legend_text or "").casefold()
+    for word, kind in _PLAN_KIND_WORDS:
+        if word in low:
+            return kind
+    return _PLAN_KIND_BY_CODE.get(base, "T")
+
+def _plan_ranges(codes: list, legend: dict) -> list:
+    """Послідовні тижні з однаковим кодом → відрізки {from, to, kind, title, code}. Порожні тижні пропускаються."""
+    out, i, n = [], 0, len(codes or [])
+    while i < n:
+        base = _pr_code(codes[i])[1] if codes[i] else None
+        if not base:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and codes[j + 1] and _pr_code(codes[j + 1])[1] == base:
+            j += 1
+        text = (legend or {}).get(base) or ""
+        title = (text[:1].upper() + text[1:]).strip()[:70] if text else f"Код «{base}»"
+        out.append({"from": i + 1, "to": j + 1, "kind": _plan_kind(base, text), "title": title, "code": base})
+        i = j + 1
+    return out
+
+@app.get("/api/student/process-schedule")
+def student_process_schedule(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    db_user = db.query(DBUser).filter(DBUser.id == user["user_id"]).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Користувача не знайдено")
+    sd = _student_data_dict(db_user.student_data)
+    my_keys = {_st_group_key(e.get("Група")): e.get("Група") for e in (sd.get("навчання") or [])
+               if isinstance(e, dict) and e.get("Група")}
+    if not my_keys:
+        return {"schedules": [], "reason": "no_group"}
+
+    sch = (db.query(DBPracticeSchedule)
+           .order_by(DBPracticeSchedule.academic_year.desc().nullslast(), DBPracticeSchedule.id.desc()).first())
+    if not sch:
+        return {"schedules": [], "reason": "no_schedule"}
+    try:
+        sy = int((sch.academic_year or "")[:4])
+    except ValueError:
+        sy = None
+
+    result = []
+    for e in (db.query(DBPracticeEntry).filter(DBPracticeEntry.schedule_id == sch.id)
+              .order_by(DBPracticeEntry.form, DBPracticeEntry.src_row, DBPracticeEntry.id).all()):
+        base = _practice_entry_group_name(e)
+        variants = [base] + [f"{base}-{i}" for i in range(1, (e.subgroups or 1) + 1)]
+        hit = next((my_keys[k] for k in (_st_group_key(v) for v in variants) if k in my_keys), None)
+        if not hit:
+            continue
+        wk = (sch.weeks or {}).get(e.form) or []
+        if not wk or not wk[0].get("date_from"):
+            continue
+        legend = (sch.legend or {}).get(e.form) or {}
+        course = (sy - e.entry_year + (2 if e.is_short else 1)) if (sy and e.entry_year) else e.course
+        aud = f"{hit}" + (f" · {course} курс" if course else "") + (" · заочна" if e.form == "zaochne" else "")
+        result.append({
+            "id": f"pe-{e.id}", "academic_year": (sch.academic_year or "").replace("-", "/"), "audience": aud,
+            "start_date": wk[0]["date_from"], "ranges": _plan_ranges((e.weeks or [])[:len(wk)], legend),
+            "legend": legend,
+        })
+    return {"schedules": result, "reason": None if result else "group_not_in_schedule"}
