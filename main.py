@@ -8263,9 +8263,22 @@ def _practice_entry_group_name(e) -> str:
     suffix = ("ск" if m.group(2) else "") + ("м" if m.group(3) else "")
     return ("З" if e.form == "zaochne" else "") + f"{e.spec_abbr}-{m.group(1)}{suffix}"
 
+def _practice_entry_group_variants(e) -> list:
+    """Усі імовірні назви груп запису графіка: ЗПС-26м, ЗПС-26м-1, а також ЗПС-26-1м
+    (номер підгрупи ставиться ПЕРЕД суфіксом «м»/«ск»/«скм», як у структурі: ЗПС-26-1м, ЗПС-24-2ск)."""
+    base = _practice_entry_group_name(e)
+    n = e.subgroups or 1
+    out = [base] + [f"{base}-{i}" for i in range(1, n + 1)]
+    m = _PR_COHORT_RE.match(e.cohort or "")
+    suffix = (("ск" if m.group(2) else "") + ("м" if m.group(3) else "")) if m else ""
+    if suffix and base.endswith(suffix):
+        stem = base[:-len(suffix)]
+        out += [f"{stem}-{i}{suffix}" for i in range(1, n + 1)]
+    return out
+
 def _practice_entry_to_dict(e, known: set, student_counts: dict) -> dict:
     base = _practice_entry_group_name(e)
-    variants = [base] + [f"{base}-{i}" for i in range(1, (e.subgroups or 1) + 1)]
+    variants = _practice_entry_group_variants(e)
     keys = {_st_group_key(v) for v in variants}
     return {
         "id": e.id, "form": e.form, "level": e.level, "cohort": e.cohort, "entry_year": e.entry_year,
@@ -9097,7 +9110,7 @@ def student_process_schedule(user: dict = Depends(get_current_user), db: Session
     for e in (db.query(DBPracticeEntry).filter(DBPracticeEntry.schedule_id == sch.id)
               .order_by(DBPracticeEntry.form, DBPracticeEntry.src_row, DBPracticeEntry.id).all()):
         base = _practice_entry_group_name(e)
-        variants = [base] + [f"{base}-{i}" for i in range(1, (e.subgroups or 1) + 1)]
+        variants = _practice_entry_group_variants(e)
         hit = next((my_keys[k] for k in (_st_group_key(v) for v in variants) if k in my_keys), None)
         if not hit:
             continue
