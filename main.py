@@ -7531,43 +7531,6 @@ def survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm
     return StreamingResponse(io.BytesIO(body), media_type=mime,
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
 
-# ── Аналітична довідка ЦСК (інша структура + текст від AI) ───────────────────────────────────
-# Модуль survey_reports_csk.py (+ csk_template.docx поруч). Для AI потрібен ANTHROPIC_API_KEY у .env.
-def _sr_csk_module():
-    try:
-        import survey_reports_csk
-        return survey_reports_csk
-    except ImportError as e:
-        raise HTTPException(status_code=501, detail=f"Для довідок ЦСК бракує бібліотеки ({e.name}). Встановіть: pip install matplotlib python-docx openpyxl requests")
-
-@app.post("/api/csk/survey-reports/preview")
-def csk_survey_reports_preview(file: UploadFile = File(...), options: str = _SrForm("{}"),
-                                     user: dict = Depends(require_csk_admin)):
-    """Розбір файлу: колонка підрозділу/дати, типи питань, підрозділи з кількістю відповідей, період."""
-    sr = _sr_csk_module()
-    data, opts = _sr_read(file, options)
-    try:
-        return _sr_run(sr.analyze_csk, data, file.filename or "", opts)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
-
-@app.post("/api/csk/survey-reports/generate")
-def csk_survey_reports_generate(file: UploadFile = File(...), options: str = _SrForm("{}"),
-                                      user: dict = Depends(require_csk_admin)):
-    """Одна аналітична довідка .docx на весь файл. Текст аналізу, висновків і рекомендацій пише AI (якщо options.ai != false)."""
-    sr = _sr_csk_module()
-    data, opts = _sr_read(file, options)
-    try:
-        fname, body, mime = _sr_run(sr.generate_csk, data, file.filename or "", opts)
-    except ValueError as e:                      # у т.ч. AIError — повідомлення зрозуміле користувачеві
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Не вдалося сформувати довідку: {e}")
-    return StreamingResponse(io.BytesIO(body), media_type=mime,
-                             headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"})
-
 # ── Акаунти Zoom ↔ викладачі ────────────────────────────────────
 class ZoomAccountLinkSchema(BaseModel):
     teacher_id: Optional[int] = None
@@ -9126,3 +9089,9 @@ def student_process_schedule(user: dict = Depends(get_current_user), db: Session
             "legend": legend,
         })
     return {"schedules": result, "reason": None if result else "group_not_in_schedule"}
+
+
+# ── Аналітичні довідки ЦСК: збережені опитування, фонова збірка (модулі csk_reports.py + csk_report_worker.py) ──
+# Має стояти в самому кінці файлу: потрібні вже оголошені app, Base, engine, SessionLocal, get_db, require_csk_admin, _practice_student_rows.
+from csk_reports import register_csk_reports
+register_csk_reports(app, Base, engine, SessionLocal, get_db, require_csk_admin, _practice_student_rows)
